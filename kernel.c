@@ -37,6 +37,7 @@ NOPAT size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 
 #include "font.h"
 #include "sintab.h"
+#include "logo.h"
 
 /* ------------------------------------------------------------------ */
 /* Port I/O                                                            */
@@ -290,6 +291,24 @@ static int draw_str_s(int x, int y, const char *s, u32 c, int sc) {
 static int draw_str(int x, int y, const char *s, u32 c) { return draw_str_s(x, y, s, c, 1); }
 static int slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static void draw_str_c(int cx, int y, const char *s, u32 c) { draw_str(cx - slen(s) * 4, y, s, c); }
+static void blit_argb(int x, int y, int w, int h, const u32 *src) {
+    for (int j = 0; j < h; j++) {
+        int py = y + j;
+        if (py < cly0 || py >= cly1) continue;
+        for (int i = 0; i < w; i++) {
+            int px = x + i;
+            if (px < clx0 || px >= clx1) continue;
+            u32 v = src[j * w + i], a = v >> 24;
+            if (!a) continue;
+            if (a == 255) { back[py * W + px] = v & 0xFFFFFF; continue; }
+            u32 d = back[py * W + px];
+            u32 r = (((v >> 16) & 255) * a + ((d >> 16) & 255) * (255 - a)) / 255;
+            u32 g = (((v >> 8) & 255) * a + ((d >> 8) & 255) * (255 - a)) / 255;
+            u32 b = ((v & 255) * a + (d & 255) * (255 - a)) / 255;
+            back[py * W + px] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
 static void drawf(int x, int y, u32 c, const char *f, ...) {
     char b[96]; va_list ap; va_start(ap, f); kvsnprintf(b, sizeof b, f, ap); va_end(ap);
     draw_str(x, y, b, c);
@@ -677,7 +696,7 @@ static int fs_delete(int i) {
 }
 static void fs_defaults(void) {
     static const char readme[] =
-        "Welcome to LeactedOS XP Edition 2.0!\n"
+        "Welcome to LeactedOS XP Edition 3.0!\n"
         "Open Terminal and type help.\n"
         "Files live in RAM until you install\n"
         "a disk with the Installer.\n";
@@ -758,7 +777,7 @@ static void power_off(void) {
 /* ------------------------------------------------------------------ */
 /* Window manager                                                      */
 /* ------------------------------------------------------------------ */
-enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, N_APPS };
+enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, N_APPS };
 static void theme_apply(int id);
 static void settings_save(void);
 
@@ -769,12 +788,13 @@ static struct win wins[N_APPS] = {
     [A_PAINT]   = { 0, 0, 60, 20, 464, 372, "Paint" },
     [A_FILES]   = { 0, 0, 110, 40, 420, 320, "File Manager" },
     [A_CLOCK]   = { 0, 0, 330, 40, 260, 310, "Clock" },
-    [A_ABOUT]   = { 0, 0, 200, 80, 340, 230, "About LeactedOS" },
+    [A_ABOUT]   = { 0, 0, 200, 60, 340, 288, "About LeactedOS" },
     [A_INSTALL] = { 0, 0, 140, 70, 380, 250, "LeactedOS Installer" },
     [A_SETTINGS] = { 0, 0, 120, 50, 380, 300, "Settings" },
     [A_TASK]    = { 0, 0, 100, 30, 380, 320, "Task Manager" },
+    [A_CALC]    = { 0, 0, 260, 40, 232, 300, "Calculator" },
 };
-static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager" };
+static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager", "Calculator" };
 static int zo[N_APPS], nz;
 
 #define TITLE_H 22
@@ -906,7 +926,7 @@ static void cmd_help(void) {
     tputs(" calc A op B   + - * / %\n");
     tputs(" beep [hz]     PC speaker\n");
     tputs(" open APP      term note paint files clock\n");
-    tputs("               about install settings task\n");
+    tputs("               about install settings task calc\n");
     tputs(" theme NAME    xp | unity | kde\n");
     tputs(" super         toggle root mode\n");
     tputs(" reboot  shutdown  exit\n");
@@ -922,7 +942,7 @@ static void run_cmd(char *line) {
     if (!kstrcmp(c, "help") || !kstrcmp(c, "?")) cmd_help();
     else if (!kstrcmp(c, "clear") || !kstrcmp(c, "cls")) tclear();
     else if (!kstrcmp(c, "about") || !kstrcmp(c, "ver")) {
-        tputs("LeactedOS XP Edition 2.0 (640x480)\nFrom-scratch hobby OS, rebuilt & upgraded.\n");
+        tputs("LeactedOS XP Edition 3.0 (640x480)\nFrom-scratch hobby OS, rebuilt & upgraded.\n");
     }
     else if (!kstrcmp(c, "echo")) {
         char *t = copy + 4; while (*t == ' ') t++;
@@ -992,6 +1012,7 @@ static void run_cmd(char *line) {
         else if (!kstrcmp(a, "install")) open_app(A_INSTALL);
         else if (!kstrcmp(a, "settings")) open_app(A_SETTINGS);
         else if (!kstrcmp(a, "task")) open_app(A_TASK);
+        else if (!kstrcmp(a, "calc")) open_app(A_CALC);
         else tputs("Unknown app.\n");
     }
     else if (!kstrcmp(c, "install")) open_app(A_INSTALL);
@@ -1259,20 +1280,18 @@ static void files_click(int rx, int ry) {
 /* ------------------------------------------------------------------ */
 static int inst_state;      /* 0 idle, 1 confirm, 2 ok, 3 fail */
 static void about_draw(int x, int y, int w, int h) {
-    rect(x + 12, y + 12, 22, 22, RGB(240, 80, 40)); rect(x + 36, y + 12, 22, 22, RGB(100, 190, 40));
-    rect(x + 12, y + 36, 22, 22, RGB(40, 140, 240)); rect(x + 36, y + 36, 22, 22, RGB(250, 200, 20));
-    draw_str_s(x + 70, y + 16, "LeactedOS", C_TEXT, 2);
-    draw_str(x + 70, y + 36, "XP Edition 2.0", RGB(0, 70, 190));
-    draw_str(x + 70, y + 48, "From-scratch hobby OS", C_DARK);
-    rect(x + 10, y + 70, w - 20, 1, C_DARK);
+    blit_argb(x + (w - logo96_W) / 2, y + 4, logo96_W, logo96_H, logo96);
+    draw_str_c(x + w / 2, y + 106, "XP Edition 3.0", RGB(0, 70, 190));
+    draw_str_c(x + w / 2, y + 118, "From-scratch hobby OS", C_DARK);
+    rect(x + 10, y + 132, w - 20, 1, C_DARK);
     u32 s = ticks / 100;
-    drawf(x + 14, y + 82, C_TEXT, "Display : 640x480, 32-bit color");
-    if (mem_kb) drawf(x + 14, y + 96, C_TEXT, "Memory  : %u MB", mem_kb / 1024);
-    else drawf(x + 14, y + 96, C_TEXT, "Memory  : unknown");
-    drawf(x + 14, y + 110, C_TEXT, "Disk    : %s", disk_present ? "detected" : "none detected");
-    drawf(x + 14, y + 124, C_TEXT, "FS      : %s", fs_on_disk ? "LeactedFS v1" : "none");
-    drawf(x + 14, y + 138, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
-    drawf(x + 14, y + 152, C_TEXT, "Mode    : %s", is_root ? "super (root)" : "normal");
+    drawf(x + 14, y + 142, C_TEXT, "Display : 640x480, 32-bit color");
+    if (mem_kb) drawf(x + 14, y + 156, C_TEXT, "Memory  : %u MB", mem_kb / 1024);
+    else drawf(x + 14, y + 156, C_TEXT, "Memory  : unknown");
+    drawf(x + 14, y + 170, C_TEXT, "Disk    : %s", disk_present ? "detected" : "none detected");
+    drawf(x + 14, y + 184, C_TEXT, "FS      : %s", fs_on_disk ? "LeactedFS v1" : "none");
+    drawf(x + 14, y + 198, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
+    drawf(x + 14, y + 212, C_TEXT, "Mode    : %s", is_root ? "super (root)" : "normal");
     button(x + w - 74, y + h - 30, 62, 22, "OK", 0);
 }
 static void about_click(int rx, int ry) {
@@ -1401,7 +1420,7 @@ static u32 frame_count, fps_t, fps_f, fps;
 static void task_draw(int x, int y, int w, int h) {
     (void)h;
     draw_str(x + 8, y + 6, "Applications", C_TEXT);
-    rect(x + 6, y + 20, w - 12, 120, C_LIGHT); frame(x + 6, y + 20, w - 12, 120, C_DARK);
+    rect(x + 6, y + 20, w - 12, 128, C_LIGHT); frame(x + 6, y + 20, w - 12, 128, C_DARK);
     rect(x + 7, y + 21, w - 14, 12, C_DARK);
     draw_str(x + 10, y + 23, "Task", C_LIGHT); draw_str(x + 220, y + 23, "Status", C_LIGHT);
     int row = 0, n = 0;
@@ -1415,22 +1434,22 @@ static void task_draw(int x, int y, int w, int h) {
         draw_str(x + 220, ry, wins[a].min ? "Minimized" : top_app() == a ? "Active" : "Running", fg);
         row++;
     }
-    button(x + 6, y + 146, 76, 22, "End Task", 0);
-    button(x + 88, y + 146, 76, 22, "Switch To", 0);
-    drawf(x + 176, y + 154, C_DARK, "%d task(s) running", n);
-    rect(x + 6, y + 176, w - 12, 1, C_DARK);
-    draw_str(x + 8, y + 182, "System", C_TEXT);
+    button(x + 6, y + 154, 76, 22, "End Task", 0);
+    button(x + 88, y + 154, 76, 22, "Switch To", 0);
+    drawf(x + 176, y + 162, C_DARK, "%d task(s) running", n);
+    rect(x + 6, y + 184, w - 12, 1, C_DARK);
+    draw_str(x + 8, y + 190, "System", C_TEXT);
     u32 s = ticks / 100;
-    drawf(x + 12, y + 196, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
+    drawf(x + 12, y + 204, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
     u32 used_kb = (u32)((sizeof back + sizeof bgimg + sizeof fsdata + sizeof canvas + sizeof tg + 65536) / 1024);
-    drawf(x + 12, y + 210, C_TEXT, "Kernel  : %u KB of %u KB", used_kb, mem_kb ? mem_kb : used_kb);
+    drawf(x + 12, y + 218, C_TEXT, "Kernel  : %u KB of %u KB", used_kb, mem_kb ? mem_kb : used_kb);
     int bw = w - 24, fill = mem_kb ? (int)((u32)bw * used_kb / mem_kb) : bw;
     if (fill < 2) fill = 2;
-    rect(x + 12, y + 222, bw, 8, C_LIGHT); frame(x + 12, y + 222, bw, 8, C_DARK);
-    rect(x + 13, y + 223, fill > bw - 2 ? bw - 2 : fill, 6, RGB(60, 170, 70));
-    drawf(x + 12, y + 238, C_TEXT, "Files   : %d / %d", fs_count(), FS_MAX);
-    drawf(x + 12, y + 252, C_TEXT, "Disk    : %s", disk_present ? (fs_on_disk ? "LeactedFS" : "unformatted") : "none");
-    drawf(x + 12, y + 266, C_TEXT, "Display : 640x480  %u fps  [%s]", fps, themes[th_id].name);
+    rect(x + 12, y + 230, bw, 8, C_LIGHT); frame(x + 12, y + 230, bw, 8, C_DARK);
+    rect(x + 13, y + 231, fill > bw - 2 ? bw - 2 : fill, 6, RGB(60, 170, 70));
+    drawf(x + 12, y + 244, C_TEXT, "Files   : %d / %d", fs_count(), FS_MAX);
+    drawf(x + 12, y + 258, C_TEXT, "Disk    : %s", disk_present ? (fs_on_disk ? "LeactedFS" : "unformatted") : "none");
+    drawf(x + 12, y + 272, C_TEXT, "Display : 640x480  %u fps  [%s]", fps, themes[th_id].name);
 }
 static void task_click(int rx, int ry) {
     int w = CW(A_TASK);
@@ -1440,8 +1459,134 @@ static void task_click(int rx, int ry) {
         if (inrect(rx, ry, 7, 35 + row * 11 - 1, w - 14, 11)) { tsel = a; return; }
         row++;
     }
-    if (inrect(rx, ry, 6, 146, 76, 22)) { if (tsel >= 0 && wins[tsel].open) { close_app(tsel); tsel = -1; } return; }
-    if (inrect(rx, ry, 88, 146, 76, 22)) { if (tsel >= 0 && wins[tsel].open) raise_app(tsel); return; }
+    if (inrect(rx, ry, 6, 154, 76, 22)) { if (tsel >= 0 && wins[tsel].open) { close_app(tsel); tsel = -1; } return; }
+    if (inrect(rx, ry, 88, 154, 76, 22)) { if (tsel >= 0 && wins[tsel].open) raise_app(tsel); return; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Calculator (fixed point, 2 decimals)                                */
+/* ------------------------------------------------------------------ */
+static i32 c_acc, c_ent;
+static char c_op;
+static int c_have, c_neg, c_frac = -1, c_after, c_err;
+
+static void calc_reset(void) { c_acc = 0; c_ent = 0; c_op = 0; c_have = 0; c_neg = 0; c_frac = -1; c_after = 0; c_err = 0; }
+static int calc_math(i32 a, char op, i32 b, i32 *r) {
+    switch (op) {
+    case '+': return !__builtin_add_overflow(a, b, r);
+    case '-': return !__builtin_sub_overflow(a, b, r);
+    case '*': {
+        i32 q = a / 100, m = a % 100, t1, t2a, t2b;
+        if (__builtin_mul_overflow(q, b, &t1)) return 0;
+        if (__builtin_mul_overflow(m, b / 100, &t2a)) return 0;
+        if (__builtin_mul_overflow(m, b % 100, &t2b)) return 0;
+        i32 t2 = t2a + t2b / 100;
+        return !__builtin_add_overflow(t1, t2, r);
+    }
+    case '/': {
+        if (b == 0) return 0;
+        i32 q = a / b, rem = a % b, t1, t2;
+        if (__builtin_mul_overflow(q, 100, &t1)) return 0;
+        if (__builtin_mul_overflow(rem, 100, &t2)) t2 = (b >= 100 || b <= -100) ? rem / (b / 100) : 0;
+        else t2 = t2 / b;
+        return !__builtin_add_overflow(t1, t2, r);
+    }
+    }
+    return 0;
+}
+static void calc_fmt(i32 v, char *o) {
+    u32 u;
+    if (v < 0) { *o++ = '-'; u = (u32)0 - (u32)v; } else u = (u32)v;
+    o += ksnprintf(o, 14, "%u", u / 100);
+    u32 fp = u % 100;
+    if (fp) { *o++ = '.'; *o++ = '0' + fp / 10; if (fp % 10) *o++ = '0' + fp % 10; }
+    *o = 0;
+}
+static void calc_fmt_entry(char *o) {
+    if (c_neg) *o++ = '-';
+    o += ksnprintf(o, 14, "%u", (u32)c_ent / 100);
+    if (c_frac >= 0) {
+        *o++ = '.';
+        if (c_frac >= 1) *o++ = '0' + (c_ent % 100) / 10;
+        if (c_frac >= 2) *o++ = '0' + c_ent % 10;
+    }
+    *o = 0;
+}
+static void calc_commit(void) {
+    i32 v = c_neg ? -c_ent : c_ent;
+    if (c_op) { i32 r; if (!calc_math(c_acc, c_op, v, &r)) { c_err = 1; return; } c_acc = r; }
+    else c_acc = v;
+    c_have = 0; c_ent = 0; c_neg = 0; c_frac = -1;
+}
+static void calc_start_entry(void) { if (!c_have) { c_have = 1; c_ent = 0; c_neg = 0; c_frac = -1; } }
+static void calc_press(char k) {
+    if (c_err && k != 'C') return;
+    if (k >= '0' && k <= '9') {
+        if (c_after) calc_reset();
+        calc_start_entry();
+        int d = k - '0';
+        if (c_frac < 0) { if (c_ent / 100 < 1000000) c_ent = (c_ent / 100 * 10 + d) * 100; }
+        else if (c_frac == 0) { c_ent += d * 10; c_frac = 1; }
+        else if (c_frac == 1) { c_ent += d; c_frac = 2; }
+        return;
+    }
+    switch (k) {
+    case 'C': calc_reset(); break;
+    case '.': if (c_after) calc_reset(); calc_start_entry(); if (c_frac < 0) c_frac = 0; break;
+    case '<':
+        if (c_have) {
+            if (c_frac >= 0) { if (c_frac == 2) c_ent -= c_ent % 10; else if (c_frac == 1) c_ent -= c_ent % 100; c_frac--; }
+            else c_ent = (c_ent / 100 / 10) * 100;
+        }
+        break;
+    case 'N': if (c_have) c_neg = !c_neg; else if (c_acc != (i32)0x80000000) c_acc = -c_acc; break;
+    case '%': if (c_have) { c_ent /= 100; c_frac = 2; } break;
+    case '+': case '-': case '*': case '/':
+        if (c_have) calc_commit();
+        if (!c_err) { c_op = k; c_after = 0; }
+        break;
+    case '=':
+        if (c_have) calc_commit();
+        c_op = 0; c_after = 1;
+        break;
+    }
+}
+static const char *calc_lbl[20] = { "C", "<", "%", "/", "7", "8", "9", "x", "4", "5", "6", "-", "1", "2", "3", "+", "+/-", "0", ".", "=" };
+static const char calc_map[20] = { 'C', '<', '%', '/', '7', '8', '9', '*', '4', '5', '6', '-', '1', '2', '3', '+', 'N', '0', '.', '=' };
+
+static void calc_draw(int x, int y, int w, int h) {
+    (void)h;
+    int ox = x + (w - 196) / 2;
+    rect(ox, y + 8, 196, 40, C_LIGHT); frame(ox, y + 8, 196, 40, C_DARK);
+    char b[24];
+    if (c_err) kstrcpy(b, "Error", sizeof b);
+    else if (c_have) calc_fmt_entry(b);
+    else calc_fmt(c_acc, b);
+    int len = slen(b), sc = len * 16 <= 184 ? 2 : 1, tw = len * 8 * sc;
+    draw_str_s(ox + 196 - 6 - tw, y + 8 + (40 - 8 * sc) / 2, b, c_err ? RGB(190, 0, 0) : C_TEXT, sc);
+    if (c_op) draw_char(ox + 6, y + 12, c_op, RGB(0, 70, 190));
+    for (int i = 0; i < 20; i++) {
+        int bx = ox + (i % 4) * 50, by = y + 58 + (i / 4) * 42;
+        char k = calc_map[i];
+        if (k == '=') { bevel(bx, by, 46, 38, 0); rect(bx + 2, by + 2, 42, 34, RGB(60, 130, 245)); }
+        else bevel(bx, by, 46, 38, 0);
+        u32 col = k == '=' ? C_LIGHT : k == 'C' ? RGB(200, 20, 20) : (k >= '0' && k <= '9') || k == '.' ? C_BLACK : RGB(0, 70, 190);
+        if (slen(calc_lbl[i]) == 1) draw_str_s(bx + 15, by + 11, calc_lbl[i], col, 2);
+        else draw_str(bx + 11, by + 15, calc_lbl[i], col);
+    }
+}
+static void calc_click(int rx, int ry) {
+    int ox = (CW(A_CALC) - 196) / 2;
+    for (int i = 0; i < 20; i++)
+        if (inrect(rx, ry, ox + (i % 4) * 50, 58 + (i / 4) * 42, 46, 38)) { calc_press(calc_map[i]); return; }
+}
+static void calc_key(int k) {
+    if (k >= '0' && k <= '9') calc_press(k);
+    else if (k == '+' || k == '-' || k == '*' || k == '/' || k == '.' || k == '%') calc_press(k);
+    else if (k == 'x' || k == 'X') calc_press('*');
+    else if (k == '=' || k == '\n') calc_press('=');
+    else if (k == '\b') calc_press('<');
+    else if (k == 'c' || k == 'C' || k == K_ESC) calc_press('C');
 }
 
 /* ------------------------------------------------------------------ */
@@ -1460,6 +1605,7 @@ static void app_init(int a) {
     } else if (a == A_INSTALL) inst_state = 0;
     else if (a == A_SETTINGS) set_msg[0] = 0;
     else if (a == A_TASK) tsel = -1;
+    else if (a == A_CALC) calc_reset();
 }
 static void app_draw(int a, int x, int y, int w, int h) {
     clip_set(x, y, w, h);
@@ -1474,6 +1620,7 @@ static void app_draw(int a, int x, int y, int w, int h) {
     case A_INSTALL: install_draw(x, y, w, h); break;
     case A_SETTINGS: settings_draw(x, y, w, h); break;
     case A_TASK: task_draw(x, y, w, h); break;
+    case A_CALC: calc_draw(x, y, w, h); break;
     }
     clip_reset();
 }
@@ -1486,11 +1633,13 @@ static void app_click(int a, int rx, int ry) {
     case A_INSTALL: install_click(rx, ry); break;
     case A_SETTINGS: settings_click(rx, ry); break;
     case A_TASK: task_click(rx, ry); break;
+    case A_CALC: calc_click(rx, ry); break;
     }
 }
 static void app_key(int a, int k) {
     if (a == A_TERM) term_key(k);
     else if (a == A_NOTE) note_key(k);
+    else if (a == A_CALC) calc_key(k);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1498,7 +1647,9 @@ static void app_key(int a, int k) {
 /* ------------------------------------------------------------------ */
 #define UBAR_H 24            /* Unity top panel */
 #define LAUNCH_W 52          /* Unity left launcher */
-#define LAUNCH_SLOT 44
+#define LAUNCH_SLOT 40
+#define START_W 84
+#define TB_X0 90
 #define LAUNCH_TOP (UBAR_H + 52)
 
 static int area_x0, area_y0, area_y1;   /* usable desktop area for windows */
@@ -1566,8 +1717,8 @@ static void theme_apply(int id) {
     for (int a = 0; a < N_APPS; a++) clamp_win(&wins[a]);
 }
 
-static const char *icon_label[10] = { "Terminal", "Notepad", "Paint", "Files", "Clock", "About", "Install", "Settings", "Tasks", "Reboot" };
-#define N_ICONS 10
+static const char *icon_label[11] = { "Terminal", "Notepad", "Paint", "Files", "Clock", "About", "Install", "Settings", "Tasks", "Calc", "Reboot" };
+#define N_ICONS 11
 static int icon_x(int i) { return area_x0 + 14 + (i / 4) * 84; }
 static int icon_y(int i) { return area_y0 + 12 + (i % 4) * 82; }
 static int icon_sel = -1;
@@ -1592,7 +1743,11 @@ static void draw_icon(int i, int x, int y) {
     case 8:  /* task manager: window with bars */
         rect(x, y + 2, 32, 28, C_LIGHT); frame(x, y + 2, 32, 28, C_DARK); rect(x + 1, y + 3, 30, 4, RGB(60, 110, 220));
         rect(x + 5, y + 20, 5, 7, RGB(60, 170, 70)); rect(x + 13, y + 14, 5, 13, RGB(60, 170, 70)); rect(x + 21, y + 17, 5, 10, RGB(220, 160, 40)); break;
-    case 9: fill_circle(x + 16, y + 16, 15, RGB(210, 60, 30)); fill_circle(x + 16, y + 16, 8, RGB(255, 255, 255)); fill_circle(x + 16, y + 16, 6, RGB(210, 60, 30)); rect(x + 14, y + 3, 4, 14, C_LIGHT); break;
+    case 9:  /* calculator */
+        rect(x + 3, y, 26, 32, RGB(120, 128, 142)); rect(x + 5, y + 3, 22, 8, RGB(150, 220, 150));
+        for (int k = 0; k < 9; k++) { rect(x + 6 + (k % 3) * 7, y + 14 + (k / 3) * 6, 5, 4, k == 8 ? RGB(60, 130, 245) : RGB(225, 228, 235)); }
+        break;
+    case 10: fill_circle(x + 16, y + 16, 15, RGB(210, 60, 30)); fill_circle(x + 16, y + 16, 8, RGB(255, 255, 255)); fill_circle(x + 16, y + 16, 6, RGB(210, 60, 30)); rect(x + 14, y + 3, 4, 14, C_LIGHT); break;
     }
 }
 static void draw_desktop(void) {
@@ -1658,7 +1813,7 @@ static void draw_window(int a) {
 static struct rtc cached_rtc; static u32 rtc_tick = 0xFFFFFFFF;
 static int tb_count(void) { int n = 0; for (int a = 0; a < N_APPS; a++) n += wins[a].open ? 1 : 0; return n; }
 static int tb_bw(void) {
-    int n = tb_count(), avail = W - 74 - 70;
+    int n = tb_count(), avail = W - TB_X0 - 70;
     if (n <= 0) return 104;
     int bw = avail / n - 4;
     return bw > 104 ? 104 : bw;
@@ -1673,10 +1828,12 @@ static void bar_title(const char *t, int bw, char *out) {
 static void bar_xp(void) {
     gradient_v(0, H - TB_H, W, TB_H, RGB(60, 130, 245), RGB(30, 88, 220));
     rect(0, H - TB_H, W, 1, RGB(120, 170, 255));
-    gradient_v(0, H - TB_H, 68, TB_H, RGB(74, 170, 74), RGB(44, 130, 44));
-    rect(0, H - TB_H, 68, 1, RGB(140, 220, 140));
-    draw_str(10, H - TB_H + 10, "start", C_LIGHT);
-    int bx = 74, bw = tb_bw();
+    gradient_v(0, H - TB_H, START_W, TB_H, RGB(74, 170, 74), RGB(44, 130, 44));
+    rect(0, H - TB_H, START_W, 1, RGB(140, 220, 140));
+    rect(2, H - TB_H + 2, 32, 24, C_LIGHT);
+    blit_argb(4, H - TB_H + 3, logoflag_W, logoflag_H, logoflag);
+    draw_str(40, H - TB_H + 10, "start", C_LIGHT);
+    int bx = TB_X0, bw = tb_bw();
     for (int a = 0; a < N_APPS; a++) {
         if (!wins[a].open) continue;
         int active = top_app() == a;
@@ -1693,12 +1850,12 @@ static void bar_xp(void) {
 static void bar_kde(void) {
     gradient_v(0, H - TB_H, W, TB_H, RGB(214, 220, 232), RGB(158, 168, 190));
     rect(0, H - TB_H, W, 1, C_LIGHT);
-    gradient_v(0, H - TB_H, 68, TB_H, RGB(100, 150, 218), RGB(52, 102, 182));
-    rect(68, H - TB_H, 1, TB_H, RGB(60, 96, 160));
-    fill_circle(15, H - TB_H / 2, 9, C_LIGHT);
-    draw_str(11, H - TB_H / 2 - 4, "K", RGB(40, 90, 180));
-    draw_str(30, H - TB_H + 10, "Menu", C_LIGHT);
-    int bx = 74, bw = tb_bw();
+    gradient_v(0, H - TB_H, START_W, TB_H, RGB(100, 150, 218), RGB(52, 102, 182));
+    rect(START_W, H - TB_H, 1, TB_H, RGB(60, 96, 160));
+    fill_circle(16, H - TB_H / 2, 10, C_LIGHT);
+    draw_str(12, H - TB_H / 2 - 4, "K", RGB(40, 90, 180));
+    draw_str(34, H - TB_H + 10, "Menu", C_LIGHT);
+    int bx = TB_X0, bw = tb_bw();
     for (int a = 0; a < N_APPS; a++) {
         if (!wins[a].open) continue;
         int active = top_app() == a;
@@ -1724,9 +1881,9 @@ static void bar_unity(void) {
         int ty = LAUNCH_TOP + i * LAUNCH_SLOT;
         if (wins[i].open) {
             rect(2, ty + 1, LAUNCH_W - 4, LAUNCH_SLOT - 2, top_app() == i ? RGB(100, 92, 86) : RGB(72, 66, 62));
-            rect(0, ty + 15, 3, 10, C_LIGHT);
+            rect(0, ty + 14, 3, 10, C_LIGHT);
         }
-        draw_icon(i, 10, ty + 6);
+        draw_icon(i, 10, ty + 4);
     }
     /* top panel */
     gradient_v(0, 0, W, UBAR_H, RGB(70, 69, 65), RGB(40, 39, 36));
@@ -1746,9 +1903,11 @@ static void draw_bar(void) {
 static void draw_startmenu(void) {
     rect(sm_x, sm_y, SM_W, SM_H, th->menu_bg); frame(sm_x, sm_y, SM_W, SM_H, th->menu_edge);
     gradient_v(sm_x + 1, sm_y + 1, SM_W - 2, SM_HEAD - 1, th->menu_h1, th->menu_h2);
-    draw_str(sm_x + 10, sm_y + 11, th->menu_title, C_LIGHT);
+    rect(sm_x + 6, sm_y + 3, 32, 24, C_LIGHT);
+    blit_argb(sm_x + 8, sm_y + 4, logoflag_W, logoflag_H, logoflag);
+    draw_str(sm_x + 46, sm_y + 11, th->menu_title, C_LIGHT);
     static const u32 bc[N_APPS] = { RGB(60, 60, 70), RGB(60, 110, 220), RGB(220, 60, 50), RGB(240, 200, 60), RGB(120, 120, 130),
-                                    RGB(40, 100, 220), RGB(80, 160, 80), RGB(140, 146, 160), RGB(60, 170, 70) };
+                                    RGB(40, 100, 220), RGB(80, 160, 80), RGB(140, 146, 160), RGB(60, 170, 70), RGB(90, 100, 120) };
     for (int i = 0; i < SM_N; i++) {
         int iy = sm_y + SM_HEAD + i * SM_ITEM;
         const char *t = i < N_APPS ? app_names[i] : i == N_APPS ? "Restart" : "Shut Down";
@@ -1798,8 +1957,8 @@ static int panel_press(int x, int y, int was_open) {
         return 0;
     }
     if (y < H - TB_H) return 0;
-    if (x < 68) { start_open = !was_open; return 1; }
-    int bx = 74, bw = tb_bw();
+    if (x < START_W) { start_open = !was_open; return 1; }
+    int bx = TB_X0, bw = tb_bw();
     for (int a = 0; a < N_APPS; a++) {
         if (!wins[a].open) continue;
         if (inrect(x, y, bx, H - TB_H + 3, bw, TB_H - 6)) { toggle_app(a); return 1; }
@@ -1882,6 +2041,17 @@ static void os_events(void) {
     prev_btn = left;
 }
 
+static void splash(int pct, const char *msg) {
+    clip_reset();
+    rect(0, 0, W, H, RGB(255, 255, 255));
+    blit_argb((W - logo192_W) / 2, 60, logo192_W, logo192_H, logo192);
+    draw_str_c(W / 2, 276, "Starting LeactedOS...", RGB(70, 70, 70));
+    int bx = (W - 240) / 2;
+    rect(bx, 300, 240, 12, RGB(230, 230, 230)); frame(bx, 300, 240, 12, RGB(120, 120, 120));
+    rect(bx + 2, 302, 236 * pct / 100, 8, RGB(210, 30, 30));
+    draw_str_c(W / 2, 322, msg, RGB(120, 120, 120));
+    flip();
+}
 static void os_init(u32 magic, const u32 *mbi) {
     boot_via_multiboot = magic == 0x2BADB002;
     if (boot_via_multiboot && mbi && (mbi[0] & 1)) mem_kb = 1024 + mbi[2];
@@ -1889,14 +2059,20 @@ static void os_init(u32 magic, const u32 *mbi) {
     mem_kb = 262144;
 #endif
     video_init();
+    irq_init();
+    splash(5, "Video");
     memset(canvas, 1, sizeof canvas);
     ps2_init();
+    splash(30, "Keyboard and mouse");
     ata_identify();
+    splash(55, "Disk");
     fs_check();
     fs_load();
     settings_load();
+    splash(80, "Files and settings");
     theme_apply(th_id);
-    irq_init();
+    splash(100, "Desktop");
+    sleep_ticks(70);
     open_app(A_TERM);
 }
 

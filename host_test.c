@@ -98,7 +98,7 @@ int main(void) {
     /* close via X */
     click(wins[a].x + wins[a].w - 15, wins[a].y + 15); assert(!wins[a].open);
     /* minimize via taskbar */
-    int top = top_app(); int bx = 74; for (int k = 0; k < top; k++) if (wins[k].open) bx += tb_bw() + 4;
+    int top = top_app(); int bx = TB_X0; for (int k = 0; k < top; k++) if (wins[k].open) bx += tb_bw() + 4;
     click(bx + 10, H - 12); assert(wins[top].min);
     click(bx + 10, H - 12); assert(!wins[top].min && top_app() == top);
     for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
@@ -139,8 +139,40 @@ int main(void) {
     /* task manager: end task */
     tsel = A_SETTINGS;
     raise_app(A_TASK); int tx = CX(A_TASK), ty = CY(A_TASK);
-    click(tx + 20, ty + 150); assert(!wins[A_SETTINGS].open);
+    click(tx + 20, ty + 160); assert(!wins[A_SETTINGS].open);
     for (int k = 0; k < 3; k++) { theme_apply(k); for (int a2 = 0; a2 < N_APPS; a2++) { open_app(a2); assert(wins[a2].y >= area_y0); } }
+    /* ---- calculator ---- */
+    cmd("theme xp");
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    open_app(A_CALC);
+    char b[24];
+    #define KEYS(str) do { for (const char *p_ = (str); *p_; p_++) calc_key(*p_); } while (0)
+    calc_reset(); KEYS("12.5*4="); calc_fmt(c_acc, b); assert(!strcmp(b, "50"));
+    calc_reset(); KEYS("10/4="); calc_fmt(c_acc, b); assert(!strcmp(b, "2.5"));
+    calc_reset(); KEYS("1/3="); calc_fmt(c_acc, b); assert(!strcmp(b, "0.33"));
+    calc_reset(); KEYS("5/0="); assert(c_err);
+    calc_press('C'); assert(!c_err);
+    calc_reset(); KEYS("7+8*2="); calc_fmt(c_acc, b); assert(!strcmp(b, "30"));      /* left to right, like a basic calculator */
+    calc_reset(); KEYS("9-12="); calc_fmt(c_acc, b); assert(!strcmp(b, "-3"));
+    calc_reset(); KEYS("3.14"); calc_fmt_entry(b); assert(!strcmp(b, "3.14"));
+    KEYS("\b"); calc_fmt_entry(b); assert(!strcmp(b, "3.1"));
+    calc_reset(); KEYS("50%"); calc_fmt_entry(b); assert(!strcmp(b, "0.50"));
+    calc_reset(); KEYS("5"); calc_press('N'); KEYS("*3="); calc_fmt(c_acc, b); assert(!strcmp(b, "-15"));
+    calc_reset(); KEYS("99999999*99999999="); assert(c_err);
+    calc_reset(); KEYS("2*3="); KEYS("+4="); calc_fmt(c_acc, b); assert(!strcmp(b, "10"));  /* continue after = */
+    calc_reset();
+    /* clicking buttons: 6 * 7 = */
+    int kx = CX(A_CALC), ky = CY(A_CALC), cox = (CW(A_CALC) - 196) / 2;
+    raise_app(A_CALC);
+    #define BTN(i) click(kx + cox + ((i) % 4) * 50 + 20, ky + 58 + ((i) / 4) * 42 + 15)
+    BTN(10); BTN(7); BTN(4); BTN(19);   /* 6 * 7 = */
+    calc_fmt(c_acc, b); assert(!strcmp(b, "42"));
+    frame_out("t11_calc_xp.ppm");
+    open_app(A_ABOUT); wins[A_ABOUT].x = 40; wins[A_ABOUT].y = 20; wins[A_CALC].x = 300;
+    frame_out("t12_about_calc_xp.ppm");
+    start_open = 1; mx = 40; my = 200; frame_out("t13_xp_menu.ppm"); start_open = 0;
+    splash(60, "Files and settings"); ppm("t14_splash.ppm");
+    theme_apply(TH_UNITY); frame_out("t15_unity_logo.ppm");
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }
