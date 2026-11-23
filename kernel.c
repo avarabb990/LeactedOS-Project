@@ -431,6 +431,10 @@ static void video_init(void) {
 #define K_LEFT  0x102
 #define K_RIGHT 0x103
 #define K_DEL   0x104
+#define K_PGUP  0x105
+#define K_PGDN  0x106
+#define K_HOME  0x107
+#define K_END   0x108
 #define K_ESC   27
 
 static const char sc_lo[] = "\0\x1b" "1234567890-=" "\b\t" "qwertyuiop[]" "\n\0" "asdfghjkl;'`" "\0\\" "zxcvbnm,./" "\0*\0 ";
@@ -461,6 +465,10 @@ static void kbd_scancode(u8 sc) {
         case 0x4B: kq_push(K_LEFT); break;
         case 0x4D: kq_push(K_RIGHT); break;
         case 0x53: kq_push(K_DEL); break;
+        case 0x49: kq_push(K_PGUP); break;
+        case 0x51: kq_push(K_PGDN); break;
+        case 0x47: kq_push(K_HOME); break;
+        case 0x4F: kq_push(K_END); break;
         case 0x1D: k_ctrl = 1; break;
         case 0x35: kq_push('/'); break;
         case 0x1C: kq_push('\n'); break;
@@ -542,93 +550,263 @@ static void ps2_init(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* ATA PIO (primary master, LBA28)                                     */
+/* ATA PIO: up to four IDE drives (C: D: E: F:), LBA28                 */
 /* ------------------------------------------------------------------ */
-static int disk_present;
-static u32 disk_sectors;
-static char disk_model[41];
+enum { DT_NONE, DT_EMPTY, DT_LEACTED, DT_FAT };
+#define N_DRIVES 4
+struct drive { int present; u32 sectors; char model[41]; int type; int fatbits; };
+static struct drive drv[N_DRIVES];
 #ifdef HOST
-#define FAKE_SECT 4096
-static u8 fakedisk[FAKE_SECT * 512];
+static u8 *fakedisk[N_DRIVES];
+static u32 fakesect[N_DRIVES];
 #endif
 
+static int n_drives(void) { int n = 0; for (int d = 0; d < N_DRIVES; d++) n += drv[d].present ? 1 : 0; return n; }
+static void dtype_str(int d, char *o, int n) {
+    if (!drv[d].present) kstrcpy(o, "-", n);
+    else if (drv[d].type == DT_LEACTED) kstrcpy(o, "LeactedFS", n);
+    else if (drv[d].type == DT_FAT) ksnprintf(o, n, "FAT%d", drv[d].fatbits);
+    else kstrcpy(o, "Unformatted", n);
+}
+
 #ifndef HOST
-static int ata_wait_ready(void) {
-    for (int i = 0; i < 1000000; i++) { u8 s = inb(0x1F7); if (!(s & 0x80)) return s; }
+static const u16 ata_base[2] = { 0x1F0, 0x170 };
+static const u16 ata_ctl[2] = { 0x3F6, 0x376 };
+static int ata_wait_ready(u16 base) {
+    for (int i = 0; i < 1000000; i++) { u8 s = inb(base + 7); if (!(s & 0x80)) return s; }
     return -1;
 }
-static int ata_wait_drq(void) {
+static int ata_wait_drq(u16 base) {
     for (int i = 0; i < 1000000; i++) {
-        u8 s = inb(0x1F7);
+        u8 s = inb(base + 7);
         if (s & 0x21) return 0;                  /* ERR or DF */
         if (!(s & 0x80) && (s & 0x08)) return 1;
     }
     return 0;
 }
+static void ata_delay(int ch) { for (int i = 0; i < 4; i++) inb(ata_ctl[ch]); }
 #endif
 
-static void ata_identify(void) {
-    disk_present = 0; disk_sectors = 0; disk_model[0] = 0;
+static void ata_identify_all(void) {
+    for (int d = 0; d < N_DRIVES; d++) {
+        memset(&drv[d], 0, sizeof drv[d]);
 #ifdef HOST
-    disk_present = 1; disk_sectors = FAKE_SECT; kstrcpy(disk_model, "HOST FAKE DISK", sizeof disk_model);
+        if (fakedisk[d] && fakesect[d]) {
+            drv[d].present = 1; drv[d].sectors = fakesect[d];
+            ksnprintf(drv[d].model, sizeof drv[d].model, "HOST DISK %d", d);
+        }
 #else
-    if (inb(0x1F7) == 0xFF) return;              /* floating bus: no controller */
-    outb(0x1F6, 0xA0);
-    for (int i = 0; i < 4; i++) inb(0x3F6);
-    outb(0x1F2, 0); outb(0x1F3, 0); outb(0x1F4, 0); outb(0x1F5, 0);
-    outb(0x1F7, 0xEC);
-    if (inb(0x1F7) == 0) return;
-    if (ata_wait_ready() < 0) return;
-    if (inb(0x1F4) || inb(0x1F5)) return;        /* ATAPI/SATA signature: not plain ATA */
-    if (!ata_wait_drq()) return;
-    u16 id[256];
-    for (int i = 0; i < 256; i++) id[i] = inw(0x1F0);
-    disk_sectors = id[60] | ((u32)id[61] << 16);
-    for (int i = 0; i < 20; i++) { disk_model[i * 2] = id[27 + i] >> 8; disk_model[i * 2 + 1] = id[27 + i] & 255; }
-    disk_model[40] = 0;
-    for (int i = 39; i >= 0 && disk_model[i] == ' '; i--) disk_model[i] = 0;
-    disk_present = disk_sectors > 0;
+        int ch = d >> 1; u16 base = ata_base[ch];
+        if (inb(base + 7) == 0xFF) continue;     /* floating bus: no controller here */
+        outb(base + 6, 0xA0 | ((d & 1) << 4)); ata_delay(ch);
+        outb(base + 2, 0); outb(base + 3, 0); outb(base + 4, 0); outb(base + 5, 0);
+        outb(base + 7, 0xEC); ata_delay(ch);
+        if (inb(base + 7) == 0) continue;        /* nothing answers */
+        if (ata_wait_ready(base) < 0) continue;
+        if (inb(base + 7) & 1) continue;         /* error: not an ATA disk */
+        if (inb(base + 4) || inb(base + 5)) continue;   /* ATAPI (CD-ROM) signature */
+        if (!ata_wait_drq(base)) continue;
+        u16 id[256];
+        for (int i = 0; i < 256; i++) id[i] = inw(base);
+        u32 sec = id[60] | ((u32)id[61] << 16);
+        if (!sec) continue;
+        drv[d].sectors = sec;
+        for (int i = 0; i < 20; i++) { drv[d].model[i * 2] = id[27 + i] >> 8; drv[d].model[i * 2 + 1] = id[27 + i] & 255; }
+        drv[d].model[40] = 0;
+        for (int i = 39; i >= 0 && drv[d].model[i] == ' '; i--) drv[d].model[i] = 0;
+        drv[d].present = 1;
 #endif
+    }
 }
 
-static int ata_read(u32 lba, int count, void *buf) {
-    if (!disk_present || lba + count > disk_sectors) return 0;
+static int ata_read(int d, u32 lba, int count, void *buf) {
+    if (d < 0 || d >= N_DRIVES || !drv[d].present || count < 1 || count > 255 || lba + count > drv[d].sectors) return 0;
 #ifdef HOST
-    memcpy(buf, &fakedisk[lba * 512], count * 512); return 1;
+    memcpy(buf, fakedisk[d] + (size_t)lba * 512, (size_t)count * 512); return 1;
 #else
+    int ch = d >> 1; u16 base = ata_base[ch];
     u16 *p = buf;
-    if (ata_wait_ready() < 0) return 0;
-    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(0x1F2, count); outb(0x1F3, lba); outb(0x1F4, lba >> 8); outb(0x1F5, lba >> 16);
-    outb(0x1F7, 0x20);
+    if (ata_wait_ready(base) < 0) return 0;
+    outb(base + 6, 0xE0 | ((d & 1) << 4) | ((lba >> 24) & 0x0F)); ata_delay(ch);
+    outb(base + 2, count); outb(base + 3, lba); outb(base + 4, lba >> 8); outb(base + 5, lba >> 16);
+    outb(base + 7, 0x20);
     for (int s = 0; s < count; s++) {
-        if (!ata_wait_drq()) return 0;
-        for (int i = 0; i < 256; i++) *p++ = inw(0x1F0);
+        if (!ata_wait_drq(base)) return 0;
+        for (int i = 0; i < 256; i++) *p++ = inw(base);
     }
     return 1;
 #endif
 }
-static int ata_write(u32 lba, int count, const void *buf) {
-    if (!disk_present || lba + count > disk_sectors) return 0;
+static int ata_write(int d, u32 lba, int count, const void *buf) {
+    if (d < 0 || d >= N_DRIVES || !drv[d].present || count < 1 || count > 255 || lba + count > drv[d].sectors) return 0;
 #ifdef HOST
-    memcpy(&fakedisk[lba * 512], buf, count * 512); return 1;
+    memcpy(fakedisk[d] + (size_t)lba * 512, buf, (size_t)count * 512); return 1;
 #else
+    int ch = d >> 1; u16 base = ata_base[ch];
     const u16 *p = buf;
-    if (ata_wait_ready() < 0) return 0;
-    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(0x1F2, count); outb(0x1F3, lba); outb(0x1F4, lba >> 8); outb(0x1F5, lba >> 16);
-    outb(0x1F7, 0x30);
+    if (ata_wait_ready(base) < 0) return 0;
+    outb(base + 6, 0xE0 | ((d & 1) << 4) | ((lba >> 24) & 0x0F)); ata_delay(ch);
+    outb(base + 2, count); outb(base + 3, lba); outb(base + 4, lba >> 8); outb(base + 5, lba >> 16);
+    outb(base + 7, 0x30);
     for (int s = 0; s < count; s++) {
-        if (!ata_wait_drq()) return 0;
-        for (int i = 0; i < 256; i++) outw(0x1F0, *p++);
+        if (!ata_wait_drq(base)) return 0;
+        for (int i = 0; i < 256; i++) outw(base, *p++);
     }
-    outb(0x1F7, 0xE7);                           /* flush cache */
-    return ata_wait_ready() >= 0;
+    outb(base + 7, 0xE7);                        /* flush cache */
+    return ata_wait_ready(base) >= 0;
 #endif
 }
 
 /* ------------------------------------------------------------------ */
-/* LeactedFS                                                           */
+/* FAT12 / FAT16 / FAT32 (read only, 512-byte sectors, long names)     */
+/* ------------------------------------------------------------------ */
+struct fatvol {
+    int drive, type;                              /* type: 12, 16 or 32 */
+    u32 base, spc, nfats, fat_lba, fatsz, root_lba, root_sectors, root_cluster, data_lba, clusters;
+};
+struct dent { char name[44]; u32 size; u32 cluster; u8 isdir; };
+#define MAX_DENT 200
+
+static u8 fat_cache[512]; static int fat_cache_drive = -1; static u32 fat_cache_lba;
+static const u8 *fat_sector(int d, u32 lba) {
+    if (fat_cache_drive == d && fat_cache_lba == lba) return fat_cache;
+    if (!ata_read(d, lba, 1, fat_cache)) { fat_cache_drive = -1; return NULL; }
+    fat_cache_drive = d; fat_cache_lba = lba;
+    return fat_cache;
+}
+static u32 rd16(const u8 *p) { return p[0] | (p[1] << 8); }
+static u32 rd32(const u8 *p) { return p[0] | (p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+
+static int is_bpb(const u8 *s) {
+    if (s[510] != 0x55 || s[511] != 0xAA) return 0;
+    if (s[0] != 0xEB && s[0] != 0xE9) return 0;
+    u32 bps = rd16(s + 11), spc = s[13], rsvd = rd16(s + 14), nf = s[16];
+    if (bps != 512 || !spc || (spc & (spc - 1)) || !rsvd || nf < 1 || nf > 2) return 0;
+    return 1;
+}
+static int fat_mount(int d, struct fatvol *v) {
+    u8 s[512]; u32 base = 0;
+    if (!ata_read(d, 0, 1, s)) return 0;
+    if (s[510] != 0x55 || s[511] != 0xAA) return 0;
+    if (!is_bpb(s)) {                             /* maybe an MBR: look for a FAT partition */
+        int found = 0;
+        for (int i = 0; i < 4 && !found; i++) {
+            const u8 *e = s + 0x1BE + i * 16;
+            u8 t = e[4]; u32 lba = rd32(e + 8);
+            if ((t == 1 || t == 4 || t == 6 || t == 0xB || t == 0xC || t == 0xE) && lba > 0) { base = lba; found = 1; }
+        }
+        if (!found || !ata_read(d, base, 1, s) || !is_bpb(s)) return 0;
+    }
+    u32 spc = s[13], rsvd = rd16(s + 14), nf = s[16], rootent = rd16(s + 17);
+    u32 tot = rd16(s + 19) ? rd16(s + 19) : rd32(s + 32);
+    u32 fatsz = rd16(s + 22) ? rd16(s + 22) : rd32(s + 36);
+    if (!fatsz || !tot) return 0;
+    u32 rootsec = (rootent * 32 + 511) / 512;
+    u32 meta = rsvd + nf * fatsz + rootsec;
+    if (tot <= meta) return 0;
+    u32 clusters = (tot - meta) / spc;
+    v->drive = d; v->base = base; v->spc = spc; v->nfats = nf; v->fatsz = fatsz;
+    v->fat_lba = base + rsvd; v->root_sectors = rootsec;
+    v->root_lba = base + rsvd + nf * fatsz;
+    v->data_lba = base + meta; v->clusters = clusters;
+    v->type = clusters < 4085 ? 12 : clusters < 65525 ? 16 : 32;
+    v->root_cluster = 0;
+    if (v->type == 32) { v->root_cluster = rd32(s + 44); if (v->root_cluster < 2) return 0; }
+    return 1;
+}
+/* next cluster in a chain, or 0 at the end / on a bad entry */
+static u32 fat_next(const struct fatvol *v, u32 c) {
+    u32 off = v->type == 12 ? c + c / 2 : v->type == 16 ? c * 2 : c * 4;
+    u32 lba = v->fat_lba + off / 512, o = off % 512, val, eoc;
+    const u8 *s = fat_sector(v->drive, lba);
+    if (!s) return 0;
+    if (v->type == 12) {
+        u32 lo = s[o], hi;
+        if (o == 511) { const u8 *s2 = fat_sector(v->drive, lba + 1); if (!s2) return 0; hi = s2[0]; }
+        else hi = s[o + 1];
+        val = lo | (hi << 8);
+        val = (c & 1) ? val >> 4 : val & 0x0FFF;
+        eoc = 0xFF8;
+    } else if (v->type == 16) { val = rd16(s + o); eoc = 0xFFF8; }
+    else { val = rd32(s + o) & 0x0FFFFFFF; eoc = 0x0FFFFFF8; }
+    if (val < 2 || val >= eoc || val >= v->clusters + 2) return 0;
+    return val;
+}
+/* read the idx-th sector of a directory (cluster 0 = root); 0 when past the end */
+static int fat_dir_sector(const struct fatvol *v, u32 cluster, u32 idx, u8 *buf) {
+    if (cluster == 0 && v->type != 32) {
+        if (idx >= v->root_sectors) return 0;
+        return ata_read(v->drive, v->root_lba + idx, 1, buf);
+    }
+    if (cluster == 0) cluster = v->root_cluster;
+    u32 hops = idx / v->spc, c = cluster;
+    while (hops--) { c = fat_next(v, c); if (!c) return 0; }
+    return ata_read(v->drive, v->data_lba + (c - 2) * v->spc + (idx % v->spc), 1, buf);
+}
+static int fat_readdir(const struct fatvol *v, u32 cluster, struct dent *out, int max) {
+    static const u8 lpos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+    u8 s[512]; int n = 0, lfn_ok = 0; u8 lfn_chk = 0; char lfn[64];
+    for (u32 idx = 0; idx < 100000; idx++) {
+        if (!fat_dir_sector(v, cluster, idx, s)) break;
+        for (int o = 0; o < 512; o += 32) {
+            const u8 *e = s + o;
+            if (e[0] == 0) return n;
+            if (e[0] == 0xE5) { lfn_ok = 0; continue; }
+            u8 attr = e[11];
+            if (attr == 0x0F) {                   /* long-name fragment */
+                u8 seq = e[0]; int ord = seq & 0x1F;
+                if (seq & 0x40) { memset(lfn, 0, sizeof lfn); lfn_ok = 1; lfn_chk = e[13]; }
+                if (!lfn_ok || ord < 1) continue;
+                for (int k = 0; k < 13; k++) {
+                    u32 cp = rd16(e + lpos[k]);
+                    int at = (ord - 1) * 13 + k;
+                    if (at < (int)sizeof lfn - 1) lfn[at] = (cp == 0 || cp == 0xFFFF) ? 0 : cp < 128 ? (char)cp : '?';
+                }
+                continue;
+            }
+            if (attr & 0x08) { lfn_ok = 0; continue; }    /* volume label */
+            char nm[16]; int p = 0;
+            for (int i = 0; i < 8 && e[i] != ' '; i++) {
+                char c = e[i]; if (i == 0 && (u8)c == 0x05) c = '?';
+                nm[p++] = (e[12] & 0x08) ? klower(c) : c;
+            }
+            if (e[8] != ' ') {
+                nm[p++] = '.';
+                for (int i = 8; i < 11 && e[i] != ' '; i++) nm[p++] = (e[12] & 0x10) ? klower(e[i]) : e[i];
+            }
+            nm[p] = 0;
+            u8 sum = 0;
+            for (int i = 0; i < 11; i++) sum = (u8)(((sum & 1) << 7) + (sum >> 1) + e[i]);
+            int use_lfn = lfn_ok && sum == lfn_chk && lfn[0];
+            lfn_ok = 0;
+            if (!kstrcmp(nm, ".") || !kstrcmp(nm, "..")) continue;
+            if (n >= max) return n;
+            struct dent *d = &out[n++];
+            kstrcpy(d->name, use_lfn ? lfn : nm, sizeof d->name);
+            d->size = rd32(e + 28);
+            d->cluster = ((u32)rd16(e + 20) << 16) | rd16(e + 26);
+            if (v->type != 32) d->cluster &= 0xFFFF;
+            d->isdir = (attr & 0x10) ? 1 : 0;
+        }
+    }
+    return n;
+}
+static u32 fat_read_file(const struct fatvol *v, u32 cluster, u32 size, u8 *buf, u32 maxlen) {
+    static u8 cbuf[65536];
+    u32 csz = v->spc * 512, got = 0, guard = v->clusters + 2;
+    if (size > maxlen) size = maxlen;
+    if (csz > sizeof cbuf) return 0;
+    while (got < size && cluster >= 2 && guard--) {
+        if (!ata_read(v->drive, v->data_lba + (cluster - 2) * v->spc, v->spc, cbuf)) break;
+        u32 n = size - got < csz ? size - got : csz;
+        memcpy(buf + got, cbuf, n); got += n;
+        cluster = fat_next(v, cluster);
+    }
+    return got;
+}
+
+/* ------------------------------------------------------------------ */
+/* LeactedFS (lives on one drive: fs_drive)                            */
 /*  sector 0 : MBR with one partition (type 0xDA, non-FS data)         */
 /*  sector 1 : superblock "LEACTEDFS" 0x01, total sectors at +0x10     */
 /*  sector 2 : directory "LDIR" + 15 x { name[24], size, used }        */
@@ -642,6 +820,7 @@ struct fent { char name[FS_NAME]; u32 size; u32 used; };
 static struct fent fsdir[FS_MAX];
 static u8 fsdata[FS_MAX][FS_SLOT];
 static int fs_on_disk;                           /* LeactedFS volume present */
+static int fs_drive = -1;                        /* which drive holds it */
 
 static void fs_norm(char *d, const char *s) {
     int i = 0;
@@ -660,12 +839,12 @@ static int fs_flush_dir(void) {
     u8 sec[512]; memset(sec, 0, 512);
     memcpy(sec, "LDIR", 4);
     memcpy(sec + 4, fsdir, sizeof(fsdir));
-    return ata_write(2, 1, sec);
+    return ata_write(fs_drive, 2, 1, sec);
 }
 static int fs_flush_file(int i) {
     if (!fs_on_disk) return 1;
     int secs = (fsdir[i].size + 511) / 512;
-    if (secs && !ata_write(FS_DATA_LBA + i * 8, secs, fsdata[i])) return 0;
+    if (secs && !ata_write(fs_drive, FS_DATA_LBA + i * 8, secs, fsdata[i])) return 0;
     return fs_flush_dir();
 }
 /* returns slot or -1 (full) */
@@ -703,25 +882,34 @@ static void fs_defaults(void) {
     int i = fs_create("README.TXT");
     if (i >= 0) { memcpy(fsdata[i], readme, sizeof readme - 1); fsdir[i].size = sizeof readme - 1; }
 }
-static int fs_check(void) {
+/* classify one drive: LeactedFS, FAT or unformatted */
+static void drive_probe(int d) {
+    struct drive *v = &drv[d];
+    v->type = DT_NONE; v->fatbits = 0;
+    if (!v->present) return;
+    v->type = DT_EMPTY;
     u8 sec[512];
-    fs_on_disk = 0;
-    if (!disk_present || !ata_read(1, 1, sec)) return 0;
-    if (memcmp(sec, "LEAC", 4) != 0) return 0;
-    fs_on_disk = 1;
-    return 1;
+    if (ata_read(d, 1, 1, sec) && !memcmp(sec, "LEAC", 4)) { v->type = DT_LEACTED; return; }
+    struct fatvol fv;
+    if (fat_mount(d, &fv)) { v->type = DT_FAT; v->fatbits = fv.type; }
+}
+static int fs_check(void) {
+    fs_on_disk = 0; fs_drive = -1;
+    for (int d = 0; d < N_DRIVES; d++)
+        if (drv[d].present && drv[d].type == DT_LEACTED) { fs_on_disk = 1; fs_drive = d; return 1; }
+    return 0;
 }
 static void fs_load(void) {
     memset(fsdir, 0, sizeof fsdir);
     if (fs_on_disk) {
         u8 sec[512];
-        if (ata_read(2, 1, sec) && !memcmp(sec, "LDIR", 4)) {
+        if (ata_read(fs_drive, 2, 1, sec) && !memcmp(sec, "LDIR", 4)) {
             memcpy(fsdir, sec + 4, sizeof fsdir);
             for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
                 if (fsdir[i].size > FS_SLOT) fsdir[i].size = FS_SLOT;
                 fsdir[i].name[FS_NAME - 1] = 0;
                 int secs = (fsdir[i].size + 511) / 512;
-                if (secs) ata_read(FS_DATA_LBA + i * 8, secs, fsdata[i]);
+                if (secs) ata_read(fs_drive, FS_DATA_LBA + i * 8, secs, fsdata[i]);
             }
             return;
         }
@@ -731,25 +919,47 @@ static void fs_load(void) {
     }
     fs_defaults();
 }
-static int fs_install(void) {
-    if (!disk_present || disk_sectors < FS_DATA_LBA + FS_MAX * 8) return 0;
+/* format drive d as LeactedFS and copy the files that are in RAM onto it */
+static int fs_install(int d) {
+    if (d < 0 || d >= N_DRIVES || !drv[d].present || drv[d].sectors < FS_DATA_LBA + FS_MAX * 8) return 0;
     u8 sec[512];
     memset(sec, 0, 512);
     /* partition entry: type 0xDA, LBA 8, rest of disk */
     sec[0x1BE] = 0x00; sec[0x1BE + 4] = 0xDA;
-    u32 start = 8, len = disk_sectors - 8;
+    u32 start = 8, len = drv[d].sectors - 8;
     memcpy(sec + 0x1BE + 8, &start, 4); memcpy(sec + 0x1BE + 12, &len, 4);
     sec[510] = 0x55; sec[511] = 0xAA;
-    if (!ata_write(0, 1, sec)) return 0;
+    fat_cache_drive = -1;
+    if (!ata_write(d, 0, 1, sec)) return 0;
     memset(sec, 0, 512);
     memcpy(sec, "LEACTEDFS\x01", 10);
-    memcpy(sec + 0x10, &disk_sectors, 4);
-    if (!ata_write(1, 1, sec)) return 0;
-    fs_on_disk = 1;
-    /* keep the files that exist in RAM: write them all out */
-    if (!fs_flush_dir()) { fs_on_disk = 0; return 0; }
-    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && !fs_flush_file(i)) { fs_on_disk = 0; return 0; }
+    memcpy(sec + 0x10, &drv[d].sectors, 4);
+    if (!ata_write(d, 1, 1, sec)) return 0;
+    fs_on_disk = 1; fs_drive = d;
+    if (!fs_flush_dir()) { fs_on_disk = 0; fs_drive = -1; return 0; }
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && !fs_flush_file(i)) { fs_on_disk = 0; fs_drive = -1; return 0; }
+    drive_probe(d);
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* File references (what the File Manager hands to viewers)            */
+/* ------------------------------------------------------------------ */
+struct fref { int kind; int drive; u32 cluster, size; char name[48]; };   /* kind: 0 none, 1 LeactedFS slot, 2 FAT */
+static u32 fref_load(const struct fref *f, u8 *buf, u32 maxlen) {
+    if (f->kind == 1) {
+        int i = (int)f->cluster;
+        if (i < 0 || i >= FS_MAX || !fsdir[i].used) return 0;
+        u32 n = fsdir[i].size < maxlen ? fsdir[i].size : maxlen;
+        memcpy(buf, fsdata[i], n);
+        return n;
+    }
+    if (f->kind == 2) {
+        struct fatvol v;
+        if (!fat_mount(f->drive, &v)) return 0;
+        return fat_read_file(&v, f->cluster, f->size, buf, maxlen);
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -777,7 +987,8 @@ static void power_off(void) {
 /* ------------------------------------------------------------------ */
 /* Window manager                                                      */
 /* ------------------------------------------------------------------ */
-enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, N_APPS };
+enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, A_OPENWITH, A_HEX, A_IMG, N_APPS };
+#define N_PIN A_OPENWITH         /* apps shown in menus, launcher and on the desktop */
 static void theme_apply(int id);
 static void settings_save(void);
 
@@ -786,15 +997,18 @@ static struct win wins[N_APPS] = {
     [A_TERM]    = { 0, 0, 90, 24, 468, 340, "Terminal" },
     [A_NOTE]    = { 0, 0, 150, 50, 420, 300, "Notepad" },
     [A_PAINT]   = { 0, 0, 60, 20, 464, 372, "Paint" },
-    [A_FILES]   = { 0, 0, 110, 40, 420, 320, "File Manager" },
+    [A_FILES]   = { 0, 0, 50, 30, 540, 360, "File Manager" },
     [A_CLOCK]   = { 0, 0, 330, 40, 260, 310, "Clock" },
     [A_ABOUT]   = { 0, 0, 200, 60, 340, 288, "About LeactedOS" },
     [A_INSTALL] = { 0, 0, 140, 70, 380, 250, "LeactedOS Installer" },
     [A_SETTINGS] = { 0, 0, 120, 50, 380, 300, "Settings" },
-    [A_TASK]    = { 0, 0, 100, 30, 380, 320, "Task Manager" },
+    [A_TASK]    = { 0, 0, 100, 30, 380, 336, "Task Manager" },
     [A_CALC]    = { 0, 0, 260, 40, 232, 300, "Calculator" },
+    [A_OPENWITH] = { 0, 0, 170, 100, 300, 270, "Open With" },
+    [A_HEX]     = { 0, 0, 120, 50, 380, 330, "Hex Viewer" },
+    [A_IMG]     = { 0, 0, 90, 40, 440, 360, "Image Viewer" },
 };
-static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager", "Calculator" };
+static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager", "Calculator", "Open With", "Hex Viewer", "Image Viewer" };
 static int zo[N_APPS], nz;
 
 #define TITLE_H 22
@@ -866,6 +1080,18 @@ static void note_open_file(const char *name) {
     if (i >= 0) { nlen = fsdir[i].size < NOTE_MAX ? fsdir[i].size : NOTE_MAX; memcpy(nbuf, fsdata[i], nlen); nbuf[nlen] = 0; }
 }
 
+static void note_open_data(const char *name, const u8 *data, u32 len, int ro, int cut) {
+    open_app(A_NOTE);
+    kstrcpy(nname, name, FS_NAME);
+    nlen = 0;
+    for (u32 i = 0; i < len && nlen < NOTE_MAX; i++) {
+        u8 c = data[i];
+        if (c == '\r') continue;
+        nbuf[nlen++] = (c == '\n') ? '\n' : (c == '\t') ? ' ' : (c >= 32 && c < 127) ? (char)c : '.';
+    }
+    nbuf[nlen] = 0; ndirty = 0;
+    kstrcpy(nmsg, ro ? (cut ? "Read-only copy (cut to 4 KB)" : "Read-only copy; Save keeps a copy") : "", sizeof nmsg);
+}
 static int split_args(char *s, char **argv, int max) {
     int n = 0;
     while (*s && n < max) {
@@ -991,10 +1217,14 @@ static void run_cmd(char *line) {
         else tputs("Memory size unknown (no multiboot info).\n");
         tprintf("Kernel back buffer: %u KB\n", (u32)(sizeof back / 1024));
     }
-    else if (!kstrcmp(c, "disk")) {
-        if (!disk_present) { tputs("No disk detected.\nStart QEMU with: -drive file=disk.img,format=raw,if=ide\n"); return; }
-        tprintf("Disk: %s\n%u sectors (%u MB)\n", disk_model, disk_sectors, disk_sectors / 2048);
-        tprintf("Filesystem: %s\n", fs_on_disk ? "LeactedFS v1" : "none (use the Installer)");
+    else if (!kstrcmp(c, "disk") || !kstrcmp(c, "drives")) {
+        if (!n_drives()) { tputs("No disk detected.\nStart QEMU with: -drive file=disk.img,format=raw,if=ide\n"); return; }
+        for (int d = 0; d < N_DRIVES; d++) {
+            if (!drv[d].present) continue;
+            char t[16]; dtype_str(d, t, sizeof t);
+            tprintf(" %c: %s  %u MB  %s\n", 'C' + d, drv[d].model, drv[d].sectors / 2048, t);
+        }
+        tprintf("LeactedFS: %s\n", fs_on_disk ? "mounted from a drive" : "RAM only (use the Installer)");
     }
     else if (!kstrcmp(c, "beep")) {
         i32 hz = 880; if (ac > 1) parse_int(av[1], &hz);
@@ -1220,59 +1450,439 @@ static void clock_draw(int x, int y, int w, int h) {
 }
 
 /* ------------------------------------------------------------------ */
-/* File manager                                                        */
+/* Hex viewer                                                          */
 /* ------------------------------------------------------------------ */
-static int fsel = -1;
-static u32 flast_tick; static int flast_row = -1;
-static void files_draw(int x, int y, int w, int h) {
-    draw_str(x + 8, y + 6, "Physical Drives", C_TEXT);
-    rect(x + 6, y + 20, w - 12, 34, C_LIGHT); frame(x + 6, y + 20, w - 12, 34, C_DARK);
-    rect(x + 12, y + 28, 24, 18, RGB(150, 150, 160)); rect(x + 14, y + 40, 6, 3, RGB(60, 220, 60));
-    draw_str(x + 44, y + 24, "Local Disk (C:)", C_TEXT);
-    if (!disk_present) draw_str(x + 44, y + 38, "No drive - files are RAM only", RGB(160, 0, 0));
-    else if (fs_on_disk) drawf(x + 44, y + 38, RGB(0, 110, 0), "LeactedFS v1 - %u MB, saved to disk", disk_sectors / 2048);
-    else draw_str(x + 44, y + 38, "Unformatted - use the Installer", RGB(160, 100, 0));
-    rect(x + 6, y + 60, w - 12, 12, C_DARK);
-    draw_str(x + 10, y + 62, "Name", C_LIGHT); draw_str(x + w - 90, y + 62, "Size", C_LIGHT);
-    int row = 0;
-    for (int i = 0; i < FS_MAX; i++) {
-        if (!fsdir[i].used) continue;
-        int ry = y + 74 + row * 11;
-        if (i == fsel) rect(x + 6, ry - 1, w - 12, 11, RGB(49, 106, 197));
-        u32 fg = i == fsel ? C_LIGHT : C_TEXT;
-        draw_str(x + 10, ry, fsdir[i].name, fg);
-        drawf(x + w - 90, ry, fg, "%u B", fsdir[i].size);
-        row++;
+#define HEX_MAX 131072
+static u8 hbuf[HEX_MAX];
+static u32 hlen, htotal, hscroll;
+static char hname[48];
+
+static void hex_open(const struct fref *f) {
+    open_app(A_HEX);
+    kstrcpy(hname, f->name, sizeof hname);
+    hlen = fref_load(f, hbuf, HEX_MAX);
+    htotal = f->size ? f->size : hlen;
+    hscroll = 0;
+}
+static int hex_rows(int h) { return (h - 66) / 10; }
+static u32 hex_maxscroll(int rows) { u32 tr = (hlen + 7) / 8; return tr > (u32)rows ? tr - rows : 0; }
+static void hex_draw(int x, int y, int w, int h) {
+    int rows = hex_rows(h);
+    char nm[42]; kstrcpy(nm, hname, sizeof nm);
+    draw_str(x + 8, y + 6, nm, C_TEXT);
+    drawf(x + 8, y + 18, C_DARK, "%u bytes%s", htotal, htotal > hlen ? " (first 128 KB shown)" : "");
+    rect(x + 6, y + 32, w - 12, rows * 10 + 6, RGB(16, 18, 28));
+    for (int r = 0; r < rows; r++) {
+        u32 off = (hscroll + r) * 8;
+        if (off >= hlen) break;
+        char b[32], a[10]; int p = 0;
+        for (int k = 0; k < 8; k++) {
+            if (off + k < hlen) {
+                u8 c = hbuf[off + k];
+                p += ksnprintf(b + p, (int)sizeof b - p, "%02x ", c);
+                a[k] = (c >= 32 && c < 127) ? (char)c : '.';
+            } else { b[p++] = ' '; b[p++] = ' '; b[p++] = ' '; a[k] = ' '; }
+        }
+        b[p] = 0; a[8] = 0;
+        int ry = y + 35 + r * 10;
+        drawf(x + 12, ry, RGB(110, 190, 230), "%05x", off);
+        draw_str(x + 68, ry, b, RGB(210, 210, 215));
+        draw_str(x + 68 + 24 * 8 + 6, ry, a, RGB(120, 230, 120));
     }
-    button(x + 6, y + h - 28, 56, 22, "Open", 0);
-    button(x + 68, y + h - 28, 56, 22, "New", 0);
-    button(x + 130, y + h - 28, 56, 22, "Delete", 0);
-    drawf(x + 196, y + h - 20, C_DARK, "%d/%d files", fs_count(), FS_MAX);
+    button(x + 6, y + h - 28, 46, 22, "Top", 0);
+    button(x + 58, y + h - 28, 46, 22, "PgUp", 0);
+    button(x + 110, y + h - 28, 46, 22, "PgDn", 0);
+    button(x + 162, y + h - 28, 46, 22, "End", 0);
+    drawf(x + 218, y + h - 20, C_DARK, "Row %u / %u", hscroll + 1, (hlen + 7) / 8);
+}
+static void hex_scroll(int d, int rows) {
+    i32 v = (i32)hscroll + d; u32 mx_ = hex_maxscroll(rows);
+    if (v < 0) v = 0;
+    if ((u32)v > mx_) v = (i32)mx_;
+    hscroll = (u32)v;
+}
+static void hex_key(int k) {
+    int rows = hex_rows(CH(A_HEX));
+    if (k == K_UP) hex_scroll(-1, rows); else if (k == K_DOWN) hex_scroll(1, rows);
+    else if (k == K_PGUP) hex_scroll(-rows, rows); else if (k == K_PGDN) hex_scroll(rows, rows);
+    else if (k == K_HOME) hscroll = 0; else if (k == K_END) hscroll = hex_maxscroll(rows);
+}
+static void hex_click(int rx, int ry) {
+    int h = CH(A_HEX);
+    if (ry < h - 28 || ry >= h - 6) return;
+    if (inrect(rx, ry, 6, h - 28, 46, 22)) hex_key(K_HOME);
+    else if (inrect(rx, ry, 58, h - 28, 46, 22)) hex_key(K_PGUP);
+    else if (inrect(rx, ry, 110, h - 28, 46, 22)) hex_key(K_PGDN);
+    else if (inrect(rx, ry, 162, h - 28, 46, 22)) hex_key(K_END);
+}
+
+/* ------------------------------------------------------------------ */
+/* Image viewer (BMP: 1/4/8/24/32-bit, uncompressed)                   */
+/* ------------------------------------------------------------------ */
+#define IMG_MAX 524288
+static u8 ibuf[IMG_MAX];
+static u32 img_len, ioff, istride, ipal[256];
+static char iname[48];
+static const char *imsg;
+static int iw, ih, ibpp, itop, iok;
+
+static void img_parse(void) {
+    iok = 0; imsg = NULL;
+    if (img_len < 54 || ibuf[0] != 'B' || ibuf[1] != 'M') { imsg = "Not a BMP picture"; return; }
+    u32 dib = rd32(ibuf + 14);
+    if (dib < 40) { imsg = "Old BMP format not supported"; return; }
+    i32 w = (i32)rd32(ibuf + 18), h = (i32)rd32(ibuf + 22);
+    u32 bpp = rd16(ibuf + 28), comp = rd32(ibuf + 30);
+    ioff = rd32(ibuf + 10);
+    itop = h < 0; if (h < 0) h = -h;
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) { imsg = "Bad picture size"; return; }
+    if (comp != 0 && !(comp == 3 && bpp == 32)) { imsg = "Compressed BMP not supported"; return; }
+    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32) { imsg = "Unsupported color depth"; return; }
+    istride = (((u32)w * bpp + 31) / 32) * 4;
+    if (ioff > img_len || istride * (u32)h > img_len - ioff) { imsg = "File is truncated"; return; }
+    if (bpp <= 8) {
+        u32 ncol = rd32(ibuf + 46), po = 14 + dib;
+        if (!ncol || ncol > (1u << bpp)) ncol = 1u << bpp;
+        memset(ipal, 0, sizeof ipal);
+        for (u32 i = 0; i < ncol; i++)
+            if (po + i * 4 + 3 < img_len) ipal[i] = (ibuf[po + i * 4 + 2] << 16) | (ibuf[po + i * 4 + 1] << 8) | ibuf[po + i * 4];
+    }
+    iw = w; ih = h; ibpp = (int)bpp; iok = 1;
+}
+static void img_open(const struct fref *f) {
+    open_app(A_IMG);
+    kstrcpy(iname, f->name, sizeof iname);
+    img_len = 0; iok = 0;
+    if (f->size > IMG_MAX) { imsg = "Picture is larger than 512 KB"; return; }
+    img_len = fref_load(f, ibuf, IMG_MAX);
+    img_parse();
+}
+static u32 img_px(int x, int y) {
+    const u8 *row = ibuf + ioff + (u32)(itop ? y : ih - 1 - y) * istride;
+    switch (ibpp) {
+    case 24: { const u8 *p = row + x * 3; return (p[2] << 16) | (p[1] << 8) | p[0]; }
+    case 32: { const u8 *p = row + x * 4; return (p[2] << 16) | (p[1] << 8) | p[0]; }
+    case 8: return ipal[row[x]];
+    case 4: { u8 b = row[x >> 1]; return ipal[(x & 1) ? (b & 15) : (b >> 4)]; }
+    case 1: return ipal[(row[x >> 3] >> (7 - (x & 7))) & 1];
+    }
+    return 0;
+}
+static void img_draw(int x, int y, int w, int h) {
+    int ax = x + 4, ay = y + 4, aw = w - 8, ah = h - 32;
+    rect(ax, ay, aw, ah, RGB(70, 72, 80));
+    if (!iok) { draw_str_c(ax + aw / 2, ay + ah / 2 - 4, imsg ? imsg : "No picture", RGB(240, 240, 240)); }
+    else {
+        int dw = iw, dh = ih;
+        if (dw > aw || dh > ah) {
+            if ((u32)iw * (u32)ah > (u32)ih * (u32)aw) { dw = aw; dh = ih * aw / iw; }
+            else { dh = ah; dw = iw * ah / ih; }
+        }
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        static int xs[640];
+        for (int i = 0; i < dw && i < 640; i++) xs[i] = i * iw / dw;
+        int ox = ax + (aw - dw) / 2, oy = ay + (ah - dh) / 2;
+        for (int j = 0; j < dh; j++) {
+            int sy = j * ih / dh;
+            for (int i = 0; i < dw && i < 640; i++) pset(ox + i, oy + j, img_px(xs[i], sy));
+        }
+    }
+    char nm[32]; kstrcpy(nm, iname, sizeof nm);
+    if (iok) drawf(x + 6, y + h - 20, C_TEXT, "%s  %dx%d, %d-bit", nm, iw, ih, ibpp);
+    else drawf(x + 6, y + h - 20, C_TEXT, "%s", nm);
+}
+
+/* ------------------------------------------------------------------ */
+/* "Open with" dialog                                                  */
+/* ------------------------------------------------------------------ */
+static struct fref ow_ref;
+static int ow_sel, ow_rec;
+static const char *ow_apps[3] = { "Notepad", "Image Viewer", "Hex Viewer" };
+static const char *ow_desc[3] = { "View and edit text files", "View BMP pictures", "Show the raw bytes of any file" };
+
+static int ext_is(const char *name, const char *ext) {
+    const char *dot = NULL;
+    for (const char *p = name; *p; p++) if (*p == '.') dot = p;
+    if (!dot) return 0;
+    dot++;
+    while (*dot && *ext) { if (klower(*dot) != *ext) return 0; dot++; ext++; }
+    return !*dot && !*ext;
+}
+static int ow_recommend(const char *name) {
+    static const char *txt[] = { "txt", "cfg", "c", "h", "md", "log", "ini", "bat", "csv", "sh", "py", "json", "asm", "s", "xml", "html", "htm", "conf", "inf", NULL };
+    for (int i = 0; txt[i]; i++) if (ext_is(name, txt[i])) return 0;
+    if (ext_is(name, "bmp")) return 1;
+    return 2;
+}
+static void openwith_show(const struct fref *f) {
+    ow_ref = *f;
+    ow_rec = ow_recommend(f->name);
+    ow_sel = ow_rec;
+    open_app(A_OPENWITH);
+    raise_app(A_OPENWITH);
+}
+static void ow_launch(void) {
+    struct fref f = ow_ref;
+    close_app(A_OPENWITH);
+    if (ow_sel == 0) {
+        if (f.kind == 1) note_open_file(f.name);
+        else {
+            static u8 tmp[NOTE_MAX + 1];
+            u32 n = fref_load(&f, tmp, NOTE_MAX);
+            note_open_data(f.name, tmp, n, 1, f.size > NOTE_MAX);
+        }
+    } else if (ow_sel == 1) img_open(&f);
+    else hex_open(&f);
+}
+static void ow_draw(int x, int y, int w, int h) {
+    char nm[34]; kstrcpy(nm, ow_ref.name, sizeof nm);
+    draw_str(x + 10, y + 10, "Open file with:", C_TEXT);
+    draw_str(x + 10, y + 24, nm, RGB(0, 70, 190));
+    drawf(x + 10, y + 36, C_DARK, "%u bytes", ow_ref.size);
+    for (int i = 0; i < 3; i++) {
+        int ry = y + 54 + i * 40, sel = ow_sel == i;
+        rect(x + 8, ry, w - 16, 36, sel ? RGB(255, 255, 255) : C_FACE);
+        frame(x + 8, ry, w - 16, 36, sel ? RGB(49, 106, 197) : C_DARK);
+        rect(x + 14, ry + 6, 22, 22, i == 0 ? RGB(60, 110, 220) : i == 1 ? RGB(60, 170, 70) : RGB(90, 100, 120));
+        draw_str(x + 44, ry + 8, ow_apps[i], C_TEXT);
+        draw_str(x + 44, ry + 21, ow_desc[i], C_DARK);
+        if (i == ow_rec) draw_str(x + w - 108, ry + 8, "recommended", RGB(0, 110, 0));
+        fill_circle(x + w - 24, ry + 26, 5, C_DARK); fill_circle(x + w - 24, ry + 26, 4, C_LIGHT);
+        if (sel) fill_circle(x + w - 24, ry + 26, 2, RGB(49, 106, 197));
+    }
+    button(x + w - 146, y + h - 30, 62, 22, "Open", 0);
+    button(x + w - 76, y + h - 30, 62, 22, "Cancel", 0);
+}
+static void ow_click(int rx, int ry) {
+    int w = CW(A_OPENWITH), h = CH(A_OPENWITH);
+    for (int i = 0; i < 3; i++) if (inrect(rx, ry, 8, 54 + i * 40, w - 16, 36)) { ow_sel = i; return; }
+    if (inrect(rx, ry, w - 146, h - 30, 62, 22)) ow_launch();
+    else if (inrect(rx, ry, w - 76, h - 30, 62, 22)) close_app(A_OPENWITH);
+}
+static void ow_key(int k) {
+    if (k == K_UP && ow_sel > 0) ow_sel--;
+    else if (k == K_DOWN && ow_sel < 2) ow_sel++;
+    else if (k == '\n') ow_launch();
+    else if (k == K_ESC) close_app(A_OPENWITH);
+}
+
+/* ------------------------------------------------------------------ */
+/* File manager: drives, folders, files                                */
+/* ------------------------------------------------------------------ */
+#define FM_RAM 4                        /* pseudo drive R: (files held in RAM) */
+#define FM_ROWS 22
+static int fm_drive = -1, fm_depth, fm_n, fm_sel = -1, fm_scroll;
+static u32 fm_stack[16];
+static char fm_path[100];
+static struct dent fm_ents[MAX_DENT];
+static struct fatvol fm_v;
+static char fm_msg[64];
+static u32 fm_ltick; static int fm_lrow = -1;
+
+static int fm_less(const struct dent *a, const struct dent *b) {
+    if (a->isdir != b->isdir) return a->isdir;
+    for (int i = 0;; i++) {
+        char x = klower(a->name[i]), y = klower(b->name[i]);
+        if (x != y) return x < y;
+        if (!x) return 0;
+    }
+}
+static void fm_sort(void) {
+    for (int i = 1; i < fm_n; i++) {
+        struct dent t = fm_ents[i]; int j = i - 1;
+        while (j >= 0 && fm_less(&t, &fm_ents[j])) { fm_ents[j + 1] = fm_ents[j]; j--; }
+        fm_ents[j + 1] = t;
+    }
+}
+static int fm_is_leacted(void) { return fm_drive == FM_RAM || (fm_drive >= 0 && drv[fm_drive].type == DT_LEACTED && fm_drive == fs_drive); }
+static void fm_refresh(void) {
+    fm_n = 0; fm_sel = -1; fm_scroll = 0;
+    if (fm_drive < 0) return;
+    if (fm_drive == FM_RAM || drv[fm_drive].type == DT_LEACTED) {
+        if (fm_drive != FM_RAM && fm_drive != fs_drive) { kstrcpy(fm_msg, "Second LeactedFS drive is not mounted.", sizeof fm_msg); return; }
+        for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
+            struct dent *d = &fm_ents[fm_n++];
+            kstrcpy(d->name, fsdir[i].name, sizeof d->name);
+            d->size = fsdir[i].size; d->cluster = (u32)i; d->isdir = 0;
+        }
+    } else if (drv[fm_drive].type == DT_FAT) {
+        if (!fat_mount(fm_drive, &fm_v)) { kstrcpy(fm_msg, "Cannot read the FAT volume.", sizeof fm_msg); return; }
+        fm_n = fat_readdir(&fm_v, fm_stack[fm_depth], fm_ents, MAX_DENT);
+        fm_sort();
+        if (fm_n >= MAX_DENT) kstrcpy(fm_msg, "Only the first 200 items are shown.", sizeof fm_msg);
+    } else kstrcpy(fm_msg, "Unformatted drive. Use the Installer to format it.", sizeof fm_msg);
+}
+static void fm_pick_drive(int d) {
+    fm_drive = d; fm_depth = 0; fm_stack[0] = 0; fm_msg[0] = 0;
+    if (d == FM_RAM) kstrcpy(fm_path, "R:\\", sizeof fm_path);
+    else ksnprintf(fm_path, sizeof fm_path, "%c:\\", 'C' + d);
+    fm_refresh();
+}
+static void fm_enter(const struct dent *e) {
+    int pl = slen(fm_path), nl = slen(e->name);
+    if (fm_depth >= 15 || pl + nl + 2 >= (int)sizeof fm_path) { kstrcpy(fm_msg, "Folder is nested too deeply.", sizeof fm_msg); return; }
+    fm_stack[++fm_depth] = e->cluster;
+    memcpy(fm_path + pl, e->name, nl); fm_path[pl + nl] = '\\'; fm_path[pl + nl + 1] = 0;
+    fm_msg[0] = 0;
+    fm_refresh();
+}
+static void fm_up(void) {
+    if (fm_depth <= 0) return;
+    fm_depth--;
+    int i = slen(fm_path) - 2;
+    while (i >= 0 && fm_path[i] != '\\') i--;
+    fm_path[i + 1] = 0;
+    fm_msg[0] = 0;
+    fm_refresh();
+}
+static void fm_open_sel(void) {
+    if (fm_sel < 0 || fm_sel >= fm_n) { kstrcpy(fm_msg, "Select a file first.", sizeof fm_msg); return; }
+    struct dent *e = &fm_ents[fm_sel];
+    if (e->isdir) { fm_enter(e); return; }
+    struct fref f;
+    f.kind = fm_is_leacted() ? 1 : 2; f.drive = fm_drive; f.cluster = e->cluster; f.size = e->size;
+    kstrcpy(f.name, e->name, sizeof f.name);
+    fm_msg[0] = 0;
+    openwith_show(&f);
+}
+static void fm_import(void) {
+    if (fm_sel < 0 || fm_sel >= fm_n || fm_ents[fm_sel].isdir) { kstrcpy(fm_msg, "Select a file to import.", sizeof fm_msg); return; }
+    if (fm_is_leacted()) { kstrcpy(fm_msg, "That file is already in LeactedFS.", sizeof fm_msg); return; }
+    struct dent *e = &fm_ents[fm_sel];
+    static u8 tmp[FS_SLOT];
+    struct fref f = { 2, fm_drive, e->cluster, e->size, "" };
+    u32 n = fref_load(&f, tmp, FS_SLOT);
+    int i = fs_create(e->name);
+    if (i < 0) { kstrcpy(fm_msg, "LeactedFS is full (15 files).", sizeof fm_msg); return; }
+    int r = fs_store(i, tmp, n);
+    char b[64]; ksnprintf(b, sizeof b, "%s%s %s", r < 0 ? "Disk error: " : "Imported ", fsdir[i].name, e->size > FS_SLOT ? "(cut to 4 KB)" : "");
+    kstrcpy(fm_msg, b, sizeof fm_msg);
+}
+static void fm_delete(void) {
+    if (!fm_is_leacted()) { kstrcpy(fm_msg, "Only LeactedFS files can be deleted.", sizeof fm_msg); return; }
+    if (fm_sel < 0 || fm_sel >= fm_n) { kstrcpy(fm_msg, "Select a file first.", sizeof fm_msg); return; }
+    int r = fs_delete((int)fm_ents[fm_sel].cluster);
+    kstrcpy(fm_msg, r < 0 ? "Disk error while deleting." : "Deleted.", sizeof fm_msg);
+    fm_refresh();
+}
+static void fm_new(void) {
+    if (!fm_is_leacted()) { kstrcpy(fm_msg, "New files go on LeactedFS (R: or its drive).", sizeof fm_msg); return; }
+    char nm[FS_NAME];
+    for (int n = 1; n < 100; n++) { ksnprintf(nm, sizeof nm, "NEW%d.TXT", n); if (fs_find(nm) < 0) break; }
+    int i = fs_create(nm);
+    if (i < 0) { kstrcpy(fm_msg, "LeactedFS is full (15 files).", sizeof fm_msg); return; }
+    fs_store(i, "", 0);
+    fm_refresh();
+    note_open_file(nm);
+}
+static int fm_rows_list(int *out) {
+    int n = 0;
+    for (int d = 0; d < N_DRIVES; d++) if (drv[d].present) out[n++] = d;
+    if (!fs_on_disk) out[n++] = FM_RAM;
+    return n;
+}
+static void fm_show_sel(void) {
+    if (fm_sel < fm_scroll) fm_scroll = fm_sel;
+    if (fm_sel >= fm_scroll + FM_ROWS) fm_scroll = fm_sel - FM_ROWS + 1;
+    if (fm_scroll < 0) fm_scroll = 0;
+}
+static void files_draw(int x, int y, int w, int h) {
+    button(x + 6, y + 4, 44, 22, "Up", 0);
+    rect(x + 56, y + 4, w - 62, 22, C_LIGHT); frame(x + 56, y + 4, w - 62, 22, C_DARK);
+    draw_str(x + 62, y + 11, fm_path[0] ? fm_path : "No drive selected", C_TEXT);
+    /* drives */
+    rect(x + 6, y + 32, 92, h - 66, C_LIGHT); frame(x + 6, y + 32, 92, h - 66, C_DARK);
+    int rows[5], nr = fm_rows_list(rows);
+    for (int i = 0; i < nr; i++) {
+        int ry = y + 34 + i * 36, d = rows[i], sel = d == fm_drive;
+        if (sel) rect(x + 7, ry, 90, 34, RGB(49, 106, 197));
+        u32 fg = sel ? C_LIGHT : C_TEXT;
+        rect(x + 12, ry + 6, 20, 14, RGB(150, 150, 160)); rect(x + 14, ry + 16, 4, 2, RGB(60, 230, 60));
+        char t[16], tn[16];
+        if (d == FM_RAM) { kstrcpy(tn, "RAM files", sizeof tn); draw_str(x + 38, ry + 9, "R:", fg); }
+        else {
+            dtype_str(d, tn, sizeof tn);
+            if (drv[d].type == DT_EMPTY) kstrcpy(tn, "Empty", sizeof tn);
+            ksnprintf(t, sizeof t, "%c:", 'C' + d); draw_str(x + 38, ry + 9, t, fg);
+        }
+        draw_str(x + 12, ry + 23, tn, sel ? RGB(220, 230, 250) : C_DARK);
+    }
+    /* file list */
+    int x0 = x + 104, w0 = w - 110;
+    rect(x0, y + 32, w0, h - 66, C_LIGHT); frame(x0, y + 32, w0, h - 66, C_DARK);
+    rect(x0 + 1, y + 33, w0 - 2, 12, C_DARK);
+    draw_str(x0 + 6, y + 35, "Name", C_LIGHT); draw_str(x0 + w0 - 108, y + 35, "Size", C_LIGHT);
+    for (int i = 0; i < FM_ROWS; i++) {
+        int k = fm_scroll + i;
+        if (k >= fm_n) break;
+        const struct dent *e = &fm_ents[k];
+        int ry = y + 47 + i * 11, sel = k == fm_sel;
+        if (sel) rect(x0 + 1, ry - 1, w0 - 15, 11, RGB(49, 106, 197));
+        u32 fg = sel ? C_LIGHT : C_TEXT;
+        if (e->isdir) { rect(x0 + 4, ry + 1, 8, 6, RGB(240, 200, 70)); rect(x0 + 4, ry, 4, 2, RGB(240, 200, 70)); }
+        else { rect(x0 + 5, ry, 6, 8, C_LIGHT); frame(x0 + 5, ry, 6, 8, sel ? C_LIGHT : C_DARK); }
+        char nm[36]; kstrcpy(nm, e->name, sizeof nm);
+        draw_str(x0 + 16, ry, nm, fg);
+        char sz[16];
+        if (e->isdir) kstrcpy(sz, "<DIR>", sizeof sz);
+        else if (e->size >= 1048576) ksnprintf(sz, sizeof sz, "%u MB", e->size / 1048576);
+        else if (e->size >= 1024) ksnprintf(sz, sizeof sz, "%u KB", e->size / 1024);
+        else ksnprintf(sz, sizeof sz, "%u B", e->size);
+        draw_str(x0 + w0 - 108, ry, sz, fg);
+    }
+    if (fm_n > FM_ROWS) {                                    /* scroll bar */
+        int sx = x0 + w0 - 13, top = y + 46, bot = y + 47 + FM_ROWS * 11 - 12;
+        button(sx, top, 12, 12, "^", 0); button(sx, bot, 12, 12, "v", 0);
+        int tr0 = top + 13, tr1 = bot - 1, th_ = (tr1 - tr0) * FM_ROWS / fm_n; if (th_ < 8) th_ = 8;
+        int pos = (tr1 - tr0 - th_) * fm_scroll / (fm_n - FM_ROWS);
+        rect(sx, tr0, 12, tr1 - tr0, RGB(220, 218, 205)); bevel(sx, tr0 + pos, 12, th_, 0);
+    }
+    if (fm_msg[0]) draw_str(x + 8, y + h - 31, fm_msg, RGB(150, 40, 0));
+    else drawf(x + 8, y + h - 31, C_DARK, "%d item(s)  -  %s", fm_n, fm_drive == FM_RAM ? "RAM (not saved)" : fm_drive >= 0 ? "double-click to open" : "pick a drive");
+    button(x + 6, y + h - 22, 56, 20, "Open", 0);
+    button(x + 68, y + h - 22, 60, 20, "Import", 0);
+    button(x + 134, y + h - 22, 56, 20, "Delete", 0);
+    button(x + 196, y + h - 22, 44, 20, "New", 0);
+    button(x + 246, y + h - 22, 66, 20, "Refresh", 0);
 }
 static void files_click(int rx, int ry) {
-    int h = CH(A_FILES);
-    if (inrect(rx, ry, 6, h - 28, 56, 22)) { if (fsel >= 0 && fsdir[fsel].used) note_open_file(fsdir[fsel].name); return; }
-    if (inrect(rx, ry, 68, h - 28, 56, 22)) {
-        char nm[FS_NAME];
-        for (int n = 1; n < 100; n++) {
-            ksnprintf(nm, sizeof nm, "NEW%d.TXT", n);
-            if (fs_find(nm) < 0) break;
-        }
-        int i = fs_create(nm);
-        if (i >= 0) { fs_store(i, "", 0); fsel = i; note_open_file(nm); }
-        return;
+    int w = CW(A_FILES), h = CH(A_FILES);
+    if (inrect(rx, ry, 6, 4, 44, 22)) { fm_up(); return; }
+    int rows[5], nr = fm_rows_list(rows);
+    for (int i = 0; i < nr; i++) if (inrect(rx, ry, 7, 34 + i * 36, 90, 34)) { fm_pick_drive(rows[i]); return; }
+    int x0 = 104, w0 = w - 110;
+    if (fm_n > FM_ROWS) {
+        int sx = x0 + w0 - 13, top = 46, bot = 47 + FM_ROWS * 11 - 12;
+        if (inrect(rx, ry, sx, top, 12, 12)) { fm_scroll = fm_scroll > 3 ? fm_scroll - 3 : 0; return; }
+        if (inrect(rx, ry, sx, bot, 12, 12)) { fm_scroll += 3; if (fm_scroll > fm_n - FM_ROWS) fm_scroll = fm_n - FM_ROWS; return; }
     }
-    if (inrect(rx, ry, 130, h - 28, 56, 22)) { if (fsel >= 0 && fsdir[fsel].used) { fs_delete(fsel); fsel = -1; } return; }
-    int row = 0;
-    for (int i = 0; i < FS_MAX; i++) {
-        if (!fsdir[i].used) continue;
-        if (inrect(rx, ry, 6, 74 + row * 11 - 1, CW(A_FILES) - 12, 11)) {
-            if (i == fsel && flast_row == i && ticks - flast_tick < 60) note_open_file(fsdir[i].name);
-            fsel = i; flast_row = i; flast_tick = ticks;
+    for (int i = 0; i < FM_ROWS; i++) {
+        int k = fm_scroll + i;
+        if (k >= fm_n) break;
+        if (inrect(rx, ry, x0 + 1, 47 + i * 11 - 1, w0 - 15, 11)) {
+            int dbl = fm_lrow == k && ticks - fm_ltick < 60;
+            fm_sel = k; fm_lrow = k; fm_ltick = ticks; fm_msg[0] = 0;
+            if (dbl) fm_open_sel();
             return;
         }
-        row++;
     }
+    if (inrect(rx, ry, 6, h - 22, 56, 20)) fm_open_sel();
+    else if (inrect(rx, ry, 68, h - 22, 60, 20)) fm_import();
+    else if (inrect(rx, ry, 134, h - 22, 56, 20)) fm_delete();
+    else if (inrect(rx, ry, 196, h - 22, 44, 20)) fm_new();
+    else if (inrect(rx, ry, 246, h - 22, 66, 20)) { fm_msg[0] = 0; fm_refresh(); }
+}
+static void files_key(int k) {
+    if (k == K_UP) { if (fm_sel > 0) fm_sel--; else if (fm_sel < 0 && fm_n) fm_sel = 0; fm_show_sel(); }
+    else if (k == K_DOWN) { if (fm_sel < fm_n - 1) fm_sel++; fm_show_sel(); }
+    else if (k == K_PGUP) { fm_sel = fm_sel > FM_ROWS ? fm_sel - FM_ROWS : (fm_n ? 0 : -1); fm_show_sel(); }
+    else if (k == K_PGDN) { fm_sel += FM_ROWS; if (fm_sel >= fm_n) fm_sel = fm_n - 1; fm_show_sel(); }
+    else if (k == K_HOME) { fm_sel = fm_n ? 0 : -1; fm_show_sel(); }
+    else if (k == K_END) { fm_sel = fm_n - 1; fm_show_sel(); }
+    else if (k == '\n') fm_open_sel();
+    else if (k == '\b') fm_up();
+    else if (k == K_DEL) fm_delete();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1288,7 +1898,8 @@ static void about_draw(int x, int y, int w, int h) {
     drawf(x + 14, y + 142, C_TEXT, "Display : 640x480, 32-bit color");
     if (mem_kb) drawf(x + 14, y + 156, C_TEXT, "Memory  : %u MB", mem_kb / 1024);
     else drawf(x + 14, y + 156, C_TEXT, "Memory  : unknown");
-    drawf(x + 14, y + 170, C_TEXT, "Disk    : %s", disk_present ? "detected" : "none detected");
+    if (n_drives()) drawf(x + 14, y + 170, C_TEXT, "Disk    : %d drive(s)", n_drives());
+    else drawf(x + 14, y + 170, C_TEXT, "Disk    : none detected");
     drawf(x + 14, y + 184, C_TEXT, "FS      : %s", fs_on_disk ? "LeactedFS v1" : "none");
     drawf(x + 14, y + 198, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
     drawf(x + 14, y + 212, C_TEXT, "Mode    : %s", is_root ? "super (root)" : "normal");
@@ -1297,11 +1908,18 @@ static void about_draw(int x, int y, int w, int h) {
 static void about_click(int rx, int ry) {
     if (inrect(rx, ry, CW(A_ABOUT) - 74, CH(A_ABOUT) - 30, 62, 22)) close_app(A_ABOUT);
 }
+static int inst_sel = -1;
+static void install_pick_default(void) {
+    inst_sel = -1;
+    for (int d = 0; d < N_DRIVES; d++) if (drv[d].present && drv[d].type == DT_EMPTY) { inst_sel = d; return; }
+    for (int d = 0; d < N_DRIVES; d++) if (drv[d].present && drv[d].type == DT_LEACTED) { inst_sel = d; return; }
+    for (int d = 0; d < N_DRIVES; d++) if (drv[d].present) { inst_sel = d; return; }
+}
 static void install_draw(int x, int y, int w, int h) {
     (void)h;
-    draw_str(x + 12, y + 12, "Install LeactedFS to disk", C_TEXT);
+    draw_str(x + 12, y + 12, "Format a drive as LeactedFS", C_TEXT);
     rect(x + 10, y + 30, w - 20, 1, C_DARK);
-    if (!disk_present) {
+    if (!n_drives()) {
         draw_str(x + 12, y + 44, "No disk detected!", RGB(180, 0, 0));
         draw_str(x + 12, y + 62, "Attach a drive when starting QEMU:", C_TEXT);
         draw_str(x + 12, y + 76, "-drive file=disk.img,format=raw,if=ide", C_DARK);
@@ -1309,23 +1927,42 @@ static void install_draw(int x, int y, int w, int h) {
         draw_str(x + 12, y + 106, "qemu-img create -f raw disk.img 64M", C_DARK);
         return;
     }
-    draw_str(x + 12, y + 40, "Target disk:", C_TEXT);
-    drawf(x + 12, y + 54, C_DARK, "%s", disk_model);
-    drawf(x + 12, y + 66, C_DARK, "%u sectors (%u MB)", disk_sectors, disk_sectors / 2048);
-    if (fs_on_disk) draw_str(x + 12, y + 84, "Already has LeactedFS (will overwrite)", RGB(160, 100, 0));
-    else draw_str(x + 12, y + 84, "Disk is empty / unformatted", C_TEXT);
-    draw_str(x + 12, y + 100, "This will erase the partition table.", C_TEXT);
-    draw_str(x + 12, y + 112, "Files in RAM are copied to the disk.", C_TEXT);
-    button(x + w / 2 - 70, y + 134, 140, 26, inst_state == 1 ? "Click again to confirm" : "Install Now", 0);
-    if (inst_state == 2) draw_str_c(x + w / 2, y + 172, "Install successful!", RGB(0, 130, 0));
-    if (inst_state == 3) draw_str_c(x + w / 2, y + 172, "Install FAILED", RGB(200, 0, 0));
+    if (inst_sel < 0 || !drv[inst_sel].present) install_pick_default();
+    draw_str(x + 12, y + 38, "Select the target drive:", C_TEXT);
+    for (int d = 0, row = 0; d < N_DRIVES; d++) {
+        if (!drv[d].present) continue;
+        int ry = y + 52 + row * 18; row++;
+        int sel = d == inst_sel;
+        if (sel) rect(x + 8, ry - 2, w - 16, 16, RGB(255, 255, 255));
+        fill_circle(x + 18, ry + 5, 5, C_DARK); fill_circle(x + 18, ry + 5, 4, C_LIGHT);
+        if (sel) fill_circle(x + 18, ry + 5, 2, RGB(49, 106, 197));
+        char m[14], t[16]; kstrcpy(m, drv[d].model, sizeof m); dtype_str(d, t, sizeof t);
+        drawf(x + 30, ry + 1, C_TEXT, "%c: %s", 'C' + d, m);
+        drawf(x + 216, ry + 1, C_DARK, "%u MB", drv[d].sectors / 2048);
+        draw_str(x + 276, ry + 1, t, drv[d].type == DT_FAT ? RGB(170, 0, 0) : C_DARK);
+    }
+    int ty = inst_sel >= 0 ? drv[inst_sel].type : DT_NONE;
+    if (ty == DT_FAT) draw_str(x + 12, y + 130, "This drive has FAT files: they will be ERASED!", RGB(190, 0, 0));
+    else if (ty == DT_LEACTED) draw_str(x + 12, y + 130, "Already LeactedFS (it will be reset)", RGB(160, 100, 0));
+    else draw_str(x + 12, y + 130, "Drive is empty / unformatted", C_TEXT);
+    draw_str(x + 12, y + 144, "Files in RAM are copied to the drive.", C_TEXT);
+    button(x + w / 2 - 74, y + 164, 148, 26, inst_state == 1 ? "Click again to erase" : "Install Now", 0);
+    if (inst_state == 2) draw_str_c(x + w / 2, y + 202, "Install successful!", RGB(0, 130, 0));
+    if (inst_state == 3) draw_str_c(x + w / 2, y + 202, "Install FAILED", RGB(200, 0, 0));
 }
+static void fm_pick_drive(int d);
 static void install_click(int rx, int ry) {
     int w = CW(A_INSTALL);
-    if (!disk_present) return;
-    if (inrect(rx, ry, w / 2 - 70, 134, 140, 26)) {
+    if (!n_drives()) return;
+    for (int d = 0, row = 0; d < N_DRIVES; d++) {
+        if (!drv[d].present) continue;
+        if (inrect(rx, ry, 8, 50 + row * 18, w - 16, 16)) { inst_sel = d; inst_state = 0; return; }
+        row++;
+    }
+    if (inrect(rx, ry, w / 2 - 74, 164, 148, 26)) {
         if (inst_state != 1) { inst_state = 1; return; }
-        inst_state = fs_install() ? 2 : 3;
+        inst_state = fs_install(inst_sel) ? 2 : 3;
+        if (inst_state == 2 && wins[A_FILES].open) fm_pick_drive(fs_drive);
     }
 }
 
@@ -1420,7 +2057,7 @@ static u32 frame_count, fps_t, fps_f, fps;
 static void task_draw(int x, int y, int w, int h) {
     (void)h;
     draw_str(x + 8, y + 6, "Applications", C_TEXT);
-    rect(x + 6, y + 20, w - 12, 128, C_LIGHT); frame(x + 6, y + 20, w - 12, 128, C_DARK);
+    rect(x + 6, y + 20, w - 12, 140, C_LIGHT); frame(x + 6, y + 20, w - 12, 140, C_DARK);
     rect(x + 7, y + 21, w - 14, 12, C_DARK);
     draw_str(x + 10, y + 23, "Task", C_LIGHT); draw_str(x + 220, y + 23, "Status", C_LIGHT);
     int row = 0, n = 0;
@@ -1434,22 +2071,22 @@ static void task_draw(int x, int y, int w, int h) {
         draw_str(x + 220, ry, wins[a].min ? "Minimized" : top_app() == a ? "Active" : "Running", fg);
         row++;
     }
-    button(x + 6, y + 154, 76, 22, "End Task", 0);
-    button(x + 88, y + 154, 76, 22, "Switch To", 0);
-    drawf(x + 176, y + 162, C_DARK, "%d task(s) running", n);
-    rect(x + 6, y + 184, w - 12, 1, C_DARK);
-    draw_str(x + 8, y + 190, "System", C_TEXT);
+    button(x + 6, y + 166, 76, 22, "End Task", 0);
+    button(x + 88, y + 166, 76, 22, "Switch To", 0);
+    drawf(x + 176, y + 174, C_DARK, "%d task(s) running", n);
+    rect(x + 6, y + 196, w - 12, 1, C_DARK);
+    draw_str(x + 8, y + 202, "System", C_TEXT);
     u32 s = ticks / 100;
-    drawf(x + 12, y + 204, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
+    drawf(x + 12, y + 216, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
     u32 used_kb = (u32)((sizeof back + sizeof bgimg + sizeof fsdata + sizeof canvas + sizeof tg + 65536) / 1024);
-    drawf(x + 12, y + 218, C_TEXT, "Kernel  : %u KB of %u KB", used_kb, mem_kb ? mem_kb : used_kb);
+    drawf(x + 12, y + 230, C_TEXT, "Kernel  : %u KB of %u KB", used_kb, mem_kb ? mem_kb : used_kb);
     int bw = w - 24, fill = mem_kb ? (int)((u32)bw * used_kb / mem_kb) : bw;
     if (fill < 2) fill = 2;
-    rect(x + 12, y + 230, bw, 8, C_LIGHT); frame(x + 12, y + 230, bw, 8, C_DARK);
-    rect(x + 13, y + 231, fill > bw - 2 ? bw - 2 : fill, 6, RGB(60, 170, 70));
-    drawf(x + 12, y + 244, C_TEXT, "Files   : %d / %d", fs_count(), FS_MAX);
-    drawf(x + 12, y + 258, C_TEXT, "Disk    : %s", disk_present ? (fs_on_disk ? "LeactedFS" : "unformatted") : "none");
-    drawf(x + 12, y + 272, C_TEXT, "Display : 640x480  %u fps  [%s]", fps, themes[th_id].name);
+    rect(x + 12, y + 242, bw, 8, C_LIGHT); frame(x + 12, y + 242, bw, 8, C_DARK);
+    rect(x + 13, y + 243, fill > bw - 2 ? bw - 2 : fill, 6, RGB(60, 170, 70));
+    drawf(x + 12, y + 256, C_TEXT, "Files   : %d / %d", fs_count(), FS_MAX);
+    drawf(x + 12, y + 270, C_TEXT, "Disk    : %d drive(s), LeactedFS %s", n_drives(), fs_on_disk ? "on disk" : "in RAM");
+    drawf(x + 12, y + 284, C_TEXT, "Display : 640x480  %u fps  [%s]", fps, themes[th_id].name);
 }
 static void task_click(int rx, int ry) {
     int w = CW(A_TASK);
@@ -1459,8 +2096,8 @@ static void task_click(int rx, int ry) {
         if (inrect(rx, ry, 7, 35 + row * 11 - 1, w - 14, 11)) { tsel = a; return; }
         row++;
     }
-    if (inrect(rx, ry, 6, 154, 76, 22)) { if (tsel >= 0 && wins[tsel].open) { close_app(tsel); tsel = -1; } return; }
-    if (inrect(rx, ry, 88, 154, 76, 22)) { if (tsel >= 0 && wins[tsel].open) raise_app(tsel); return; }
+    if (inrect(rx, ry, 6, 166, 76, 22)) { if (tsel >= 0 && wins[tsel].open) { close_app(tsel); tsel = -1; } return; }
+    if (inrect(rx, ry, 88, 166, 76, 22)) { if (tsel >= 0 && wins[tsel].open) raise_app(tsel); return; }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1602,10 +2239,12 @@ static void app_init(int a) {
         static int first = 1;
         if (first) { memset(canvas, 1, sizeof canvas); first = 0; }
         plastx = -1;
-    } else if (a == A_INSTALL) inst_state = 0;
+    }
     else if (a == A_SETTINGS) set_msg[0] = 0;
     else if (a == A_TASK) tsel = -1;
     else if (a == A_CALC) calc_reset();
+    else if (a == A_FILES) { if (fm_drive < 0 || (fm_drive != FM_RAM && !drv[fm_drive].present)) fm_pick_drive(fs_on_disk ? fs_drive : FM_RAM); else fm_refresh(); }
+    else if (a == A_INSTALL) { inst_state = 0; install_pick_default(); }
 }
 static void app_draw(int a, int x, int y, int w, int h) {
     clip_set(x, y, w, h);
@@ -1621,6 +2260,9 @@ static void app_draw(int a, int x, int y, int w, int h) {
     case A_SETTINGS: settings_draw(x, y, w, h); break;
     case A_TASK: task_draw(x, y, w, h); break;
     case A_CALC: calc_draw(x, y, w, h); break;
+    case A_OPENWITH: ow_draw(x, y, w, h); break;
+    case A_HEX: hex_draw(x, y, w, h); break;
+    case A_IMG: img_draw(x, y, w, h); break;
     }
     clip_reset();
 }
@@ -1634,12 +2276,17 @@ static void app_click(int a, int rx, int ry) {
     case A_SETTINGS: settings_click(rx, ry); break;
     case A_TASK: task_click(rx, ry); break;
     case A_CALC: calc_click(rx, ry); break;
+    case A_OPENWITH: ow_click(rx, ry); break;
+    case A_HEX: hex_click(rx, ry); break;
     }
 }
 static void app_key(int a, int k) {
     if (a == A_TERM) term_key(k);
     else if (a == A_NOTE) note_key(k);
     else if (a == A_CALC) calc_key(k);
+    else if (a == A_FILES) files_key(k);
+    else if (a == A_OPENWITH) ow_key(k);
+    else if (a == A_HEX) hex_key(k);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1704,7 +2351,7 @@ static int start_open;
 #define SM_W 200
 #define SM_ITEM 24
 #define SM_HEAD 30
-#define SM_N (N_APPS + 2)
+#define SM_N (N_PIN + 2)
 #define SM_H (SM_HEAD + SM_N * SM_ITEM + 6)
 
 static void theme_apply(int id) {
@@ -1806,6 +2453,11 @@ static void draw_window(int a) {
         rect(bx, by, bw, bh, RGB(50, 110, 230)); frame(bx, by, bw, bh, C_LIGHT);
         rect(bx + 4, by + 11, 8, 3, C_LIGHT);
     }
+    if (a >= N_PIN) {                    /* helper windows cannot be minimised */
+        u32 c1 = focus ? th->ta1 : th->ti1, c2 = focus ? th->ta2 : th->ti2;
+        min_rect(a, &bx, &by, &bw, &bh);
+        for (int j = 0; j < bh; j++) rect(bx, by + j, bw, 1, mix(c1, c2, by + j - (w->y + 3), TITLE_H - 1));
+    }
     app_draw(a, CX(a), CY(a), CW(a), CH(a));
 }
 
@@ -1877,7 +2529,7 @@ static void bar_unity(void) {
     fill_circle(25, UBAR_H + 26, 15, C_LIGHT);
     fill_circle(25, UBAR_H + 26, 10, RGB(220, 80, 30));
     fill_circle(25, UBAR_H + 26, 5, C_LIGHT);
-    for (int i = 0; i < N_APPS; i++) {
+    for (int i = 0; i < N_PIN; i++) {
         int ty = LAUNCH_TOP + i * LAUNCH_SLOT;
         if (wins[i].open) {
             rect(2, ty + 1, LAUNCH_W - 4, LAUNCH_SLOT - 2, top_app() == i ? RGB(100, 92, 86) : RGB(72, 66, 62));
@@ -1906,15 +2558,15 @@ static void draw_startmenu(void) {
     rect(sm_x + 6, sm_y + 3, 32, 24, C_LIGHT);
     blit_argb(sm_x + 8, sm_y + 4, logoflag_W, logoflag_H, logoflag);
     draw_str(sm_x + 46, sm_y + 11, th->menu_title, C_LIGHT);
-    static const u32 bc[N_APPS] = { RGB(60, 60, 70), RGB(60, 110, 220), RGB(220, 60, 50), RGB(240, 200, 60), RGB(120, 120, 130),
+    static const u32 bc[N_PIN] = { RGB(60, 60, 70), RGB(60, 110, 220), RGB(220, 60, 50), RGB(240, 200, 60), RGB(120, 120, 130),
                                     RGB(40, 100, 220), RGB(80, 160, 80), RGB(140, 146, 160), RGB(60, 170, 70), RGB(90, 100, 120) };
     for (int i = 0; i < SM_N; i++) {
         int iy = sm_y + SM_HEAD + i * SM_ITEM;
-        const char *t = i < N_APPS ? app_names[i] : i == N_APPS ? "Restart" : "Shut Down";
-        if (i == N_APPS) rect(sm_x + 8, iy - 1, SM_W - 16, 1, th->menu_edge);
+        const char *t = i < N_PIN ? app_names[i] : i == N_PIN ? "Restart" : "Shut Down";
+        if (i == N_PIN) rect(sm_x + 8, iy - 1, SM_W - 16, 1, th->menu_edge);
         int hot = inrect(mx, my, sm_x, iy, SM_W, SM_ITEM);
         if (hot) rect(sm_x + 2, iy, SM_W - 4, SM_ITEM, th->menu_hl);
-        if (i < N_APPS) { rect(sm_x + 10, iy + 7, 10, 10, bc[i]); frame(sm_x + 10, iy + 7, 10, 10, C_DARK); }
+        if (i < N_PIN) { rect(sm_x + 10, iy + 7, 10, 10, bc[i]); frame(sm_x + 10, iy + 7, 10, 10, C_DARK); }
         draw_str(sm_x + 34, iy + 8, t, hot ? th->menu_hl_fg : th->menu_fg);
     }
 }
@@ -1935,8 +2587,8 @@ static void draw_cursor(void) {
 static int drag_app = -1, drag_dx, drag_dy, press_app = -1;
 
 static void start_item(int i) {
-    if (i < N_APPS) open_app(i);
-    else if (i == N_APPS) reboot_now();
+    if (i < N_PIN) open_app(i);
+    else if (i == N_PIN) reboot_now();
     else power_off();
 }
 static void toggle_app(int a) {
@@ -1951,7 +2603,7 @@ static int panel_press(int x, int y, int was_open) {
         if (x < LAUNCH_W) {
             if (y < LAUNCH_TOP) { start_open = !was_open; return 1; }
             int i = (y - LAUNCH_TOP) / LAUNCH_SLOT;
-            if (i >= 0 && i < N_APPS) toggle_app(i);
+            if (i >= 0 && i < N_PIN) toggle_app(i);
             return 1;
         }
         return 0;
@@ -1981,7 +2633,7 @@ static void on_press(int x, int y) {
         close_rect(a, &bx, &by, &bw, &bh);
         if (inrect(x, y, bx, by, bw, bh)) { close_app(a); return; }
         min_rect(a, &bx, &by, &bw, &bh);
-        if (inrect(x, y, bx, by, bw, bh)) { w->min = 1; return; }
+        if (inrect(x, y, bx, by, bw, bh)) { if (a < N_PIN) w->min = 1; return; }
         if (y < w->y + 3 + TITLE_H) { drag_app = a; drag_dx = x - w->x; drag_dy = y - w->y; return; }
         press_app = a;
         app_click(a, x - CX(a), y - CY(a));
@@ -1994,7 +2646,7 @@ static void on_press(int x, int y) {
         if (inrect(x, y, icon_x(i), icon_y(i), 64, 56)) {
             int dbl = icon_last == i && ticks - icon_tick < 60;
             icon_sel = i; icon_last = i; icon_tick = ticks;
-            if (dbl) { if (i < N_APPS) open_app(i); else reboot_now(); }
+            if (dbl) { if (i < N_PIN) open_app(i); else reboot_now(); }
             return;
         }
     }
@@ -2064,7 +2716,8 @@ static void os_init(u32 magic, const u32 *mbi) {
     memset(canvas, 1, sizeof canvas);
     ps2_init();
     splash(30, "Keyboard and mouse");
-    ata_identify();
+    ata_identify_all();
+    for (int d = 0; d < N_DRIVES; d++) drive_probe(d);
     splash(55, "Disk");
     fs_check();
     fs_load();

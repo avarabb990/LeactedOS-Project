@@ -5,6 +5,19 @@
 #define HOST 1
 #include "kernel.c"
 
+static u8 *loadimg(const char *fn, u32 *secs) {
+    FILE *f = fopen(fn, "rb"); assert(f);
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    u8 *b = malloc(n); assert(fread(b, 1, n, f) == (size_t)n); fclose(f);
+    *secs = n / 512; return b;
+}
+static u8 *readfile(const char *fn, long *len) {
+    FILE *f = fopen(fn, "rb"); assert(f);
+    fseek(f, 0, SEEK_END); *len = ftell(f); fseek(f, 0, SEEK_SET);
+    u8 *b = malloc(*len + 1); assert(fread(b, 1, *len, f) == (size_t)*len); fclose(f);
+    return b;
+}
+static int find_ent(const char *n) { for (int i = 0; i < fm_n; i++) if (!strcmp(fm_ents[i].name, n)) return i; return -1; }
 static void ppm(const char *fn) {
     FILE *f = fopen(fn, "wb"); fprintf(f, "P6\n%d %d\n255\n", W, H);
     for (int i = 0; i < W * H; i++) { u8 p[3] = { back[i] >> 16, back[i] >> 8, back[i] }; fwrite(p, 1, 3, f); }
@@ -16,7 +29,14 @@ static void click(int x, int y) { on_press(x, y); on_release(); }
 static void frame_out(const char *fn) { ticks += 25; os_draw(); ppm(fn); }
 
 int main(void) {
+    fakedisk[0] = calloc(4096, 512); fakesect[0] = 4096;               /* C: blank */
+    fakedisk[1] = loadimg("tests/out/fat16.img", &fakesect[1]);        /* D: FAT16 with MBR */
+    fakedisk[2] = loadimg("tests/out/fat32.img", &fakesect[2]);        /* E: FAT32 */
+    fakedisk[3] = loadimg("tests/out/fat12.img", &fakesect[3]);        /* F: FAT12 */
     os_init(0x2BADB002, (u32[]){ 1, 639, 261120 });
+    assert(drv[0].type == DT_EMPTY && drv[1].type == DT_FAT && drv[1].fatbits == 16);
+    assert(drv[2].type == DT_FAT && drv[2].fatbits == 32 && drv[3].type == DT_FAT && drv[3].fatbits == 12);
+    assert(!fs_on_disk && fs_drive == -1);
     assert(wins[A_TERM].open);
     cmd("help");
     cmd("ls");
@@ -52,10 +72,11 @@ int main(void) {
     /* installer + persistence */
     open_app(A_INSTALL);
     assert(!fs_on_disk);
-    int cx = CX(A_INSTALL) + CW(A_INSTALL) / 2, cy = CY(A_INSTALL) + 134 + 5;
+    assert(inst_sel == 0);
+    int cx = CX(A_INSTALL) + CW(A_INSTALL) / 2, cy = CY(A_INSTALL) + 164 + 5;
     click(cx, cy); assert(inst_state == 1);
     frame_out("t2_install_confirm.ppm");
-    click(cx, cy); assert(inst_state == 2 && fs_on_disk);
+    click(cx, cy); assert(inst_state == 2 && fs_on_disk && fs_drive == 0 && drv[0].type == DT_LEACTED);
     frame_out("t3_install_ok.ppm");
     /* simulate reboot: reload from the fake disk */
     memset(fsdir, 0, sizeof fsdir); memset(fsdata, 0, sizeof fsdata); fs_on_disk = 0;
@@ -84,7 +105,7 @@ int main(void) {
     note_save();
     frame_out("t4_windows.ppm");
 
-    open_app(A_FILES); fsel = fs_find("A.TXT");
+    open_app(A_FILES);
     open_app(A_CLOCK);
     open_app(A_ABOUT);
     start_open = 1; mx = 100; my = 300;
@@ -139,7 +160,7 @@ int main(void) {
     /* task manager: end task */
     tsel = A_SETTINGS;
     raise_app(A_TASK); int tx = CX(A_TASK), ty = CY(A_TASK);
-    click(tx + 20, ty + 160); assert(!wins[A_SETTINGS].open);
+    click(tx + 20, ty + 172); assert(!wins[A_SETTINGS].open);
     for (int k = 0; k < 3; k++) { theme_apply(k); for (int a2 = 0; a2 < N_APPS; a2++) { open_app(a2); assert(wins[a2].y >= area_y0); } }
     /* ---- calculator ---- */
     cmd("theme xp");
@@ -173,6 +194,105 @@ int main(void) {
     start_open = 1; mx = 40; my = 200; frame_out("t13_xp_menu.ppm"); start_open = 0;
     splash(60, "Files and settings"); ppm("t14_splash.ppm");
     theme_apply(TH_UNITY); frame_out("t15_unity_logo.ppm");
+    /* ================= drives, FAT, File Manager, Open With, viewers ================= */
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    theme_apply(TH_XP);
+    open_app(A_FILES);
+    assert(fm_drive == fs_drive);                       /* LeactedFS drive is selected first */
+    int fx = CX(A_FILES), fy = CY(A_FILES);
+    /* click drive D: (row 1) = FAT16 on an MBR partition */
+    click(fx + 20, fy + 34 + 1 * 36 + 10); assert(fm_drive == 1);
+    assert(!strcmp(fm_path, "D:\\") && fm_n == 10);
+    assert(fm_ents[0].isdir && !strcmp(fm_ents[0].name, "Documents") && !strcmp(fm_ents[1].name, "Many") && fm_ents[1].isdir);
+    assert(find_ent("Hello World.txt") >= 0 && find_ent("notes.md") >= 0 && find_ent("README.TXT") >= 0);
+    assert(find_ent("A Very Long File Name Indeed 1234567890.txt") >= 0);
+    int ei = find_ent("EMPTY.TXT"); assert(ei >= 0 && fm_ents[ei].size == 0);
+    ei = find_ent("big.bin"); assert(fm_ents[ei].size == 10000 && !fm_ents[ei].isdir);
+    frame_out("t20_files_fat16.ppm");
+
+    /* README.TXT -> Open With dialog (recommended: Notepad) -> content */
+    ei = find_ent("README.TXT");
+    click(fx + 104 + 20, fy + 47 + ei * 11 + 4); assert(fm_sel == ei);
+    click(fx + 104 + 20, fy + 47 + ei * 11 + 4);        /* second click = double-click */
+    assert(wins[A_OPENWITH].open && ow_rec == 0 && ow_sel == 0 && !strcmp(ow_ref.name, "README.TXT"));
+    frame_out("t21_openwith.ppm");
+    int owx = CX(A_OPENWITH), owy = CY(A_OPENWITH);
+    click(owx + CW(A_OPENWITH) - 146 + 10, owy + CH(A_OPENWITH) - 30 + 5);   /* Open */
+    assert(!wins[A_OPENWITH].open && wins[A_NOTE].open);
+    assert(!strncmp(nbuf, "Hello from a FAT drive!\nSecond line.\n", 37) && nlen == 37);
+    close_app(A_NOTE);
+
+    /* big.bin (multi-cluster) -> Hex Viewer */
+    fm_sel = find_ent("big.bin"); fm_open_sel();
+    assert(ow_rec == 2); ow_launch();
+    { long n; u8 *ex = readfile("tests/out/exp_big.bin", &n); assert(hlen == (u32)n && !memcmp(hbuf, ex, n)); free(ex); }
+    hex_key(K_PGDN); assert(hscroll > 0); hex_key(K_END); hex_key(K_HOME); assert(hscroll == 0);
+    frame_out("t22_hex.ppm");
+    close_app(A_HEX);
+
+    /* 24-bit and 8-bit BMP -> Image Viewer */
+    fm_sel = find_ent("pic24.bmp"); fm_open_sel(); assert(ow_rec == 1); ow_launch();
+    assert(iok && iw == 64 && ih == 48 && ibpp == 24);
+    assert(img_px(10, 20) == (u32)((128 << 16) | ((20 * 255 / 48) << 8) | (10 * 255 / 64)));
+    frame_out("t23_image24.ppm");
+    fm_sel = find_ent("pic8.bmp"); fm_open_sel(); ow_launch();
+    assert(iok && iw == 40 && ih == 30 && ibpp == 8);
+    assert(img_px(3, 4) == (u32)((49 << 16) | (248 << 8) | 7));
+    close_app(A_IMG);
+    fm_sel = find_ent("README.TXT"); fm_open_sel(); ow_sel = 1; ow_launch();       /* text as an image */
+    assert(!iok && imsg); close_app(A_IMG);
+    fm_sel = find_ent("EMPTY.TXT"); fm_open_sel(); ow_sel = 2; ow_launch(); assert(hlen == 0); close_app(A_HEX);
+
+    /* folders: E: = FAT32, go 3 levels deep and back */
+    click(fx + 20, fy + 34 + 2 * 36 + 10); assert(fm_drive == 2 && !strcmp(fm_path, "E:\\"));
+    fm_sel = find_ent("Documents"); fm_open_sel(); assert(!strcmp(fm_path, "E:\\Documents\\") && fm_depth == 1);
+    assert(find_ent("Report 2026.txt") >= 0 && find_ent("deep") >= 0);
+    fm_sel = find_ent("deep"); fm_open_sel();
+    fm_sel = find_ent("More Stuff"); fm_open_sel();
+    assert(!strcmp(fm_path, "E:\\Documents\\deep\\More Stuff\\") && fm_depth == 3 && fm_n == 1 && !strcmp(fm_ents[0].name, "y.txt"));
+    { struct fref f = { 2, 2, fm_ents[0].cluster, fm_ents[0].size, "y.txt" }; u8 t[8] = {0}; assert(fref_load(&f, t, 8) == 2 && !memcmp(t, "y\n", 2)); }
+    click(fx + 20, fy + 8); assert(fm_depth == 2);       /* Up button */
+    files_key('\b'); files_key('\b'); assert(fm_depth == 0 && !strcmp(fm_path, "E:\\"));
+    files_key('\b'); assert(fm_depth == 0);
+    /* a folder with 40 files: scrolling */
+    fm_sel = find_ent("Many"); fm_open_sel(); assert(fm_n == 40);
+    files_key(K_END); assert(fm_sel == 39 && fm_scroll == 40 - FM_ROWS);
+    frame_out("t24_files_scroll.ppm");
+    files_key(K_HOME); assert(fm_sel == 0 && fm_scroll == 0);
+    files_key(K_PGDN); assert(fm_sel == FM_ROWS);
+    click(fx + 104 + (CW(A_FILES) - 110) - 13 + 5, fy + 47 + FM_ROWS * 11 - 12 + 5); assert(fm_scroll == 4);
+    files_key('\b');
+
+    /* FAT12 with a 900 KB file: FAT entries straddle sector boundaries */
+    click(fx + 20, fy + 34 + 3 * 36 + 10); assert(fm_drive == 3);
+    ei = find_ent("huge.bin"); assert(ei >= 0 && fm_ents[ei].size == 900000);
+    { long n; u8 *ex = readfile("tests/out/exp_huge.bin", &n); u8 *got = malloc(1000000);
+      struct fref f = { 2, 3, fm_ents[ei].cluster, fm_ents[ei].size, "huge.bin" };
+      assert(fref_load(&f, got, 1000000) == (u32)n && !memcmp(got, ex, n)); free(ex); free(got); }
+
+    /* import a FAT file into LeactedFS (C:) and make sure it was saved to the drive */
+    click(fx + 20, fy + 34 + 1 * 36 + 10); assert(fm_drive == 1);
+    fm_sel = find_ent("notes.md"); click(fx + 68 + 10, CH(A_FILES) + fy - 22 + 5);   /* Import button */
+    assert(fs_find("NOTES.MD") >= 0 && !strncmp((char *)fsdata[fs_find("NOTES.MD")], "# lowercase 8.3 name\n", 21));
+    memset(fsdir, 0, sizeof fsdir); memset(fsdata, 0, sizeof fsdata); fs_load(); assert(fs_find("NOTES.MD") >= 0);
+    fm_sel = find_ent("big.bin"); fm_import(); assert(fsdir[fs_find("BIG.BIN")].size == 4096);
+    /* LeactedFS view: new + delete via buttons */
+    click(fx + 20, fy + 34 + 0 * 36 + 10); assert(fm_drive == 0 && fm_is_leacted());
+    int before = fm_n; click(fx + 196 + 10, CH(A_FILES) + fy - 22 + 5); assert(fm_n == before + 1 && wins[A_NOTE].open);
+    close_app(A_NOTE);
+    fm_sel = find_ent("NEW1.TXT"); click(fx + 134 + 10, CH(A_FILES) + fy - 22 + 5); assert(find_ent("NEW1.TXT") < 0);
+    /* unformatted/empty & delete refusal on FAT */
+    click(fx + 20, fy + 34 + 2 * 36 + 10); fm_sel = 0; fm_delete(); assert(!strncmp(fm_msg, "Only LeactedFS", 14));
+    frame_out("t25_files_fat32_msg.ppm");
+
+    /* installer lists all drives and can target another one */
+    open_app(A_INSTALL); frame_out("t26_installer.ppm"); close_app(A_INSTALL);
+    /* the same screens in the other themes */
+    theme_apply(TH_UNITY); open_app(A_FILES); fm_pick_drive(2); fm_sel = find_ent("pic24.bmp"); fm_open_sel(); frame_out("t27_unity_openwith.ppm");
+    ow_launch(); frame_out("t28_unity_image.ppm");
+    theme_apply(TH_KDE); frame_out("t29_kde_image.ppm");
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    theme_apply(TH_XP);
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }
