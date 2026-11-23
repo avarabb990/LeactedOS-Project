@@ -296,7 +296,38 @@ static void drawf(int x, int y, u32 c, const char *f, ...) {
 }
 
 /* XP-ish palette */
-#define C_FACE   RGB(236, 233, 216)
+/* ---- themes ---- */
+struct theme {
+    const char *name, *menu_title, *blurb;
+    u32 face;
+    u32 ta1, ta2, ti1, ti2;            /* title bar gradient: active / inactive */
+    u32 frame_a, frame_i;
+    u32 txt_a, txt_i;
+    u32 menu_bg, menu_fg, menu_hl, menu_hl_fg, menu_h1, menu_h2, menu_edge;
+};
+enum { TH_XP, TH_UNITY, TH_KDE, N_THEMES };
+static const struct theme themes[N_THEMES] = {
+    { "Windows XP", "LeactedOS XP", "Blue title bars, green Start",
+      RGB(236, 233, 216),
+      RGB(58, 129, 243), RGB(0, 88, 230), RGB(157, 180, 232), RGB(122, 150, 223),
+      RGB(8, 49, 217), RGB(122, 150, 223), RGB(255, 255, 255), RGB(220, 228, 248),
+      RGB(255, 255, 255), RGB(0, 0, 0), RGB(49, 106, 197), RGB(255, 255, 255), RGB(30, 90, 210), RGB(60, 130, 245), RGB(8, 49, 217) },
+    { "Ubuntu Unity", "Dash", "Dark panel and left launcher",
+      RGB(242, 241, 240),
+      RGB(74, 73, 69), RGB(52, 51, 47), RGB(92, 91, 86), RGB(72, 71, 67),
+      RGB(52, 51, 47), RGB(72, 71, 67), RGB(223, 219, 210), RGB(150, 147, 140),
+      RGB(44, 40, 38), RGB(235, 232, 228), RGB(221, 72, 20), RGB(255, 255, 255), RGB(94, 40, 76), RGB(60, 24, 50), RGB(20, 12, 18) },
+    { "KDE Classic", "K Menu", "Blue-gray panel, K menu",
+      RGB(238, 238, 238),
+      RGB(116, 164, 224), RGB(68, 118, 198), RGB(196, 204, 216), RGB(170, 180, 196),
+      RGB(60, 96, 160), RGB(150, 160, 178), RGB(255, 255, 255), RGB(90, 100, 120),
+      RGB(244, 244, 246), RGB(20, 20, 30), RGB(60, 110, 190), RGB(255, 255, 255), RGB(92, 142, 210), RGB(50, 100, 180), RGB(60, 96, 160) },
+};
+static int th_id;
+static const struct theme *th = &themes[0];
+static int show_icons = 1;
+static int term_color_idx;
+#define C_FACE   (th->face)
 #define C_LIGHT  RGB(255, 255, 255)
 #define C_DARK   RGB(113, 111, 100)
 #define C_BLACK  RGB(0, 0, 0)
@@ -727,7 +758,9 @@ static void power_off(void) {
 /* ------------------------------------------------------------------ */
 /* Window manager                                                      */
 /* ------------------------------------------------------------------ */
-enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, N_APPS };
+enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, N_APPS };
+static void theme_apply(int id);
+static void settings_save(void);
 
 struct win { int open, min, x, y, w, h; const char *title; };
 static struct win wins[N_APPS] = {
@@ -738,8 +771,10 @@ static struct win wins[N_APPS] = {
     [A_CLOCK]   = { 0, 0, 330, 40, 260, 310, "Clock" },
     [A_ABOUT]   = { 0, 0, 200, 80, 340, 230, "About LeactedOS" },
     [A_INSTALL] = { 0, 0, 140, 70, 380, 250, "LeactedOS Installer" },
+    [A_SETTINGS] = { 0, 0, 120, 50, 380, 300, "Settings" },
+    [A_TASK]    = { 0, 0, 100, 30, 380, 320, "Task Manager" },
 };
-static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer" };
+static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager" };
 static int zo[N_APPS], nz;
 
 #define TITLE_H 22
@@ -871,7 +906,8 @@ static void cmd_help(void) {
     tputs(" calc A op B   + - * / %\n");
     tputs(" beep [hz]     PC speaker\n");
     tputs(" open APP      term note paint files clock\n");
-    tputs("               about install\n");
+    tputs("               about install settings task\n");
+    tputs(" theme NAME    xp | unity | kde\n");
     tputs(" super         toggle root mode\n");
     tputs(" reboot  shutdown  exit\n");
 }
@@ -954,9 +990,22 @@ static void run_cmd(char *line) {
         else if (!kstrcmp(a, "clock")) open_app(A_CLOCK);
         else if (!kstrcmp(a, "about")) open_app(A_ABOUT);
         else if (!kstrcmp(a, "install")) open_app(A_INSTALL);
+        else if (!kstrcmp(a, "settings")) open_app(A_SETTINGS);
+        else if (!kstrcmp(a, "task")) open_app(A_TASK);
         else tputs("Unknown app.\n");
     }
     else if (!kstrcmp(c, "install")) open_app(A_INSTALL);
+    else if (!kstrcmp(c, "theme")) {
+        int t = -1;
+        if (ac >= 2) {
+            if (!kstrcmp(av[1], "xp")) t = TH_XP;
+            else if (!kstrcmp(av[1], "unity") || !kstrcmp(av[1], "ubuntu")) t = TH_UNITY;
+            else if (!kstrcmp(av[1], "kde")) t = TH_KDE;
+        }
+        if (t < 0) { tprintf("Current theme: %s\nUsage: theme xp | unity | kde\n", themes[th_id].name); return; }
+        theme_apply(t); settings_save();
+        tprintf("Theme: %s\n", themes[t].name);
+    }
     else if (!kstrcmp(c, "super")) { is_root = !is_root; tputs(is_root ? "Super mode ON\n" : "Super mode OFF\n"); }
     else if (!kstrcmp(c, "reboot")) { tputs("Rebooting...\n"); reboot_now(); }
     else if (!kstrcmp(c, "shutdown") || !kstrcmp(c, "halt")) power_off();
@@ -986,12 +1035,14 @@ static void term_key(int k) {
         else { hpos = nhist; ilen = 0; iline[0] = 0; }
     }
 }
+static const u32 term_cols[4] = { RGB(120, 230, 120), RGB(210, 210, 210), RGB(255, 190, 60), RGB(100, 220, 240) };
 static void term_draw(int x, int y, int w, int h) {
     rect(x, y, w, h, RGB(12, 12, 12));
+    u32 tfg = term_cols[term_color_idx];
     for (int r = 0; r < TR && r <= trow; r++)
-        if (r < trow) draw_str(x + 6, y + 6 + r * 10, tg[r], RGB(200, 200, 200));
+        if (r < trow) draw_str(x + 6, y + 6 + r * 10, tg[r], tfg);
     /* current output row may hold partial text (no newline yet) */
-    if (tcol) draw_str(x + 6, y + 6 + trow * 10, tg[trow], RGB(200, 200, 200));
+    if (tcol) draw_str(x + 6, y + 6 + trow * 10, tg[trow], tfg);
     int px = x + 6 + tcol * 8, py = y + 6 + trow * 10;
     px = draw_str(px, py, prompt(), RGB(80, 255, 80));
     px = draw_str(px, py, iline, RGB(230, 230, 230));
@@ -1260,6 +1311,140 @@ static void install_click(int rx, int ry) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Settings                                                            */
+/* ------------------------------------------------------------------ */
+static char set_msg[40];
+
+static void settings_save(void) {
+    char b[64];
+    int n = ksnprintf(b, sizeof b, "theme=%d\nicons=%d\nterm=%d\n", th_id, show_icons, term_color_idx);
+    int i = fs_create("SETTINGS.CFG");
+    if (i < 0) { kstrcpy(set_msg, "Not saved (15 files max)", sizeof set_msg); return; }
+    int r = fs_store(i, b, n);
+    kstrcpy(set_msg, r == 0 ? "Saved to disk." : r == 1 ? "Applied (RAM only)." : "Disk error!", sizeof set_msg);
+}
+static void settings_load(void) {
+    int i = fs_find("SETTINGS.CFG");
+    if (i < 0) return;
+    char b[65]; u32 n = fsdir[i].size > 64 ? 64 : fsdir[i].size;
+    memcpy(b, fsdata[i], n); b[n] = 0;
+    for (char *p = b; *p;) {
+        char v = (p[0] && p[1] && p[2] && p[3] && p[4] && p[5]) ? p[6] : 0;
+        if (!memcmp(p, "theme=", 6) && v >= '0' && v < '0' + N_THEMES) th_id = v - '0';
+        else if (!memcmp(p, "icons=", 6) && (v == '0' || v == '1')) show_icons = v - '0';
+        else if (!memcmp(p, "term=", 5) && p[5] >= '0' && p[5] <= '3') term_color_idx = p[5] - '0';
+        while (*p && *p != '\n') p++;
+        if (*p) p++;
+    }
+}
+static void theme_preview(int x, int y, int id) {
+    const struct theme *t = &themes[id];
+    rect(x, y, 64, 36, t->face); frame(x, y, 64, 36, t->frame_a);
+    if (id == TH_XP) {
+        gradient_v(x + 1, y + 1, 62, 9, t->ta1, t->ta2);
+        gradient_v(x + 1, y + 28, 62, 7, RGB(60, 130, 245), RGB(30, 88, 220));
+        rect(x + 1, y + 28, 18, 7, RGB(60, 160, 60));
+    } else if (id == TH_UNITY) {
+        rect(x + 1, y + 1, 62, 5, RGB(52, 51, 47));
+        rect(x + 1, y + 6, 10, 29, RGB(48, 42, 40));
+        for (int k = 0; k < 3; k++) rect(x + 3, y + 9 + k * 8, 6, 6, k == 0 ? RGB(221, 72, 20) : RGB(150, 140, 130));
+        gradient_v(x + 14, y + 10, 46, 8, t->ta1, t->ta2);
+        fill_circle(x + 18, y + 14, 2, RGB(221, 72, 20));
+    } else {
+        gradient_v(x + 1, y + 1, 62, 9, t->ta1, t->ta2);
+        gradient_v(x + 1, y + 28, 62, 7, RGB(214, 220, 232), RGB(160, 170, 190));
+        rect(x + 1, y + 28, 12, 7, RGB(60, 110, 190));
+    }
+}
+#define SET_ROW(i) (24 + (i) * 46)
+static void settings_draw(int x, int y, int w, int h) {
+    draw_str(x + 8, y + 8, "Appearance", C_TEXT);
+    for (int i = 0; i < N_THEMES; i++) {
+        int ry = y + SET_ROW(i);
+        int sel = th_id == i;
+        rect(x + 6, ry, w - 12, 42, sel ? RGB(255, 255, 255) : C_FACE);
+        frame(x + 6, ry, w - 12, 42, sel ? RGB(49, 106, 197) : C_DARK);
+        theme_preview(x + 12, ry + 3, i);
+        draw_str(x + 88, ry + 8, themes[i].name, C_TEXT);
+        draw_str(x + 88, ry + 22, themes[i].blurb, C_DARK);
+        fill_circle(x + w - 24, ry + 21, 6, C_DARK);
+        fill_circle(x + w - 24, ry + 21, 5, C_LIGHT);
+        if (sel) fill_circle(x + w - 24, ry + 21, 3, RGB(49, 106, 197));
+    }
+    frame(x + 12, y + 168, 14, 14, C_DARK); rect(x + 13, y + 169, 12, 12, C_LIGHT);
+    if (show_icons) { line(x + 15, y + 175, x + 18, y + 179, C_BLACK); line(x + 18, y + 179, x + 24, y + 171, C_BLACK); line(x + 15, y + 174, x + 18, y + 178, C_BLACK); line(x + 18, y + 178, x + 24, y + 170, C_BLACK); }
+    draw_str(x + 34, y + 171, "Show desktop icons", C_TEXT);
+    draw_str(x + 8, y + 194, "Terminal text color", C_TEXT);
+    for (int i = 0; i < 4; i++) {
+        rect(x + 12 + i * 40, y + 208, 32, 18, term_cols[i]);
+        frame(x + 12 + i * 40, y + 208, 32, 18, i == term_color_idx ? RGB(255, 0, 255) : C_DARK);
+    }
+    drawf(x + 8, y + h - 20, C_DARK, "%s", set_msg[0] ? set_msg : "Settings are kept in SETTINGS.CFG");
+    button(x + w - 74, y + h - 30, 62, 22, "Close", 0);
+}
+static void settings_click(int rx, int ry) {
+    int w = CW(A_SETTINGS), h = CH(A_SETTINGS);
+    for (int i = 0; i < N_THEMES; i++)
+        if (inrect(rx, ry, 6, SET_ROW(i), w - 12, 42)) { theme_apply(i); settings_save(); return; }
+    if (inrect(rx, ry, 12, 168, 150, 14)) { show_icons = !show_icons; settings_save(); return; }
+    for (int i = 0; i < 4; i++)
+        if (inrect(rx, ry, 12 + i * 40, 208, 32, 18)) { term_color_idx = i; settings_save(); return; }
+    if (inrect(rx, ry, w - 74, h - 30, 62, 22)) close_app(A_SETTINGS);
+}
+
+/* ------------------------------------------------------------------ */
+/* Task Manager                                                        */
+/* ------------------------------------------------------------------ */
+static int tsel = -1;
+static u32 frame_count, fps_t, fps_f, fps;
+
+static void task_draw(int x, int y, int w, int h) {
+    (void)h;
+    draw_str(x + 8, y + 6, "Applications", C_TEXT);
+    rect(x + 6, y + 20, w - 12, 120, C_LIGHT); frame(x + 6, y + 20, w - 12, 120, C_DARK);
+    rect(x + 7, y + 21, w - 14, 12, C_DARK);
+    draw_str(x + 10, y + 23, "Task", C_LIGHT); draw_str(x + 220, y + 23, "Status", C_LIGHT);
+    int row = 0, n = 0;
+    for (int a = 0; a < N_APPS; a++) {
+        if (!wins[a].open) continue;
+        n++;
+        int ry = y + 35 + row * 11;
+        if (a == tsel) rect(x + 7, ry - 1, w - 14, 11, RGB(49, 106, 197));
+        u32 fg = a == tsel ? C_LIGHT : C_TEXT;
+        draw_str(x + 10, ry, wins[a].title, fg);
+        draw_str(x + 220, ry, wins[a].min ? "Minimized" : top_app() == a ? "Active" : "Running", fg);
+        row++;
+    }
+    button(x + 6, y + 146, 76, 22, "End Task", 0);
+    button(x + 88, y + 146, 76, 22, "Switch To", 0);
+    drawf(x + 176, y + 154, C_DARK, "%d task(s) running", n);
+    rect(x + 6, y + 176, w - 12, 1, C_DARK);
+    draw_str(x + 8, y + 182, "System", C_TEXT);
+    u32 s = ticks / 100;
+    drawf(x + 12, y + 196, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
+    u32 used_kb = (u32)((sizeof back + sizeof bgimg + sizeof fsdata + sizeof canvas + sizeof tg + 65536) / 1024);
+    drawf(x + 12, y + 210, C_TEXT, "Kernel  : %u KB of %u KB", used_kb, mem_kb ? mem_kb : used_kb);
+    int bw = w - 24, fill = mem_kb ? (int)((u32)bw * used_kb / mem_kb) : bw;
+    if (fill < 2) fill = 2;
+    rect(x + 12, y + 222, bw, 8, C_LIGHT); frame(x + 12, y + 222, bw, 8, C_DARK);
+    rect(x + 13, y + 223, fill > bw - 2 ? bw - 2 : fill, 6, RGB(60, 170, 70));
+    drawf(x + 12, y + 238, C_TEXT, "Files   : %d / %d", fs_count(), FS_MAX);
+    drawf(x + 12, y + 252, C_TEXT, "Disk    : %s", disk_present ? (fs_on_disk ? "LeactedFS" : "unformatted") : "none");
+    drawf(x + 12, y + 266, C_TEXT, "Display : 640x480  %u fps  [%s]", fps, themes[th_id].name);
+}
+static void task_click(int rx, int ry) {
+    int w = CW(A_TASK);
+    int row = 0;
+    for (int a = 0; a < N_APPS; a++) {
+        if (!wins[a].open) continue;
+        if (inrect(rx, ry, 7, 35 + row * 11 - 1, w - 14, 11)) { tsel = a; return; }
+        row++;
+    }
+    if (inrect(rx, ry, 6, 146, 76, 22)) { if (tsel >= 0 && wins[tsel].open) { close_app(tsel); tsel = -1; } return; }
+    if (inrect(rx, ry, 88, 146, 76, 22)) { if (tsel >= 0 && wins[tsel].open) raise_app(tsel); return; }
+}
+
+/* ------------------------------------------------------------------ */
 /* Per-app dispatch                                                    */
 /* ------------------------------------------------------------------ */
 static void app_init(int a) {
@@ -1273,6 +1458,8 @@ static void app_init(int a) {
         if (first) { memset(canvas, 1, sizeof canvas); first = 0; }
         plastx = -1;
     } else if (a == A_INSTALL) inst_state = 0;
+    else if (a == A_SETTINGS) set_msg[0] = 0;
+    else if (a == A_TASK) tsel = -1;
 }
 static void app_draw(int a, int x, int y, int w, int h) {
     clip_set(x, y, w, h);
@@ -1285,6 +1472,8 @@ static void app_draw(int a, int x, int y, int w, int h) {
     case A_CLOCK: clock_draw(x, y, w, h); break;
     case A_ABOUT: about_draw(x, y, w, h); break;
     case A_INSTALL: install_draw(x, y, w, h); break;
+    case A_SETTINGS: settings_draw(x, y, w, h); break;
+    case A_TASK: task_draw(x, y, w, h); break;
     }
     clip_reset();
 }
@@ -1295,6 +1484,8 @@ static void app_click(int a, int rx, int ry) {
     case A_FILES: files_click(rx, ry); break;
     case A_ABOUT: about_click(rx, ry); break;
     case A_INSTALL: install_click(rx, ry); break;
+    case A_SETTINGS: settings_click(rx, ry); break;
+    case A_TASK: task_click(rx, ry); break;
     }
 }
 static void app_key(int a, int k) {
@@ -1303,16 +1494,22 @@ static void app_key(int a, int k) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Desktop, taskbar, start menu                                        */
+/* Desktop, themes, panels, start menu                                 */
 /* ------------------------------------------------------------------ */
-static void build_wallpaper(void) {
+#define UBAR_H 24            /* Unity top panel */
+#define LAUNCH_W 52          /* Unity left launcher */
+#define LAUNCH_SLOT 44
+#define LAUNCH_TOP (UBAR_H + 52)
+
+static int area_x0, area_y0, area_y1;   /* usable desktop area for windows */
+static int sm_x, sm_y;                  /* start menu / dash position */
+
+static void wp_xp(void) {
     for (int y = 0; y < H; y++) {
         u32 sky = mix(RGB(30, 94, 214), RGB(176, 214, 250), y > 330 ? 330 : y, 330);
         for (int x = 0; x < W; x++) {
-            /* rolling green hill, "Bliss"-style */
             int dx = x - 260;
-            int hill = 340 + (dx * dx) / 520 - 0;
-            hill = 335 + ((dx * dx) >> 9) / 2;
+            int hill = 335 + ((dx * dx) >> 9) / 2;
             if (hill > 470) hill = 470;
             u32 c = sky;
             if (y >= hill) c = mix(RGB(96, 176, 52), RGB(30, 110, 24), y - hill > 140 ? 140 : y - hill, 140);
@@ -1320,14 +1517,64 @@ static void build_wallpaper(void) {
         }
     }
 }
+static void wp_unity(void) {            /* aubergine with a warm glow */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            u32 c = mix(RGB(52, 10, 40), RGB(118, 36, 68), y, H - 1);
+            int dx = x - 540, dy = y - 450, d2 = dx * dx + dy * dy;
+            if (d2 < 90000) c = mix(c, RGB(244, 120, 44), ((90000 - d2) / 352) * 3 / 4, 255);
+            dx = x - 90; dy = y - 60; d2 = dx * dx + dy * dy;
+            if (d2 < 40000) c = mix(c, RGB(160, 70, 120), ((40000 - d2) / 157) / 3, 255);
+            bgimg[y * W + x] = c;
+        }
+}
+static void wp_kde(void) {              /* deep blue with a bright burst */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            u32 c = mix(RGB(8, 34, 104), RGB(72, 142, 216), y, H - 1);
+            int dx = x - 470, dy = y - 110, d2 = dx * dx + dy * dy;
+            if (d2 < 160000) c = mix(c, RGB(200, 230, 255), ((160000 - d2) / 628) / 2, 255);
+            bgimg[y * W + x] = c;
+        }
+}
+static void build_wallpaper(void) {
+    if (th_id == TH_UNITY) wp_unity();
+    else if (th_id == TH_KDE) wp_kde();
+    else wp_xp();
+}
 
-static const char *icon_label[8] = { "Terminal", "Notepad", "Paint", "Files", "Clock", "About", "Install", "Reboot" };
-#define ICON_X(i) (14 + ((i) / 4) * 84)
-#define ICON_Y(i) (12 + ((i) % 4) * 82)
+static void clamp_win(struct win *w) {
+    if (w->y < area_y0) w->y = area_y0;
+    if (w->y > area_y1 - 26) w->y = area_y1 - 26;
+    if (w->x < area_x0 + 80 - w->w) w->x = area_x0 + 80 - w->w;
+    if (w->x > W - 80) w->x = W - 80;
+}
+static int start_open;
+#define SM_W 200
+#define SM_ITEM 24
+#define SM_HEAD 30
+#define SM_N (N_APPS + 2)
+#define SM_H (SM_HEAD + SM_N * SM_ITEM + 6)
+
+static void theme_apply(int id) {
+    if (id < 0 || id >= N_THEMES) id = 0;
+    th_id = id; th = &themes[id];
+    if (id == TH_UNITY) { area_x0 = LAUNCH_W; area_y0 = UBAR_H; area_y1 = H; sm_x = LAUNCH_W; sm_y = UBAR_H; }
+    else { area_x0 = 0; area_y0 = 0; area_y1 = H - TB_H; sm_x = 2; sm_y = H - TB_H - SM_H; }
+    start_open = 0;
+    build_wallpaper();
+    for (int a = 0; a < N_APPS; a++) clamp_win(&wins[a]);
+}
+
+static const char *icon_label[10] = { "Terminal", "Notepad", "Paint", "Files", "Clock", "About", "Install", "Settings", "Tasks", "Reboot" };
+#define N_ICONS 10
+static int icon_x(int i) { return area_x0 + 14 + (i / 4) * 84; }
+static int icon_y(int i) { return area_y0 + 12 + (i % 4) * 82; }
 static int icon_sel = -1;
 static u32 icon_tick; static int icon_last = -1;
 
-static void draw_icon(int i, int x, int y) {   /* x,y = top-left of 32x32 */
+/* icon ids 0..8 are the app ids, 9 = reboot. 32x32 at x,y */
+static void draw_icon(int i, int x, int y) {
     switch (i) {
     case 0: rect(x, y + 2, 32, 28, RGB(60, 60, 70)); rect(x + 2, y + 6, 28, 22, C_BLACK); draw_str(x + 5, y + 12, ">_", RGB(80, 255, 80)); break;
     case 1: rect(x + 4, y, 24, 32, C_LIGHT); rect(x + 4, y, 24, 5, RGB(60, 110, 220)); for (int k = 0; k < 4; k++) rect(x + 8, y + 10 + k * 5, 16, 1, C_DARK); break;
@@ -1336,80 +1583,180 @@ static void draw_icon(int i, int x, int y) {   /* x,y = top-left of 32x32 */
     case 4: fill_circle(x + 16, y + 16, 15, C_DARK); fill_circle(x + 16, y + 16, 13, C_LIGHT); line(x + 16, y + 16, x + 16, y + 7, C_BLACK); line(x + 16, y + 16, x + 23, y + 18, C_BLACK); break;
     case 5: fill_circle(x + 16, y + 16, 15, RGB(40, 100, 220)); draw_str_s(x + 11, y + 9, "i", C_LIGHT, 2); break;
     case 6: rect(x, y + 6, 32, 20, RGB(150, 150, 160)); rect(x + 3, y + 18, 26, 4, RGB(60, 60, 70)); rect(x + 24, y + 11, 5, 3, RGB(60, 230, 60)); break;
-    case 7: fill_circle(x + 16, y + 16, 15, RGB(210, 60, 30)); fill_circle(x + 16, y + 16, 8, RGB(255, 255, 255)); fill_circle(x + 16, y + 16, 6, RGB(210, 60, 30)); rect(x + 14, y + 3, 4, 14, C_LIGHT); break;
+    case 7:  /* settings: gear */
+        for (int k = 0; k < 8; k++) {
+            int tx = x + 16 + sin60[k * 7 % 60] * 13 / 256, ty = y + 16 - sin60[(k * 7 + 15) % 60] * 13 / 256;
+            rect(tx - 3, ty - 3, 6, 6, RGB(120, 126, 140));
+        }
+        fill_circle(x + 16, y + 16, 11, RGB(140, 146, 160)); fill_circle(x + 16, y + 16, 5, RGB(236, 233, 216)); break;
+    case 8:  /* task manager: window with bars */
+        rect(x, y + 2, 32, 28, C_LIGHT); frame(x, y + 2, 32, 28, C_DARK); rect(x + 1, y + 3, 30, 4, RGB(60, 110, 220));
+        rect(x + 5, y + 20, 5, 7, RGB(60, 170, 70)); rect(x + 13, y + 14, 5, 13, RGB(60, 170, 70)); rect(x + 21, y + 17, 5, 10, RGB(220, 160, 40)); break;
+    case 9: fill_circle(x + 16, y + 16, 15, RGB(210, 60, 30)); fill_circle(x + 16, y + 16, 8, RGB(255, 255, 255)); fill_circle(x + 16, y + 16, 6, RGB(210, 60, 30)); rect(x + 14, y + 3, 4, 14, C_LIGHT); break;
     }
 }
 static void draw_desktop(void) {
     memcpy(back, bgimg, sizeof back);
-    for (int i = 0; i < 8; i++) {
-        int ix = ICON_X(i), iy = ICON_Y(i);
+    if (!show_icons) return;
+    for (int i = 0; i < N_ICONS; i++) {
+        int ix = icon_x(i), iy = icon_y(i);
         draw_icon(i, ix + 16, iy);
         int tw = slen(icon_label[i]) * 8, tx = ix + 32 - tw / 2, ty = iy + 38;
-        if (i == icon_sel) rect(tx - 2, ty - 2, tw + 4, 12, RGB(49, 106, 197));
+        if (i == icon_sel) rect(tx - 2, ty - 2, tw + 4, 12, th_id == TH_UNITY ? RGB(221, 72, 20) : RGB(49, 106, 197));
         draw_str(tx + 1, ty + 1, icon_label[i], C_BLACK);
         draw_str(tx, ty, icon_label[i], C_LIGHT);
     }
 }
 
+/* ---- window decoration ---- */
+static void close_rect(int a, int *x, int *y, int *w, int *h) {
+    struct win *wn = &wins[a];
+    if (th_id == TH_UNITY) { *x = wn->x + 9; *y = wn->y + 7; *w = 16; *h = 16; }
+    else { *x = wn->x + wn->w - 24; *y = wn->y + 6; *w = 18; *h = 18; }
+}
+static void min_rect(int a, int *x, int *y, int *w, int *h) {
+    struct win *wn = &wins[a];
+    if (th_id == TH_UNITY) { *x = wn->x + 29; *y = wn->y + 7; *w = 16; *h = 16; }
+    else { *x = wn->x + wn->w - 46; *y = wn->y + 6; *w = 18; *h = 18; }
+}
 static void draw_window(int a) {
     struct win *w = &wins[a];
     int focus = top_app() == a;
-    rect(w->x, w->y, w->w, w->h, focus ? C_FRAME : RGB(122, 150, 223));
-    gradient_v(w->x + 3, w->y + 3, w->w - 6, TITLE_H, focus ? C_TITLE2 : RGB(157, 180, 232), focus ? C_TITLE1 : RGB(122, 150, 223));
-    draw_str(w->x + 9, w->y + 11, w->title, focus ? C_LIGHT : RGB(220, 228, 248));
-    /* minimize + close */
-    int bx = w->x + w->w - 24, by = w->y + 6;
-    rect(bx, by, 18, 18, RGB(217, 83, 58)); frame(bx, by, 18, 18, C_LIGHT);
-    line(bx + 5, by + 5, bx + 12, by + 12, C_LIGHT); line(bx + 12, by + 5, bx + 5, by + 12, C_LIGHT);
-    line(bx + 6, by + 5, bx + 13, by + 12, C_LIGHT); line(bx + 13, by + 5, bx + 6, by + 12, C_LIGHT);
-    bx -= 22;
-    rect(bx, by, 18, 18, RGB(50, 110, 230)); frame(bx, by, 18, 18, C_LIGHT);
-    rect(bx + 4, by + 11, 8, 3, C_LIGHT);
+    rect(w->x, w->y, w->w, w->h, focus ? th->frame_a : th->frame_i);
+    gradient_v(w->x + 3, w->y + 3, w->w - 6, TITLE_H, focus ? th->ta1 : th->ti1, focus ? th->ta2 : th->ti2);
+    u32 tc = focus ? th->txt_a : th->txt_i;
+    int bx, by, bw, bh;
+    close_rect(a, &bx, &by, &bw, &bh);
+    if (th_id == TH_UNITY) {
+        draw_str(w->x + 54, w->y + 11, w->title, tc);
+        fill_circle(bx + 8, by + 8, 7, focus ? RGB(221, 72, 20) : RGB(110, 108, 100));
+        line(bx + 5, by + 5, bx + 11, by + 11, C_LIGHT); line(bx + 11, by + 5, bx + 5, by + 11, C_LIGHT);
+        min_rect(a, &bx, &by, &bw, &bh);
+        fill_circle(bx + 8, by + 8, 7, RGB(110, 108, 100));
+        rect(bx + 4, by + 9, 8, 2, C_LIGHT);
+    } else if (th_id == TH_KDE) {
+        draw_str(w->x + 9, w->y + 11, w->title, tc);
+        rect(bx, by, bw, bh, RGB(228, 232, 240)); frame(bx, by, bw, bh, th->frame_a);
+        line(bx + 5, by + 5, bx + 12, by + 12, RGB(150, 30, 30)); line(bx + 12, by + 5, bx + 5, by + 12, RGB(150, 30, 30));
+        line(bx + 6, by + 5, bx + 13, by + 12, RGB(150, 30, 30)); line(bx + 13, by + 5, bx + 6, by + 12, RGB(150, 30, 30));
+        min_rect(a, &bx, &by, &bw, &bh);
+        rect(bx, by, bw, bh, RGB(228, 232, 240)); frame(bx, by, bw, bh, th->frame_a);
+        rect(bx + 4, by + 11, 9, 3, RGB(40, 60, 110));
+    } else {
+        draw_str(w->x + 9, w->y + 11, w->title, tc);
+        rect(bx, by, bw, bh, RGB(217, 83, 58)); frame(bx, by, bw, bh, C_LIGHT);
+        line(bx + 5, by + 5, bx + 12, by + 12, C_LIGHT); line(bx + 12, by + 5, bx + 5, by + 12, C_LIGHT);
+        line(bx + 6, by + 5, bx + 13, by + 12, C_LIGHT); line(bx + 13, by + 5, bx + 6, by + 12, C_LIGHT);
+        min_rect(a, &bx, &by, &bw, &bh);
+        rect(bx, by, bw, bh, RGB(50, 110, 230)); frame(bx, by, bw, bh, C_LIGHT);
+        rect(bx + 4, by + 11, 8, 3, C_LIGHT);
+    }
     app_draw(a, CX(a), CY(a), CW(a), CH(a));
 }
 
-static int start_open;
-#define SM_W 200
-#define SM_ITEM 24
-#define SM_HEAD 30
-#define SM_N 9
-#define SM_H (SM_HEAD + SM_N * SM_ITEM + 6)
-#define SM_X 2
-#define SM_Y (H - TB_H - SM_H)
+/* ---- panels ---- */
 static struct rtc cached_rtc; static u32 rtc_tick = 0xFFFFFFFF;
-
-static void draw_taskbar(void) {
+static int tb_count(void) { int n = 0; for (int a = 0; a < N_APPS; a++) n += wins[a].open ? 1 : 0; return n; }
+static int tb_bw(void) {
+    int n = tb_count(), avail = W - 74 - 70;
+    if (n <= 0) return 104;
+    int bw = avail / n - 4;
+    return bw > 104 ? 104 : bw;
+}
+static void clock_refresh(void) {
+    if (rtc_tick == 0xFFFFFFFF || ticks - rtc_tick >= 100) { rtc_read(&cached_rtc); rtc_tick = ticks; }
+}
+static void bar_title(const char *t, int bw, char *out) {
+    int n = bw / 8 - 1; if (n > 20) n = 20;
+    kstrcpy(out, t, n > 1 ? n : 2);
+}
+static void bar_xp(void) {
     gradient_v(0, H - TB_H, W, TB_H, RGB(60, 130, 245), RGB(30, 88, 220));
     rect(0, H - TB_H, W, 1, RGB(120, 170, 255));
     gradient_v(0, H - TB_H, 68, TB_H, RGB(74, 170, 74), RGB(44, 130, 44));
     rect(0, H - TB_H, 68, 1, RGB(140, 220, 140));
     draw_str(10, H - TB_H + 10, "start", C_LIGHT);
-    int bx = 74;
+    int bx = 74, bw = tb_bw();
     for (int a = 0; a < N_APPS; a++) {
         if (!wins[a].open) continue;
         int active = top_app() == a;
-        gradient_v(bx, H - TB_H + 3, 104, TB_H - 6, active ? RGB(30, 80, 190) : RGB(70, 140, 250), active ? RGB(40, 100, 220) : RGB(50, 110, 235));
-        frame(bx, H - TB_H + 3, 104, TB_H - 6, RGB(20, 60, 160));
-        char b[14]; kstrcpy(b, wins[a].title, 13);
+        gradient_v(bx, H - TB_H + 3, bw, TB_H - 6, active ? RGB(30, 80, 190) : RGB(70, 140, 250), active ? RGB(40, 100, 220) : RGB(50, 110, 235));
+        frame(bx, H - TB_H + 3, bw, TB_H - 6, RGB(20, 60, 160));
+        char b[24]; bar_title(wins[a].title, bw, b);
         draw_str(bx + 6, H - TB_H + 10, b, C_LIGHT);
-        bx += 108;
+        bx += bw + 4;
     }
-    if (rtc_tick == 0xFFFFFFFF || ticks - rtc_tick >= 100) { rtc_read(&cached_rtc); rtc_tick = ticks; }
+    clock_refresh();
     rect(W - 64, H - TB_H, 64, TB_H, RGB(22, 120, 232));
     drawf(W - 52, H - TB_H + 10, C_LIGHT, "%02d:%02d", cached_rtc.h, cached_rtc.m);
 }
+static void bar_kde(void) {
+    gradient_v(0, H - TB_H, W, TB_H, RGB(214, 220, 232), RGB(158, 168, 190));
+    rect(0, H - TB_H, W, 1, C_LIGHT);
+    gradient_v(0, H - TB_H, 68, TB_H, RGB(100, 150, 218), RGB(52, 102, 182));
+    rect(68, H - TB_H, 1, TB_H, RGB(60, 96, 160));
+    fill_circle(15, H - TB_H / 2, 9, C_LIGHT);
+    draw_str(11, H - TB_H / 2 - 4, "K", RGB(40, 90, 180));
+    draw_str(30, H - TB_H + 10, "Menu", C_LIGHT);
+    int bx = 74, bw = tb_bw();
+    for (int a = 0; a < N_APPS; a++) {
+        if (!wins[a].open) continue;
+        int active = top_app() == a;
+        if (active) { rect(bx, H - TB_H + 3, bw, TB_H - 6, RGB(190, 202, 226)); frame(bx, H - TB_H + 3, bw, TB_H - 6, RGB(60, 96, 160)); }
+        else bevel(bx, H - TB_H + 3, bw, TB_H - 6, 0);
+        char b[24]; bar_title(wins[a].title, bw, b);
+        draw_str(bx + 6, H - TB_H + 10, b, RGB(20, 24, 40));
+        bx += bw + 4;
+    }
+    clock_refresh();
+    bevel(W - 64, H - TB_H + 3, 62, TB_H - 6, 1);
+    drawf(W - 52, H - TB_H + 10, RGB(20, 24, 40), "%02d:%02d", cached_rtc.h, cached_rtc.m);
+}
+static void bar_unity(void) {
+    /* left launcher */
+    rect(0, UBAR_H, LAUNCH_W, H - UBAR_H, RGB(48, 42, 40));
+    rect(LAUNCH_W - 1, UBAR_H, 1, H - UBAR_H, RGB(24, 18, 20));
+    gradient_v(0, UBAR_H, LAUNCH_W - 1, 52, RGB(240, 110, 50), RGB(200, 60, 20));
+    fill_circle(25, UBAR_H + 26, 15, C_LIGHT);
+    fill_circle(25, UBAR_H + 26, 10, RGB(220, 80, 30));
+    fill_circle(25, UBAR_H + 26, 5, C_LIGHT);
+    for (int i = 0; i < N_APPS; i++) {
+        int ty = LAUNCH_TOP + i * LAUNCH_SLOT;
+        if (wins[i].open) {
+            rect(2, ty + 1, LAUNCH_W - 4, LAUNCH_SLOT - 2, top_app() == i ? RGB(100, 92, 86) : RGB(72, 66, 62));
+            rect(0, ty + 15, 3, 10, C_LIGHT);
+        }
+        draw_icon(i, 10, ty + 6);
+    }
+    /* top panel */
+    gradient_v(0, 0, W, UBAR_H, RGB(70, 69, 65), RGB(40, 39, 36));
+    rect(0, UBAR_H - 1, W, 1, RGB(20, 18, 16));
+    int a = top_app();
+    draw_str(LAUNCH_W + 10, 8, a >= 0 ? wins[a].title : "LeactedOS", RGB(235, 232, 226));
+    clock_refresh();
+    drawf(W - 52, 8, RGB(235, 232, 226), "%02d:%02d", cached_rtc.h, cached_rtc.m);
+    rect(W - 66, 6, 6, 12, RGB(190, 186, 178)); rect(W - 74, 10, 4, 8, RGB(190, 186, 178));
+}
+static void draw_bar(void) {
+    if (th_id == TH_UNITY) bar_unity();
+    else if (th_id == TH_KDE) bar_kde();
+    else bar_xp();
+}
+
 static void draw_startmenu(void) {
-    rect(SM_X, SM_Y, SM_W, SM_H, C_LIGHT); frame(SM_X, SM_Y, SM_W, SM_H, C_FRAME);
-    gradient_v(SM_X + 1, SM_Y + 1, SM_W - 2, SM_HEAD - 1, RGB(30, 90, 210), RGB(60, 130, 245));
-    draw_str(SM_X + 10, SM_Y + 11, "LeactedOS XP", C_LIGHT);
+    rect(sm_x, sm_y, SM_W, SM_H, th->menu_bg); frame(sm_x, sm_y, SM_W, SM_H, th->menu_edge);
+    gradient_v(sm_x + 1, sm_y + 1, SM_W - 2, SM_HEAD - 1, th->menu_h1, th->menu_h2);
+    draw_str(sm_x + 10, sm_y + 11, th->menu_title, C_LIGHT);
+    static const u32 bc[N_APPS] = { RGB(60, 60, 70), RGB(60, 110, 220), RGB(220, 60, 50), RGB(240, 200, 60), RGB(120, 120, 130),
+                                    RGB(40, 100, 220), RGB(80, 160, 80), RGB(140, 146, 160), RGB(60, 170, 70) };
     for (int i = 0; i < SM_N; i++) {
-        int iy = SM_Y + SM_HEAD + i * SM_ITEM;
-        const char *t = i < N_APPS ? app_names[i] : i == 7 ? "Restart" : "Shut Down";
-        if (i == 7) rect(SM_X + 8, iy - 1, SM_W - 16, 1, C_DARK);
-        int hot = inrect(mx, my, SM_X, iy, SM_W, SM_ITEM);
-        if (hot) rect(SM_X + 2, iy, SM_W - 4, SM_ITEM, RGB(49, 106, 197));
-        if (i < N_APPS) { static const u32 bc[7] = { RGB(60,60,70), RGB(60,110,220), RGB(220,60,50), RGB(240,200,60), RGB(120,120,130), RGB(40,100,220), RGB(80,160,80) }; rect(SM_X + 10, iy + 7, 10, 10, bc[i]); frame(SM_X + 10, iy + 7, 10, 10, C_DARK); }
-        draw_str(SM_X + 34, iy + 8, t, hot ? C_LIGHT : C_TEXT);
+        int iy = sm_y + SM_HEAD + i * SM_ITEM;
+        const char *t = i < N_APPS ? app_names[i] : i == N_APPS ? "Restart" : "Shut Down";
+        if (i == N_APPS) rect(sm_x + 8, iy - 1, SM_W - 16, 1, th->menu_edge);
+        int hot = inrect(mx, my, sm_x, iy, SM_W, SM_ITEM);
+        if (hot) rect(sm_x + 2, iy, SM_W - 4, SM_ITEM, th->menu_hl);
+        if (i < N_APPS) { rect(sm_x + 10, iy + 7, 10, 10, bc[i]); frame(sm_x + 10, iy + 7, 10, 10, C_DARK); }
+        draw_str(sm_x + 34, iy + 8, t, hot ? th->menu_hl_fg : th->menu_fg);
     }
 }
 
@@ -1430,34 +1777,52 @@ static int drag_app = -1, drag_dx, drag_dy, press_app = -1;
 
 static void start_item(int i) {
     if (i < N_APPS) open_app(i);
-    else if (i == 7) reboot_now();
+    else if (i == N_APPS) reboot_now();
     else power_off();
+}
+static void toggle_app(int a) {
+    if (!wins[a].open) open_app(a);
+    else if (wins[a].min || top_app() != a) raise_app(a);
+    else wins[a].min = 1;
+}
+/* returns 1 if the click landed on a panel */
+static int panel_press(int x, int y, int was_open) {
+    if (th_id == TH_UNITY) {
+        if (y < UBAR_H) return 1;
+        if (x < LAUNCH_W) {
+            if (y < LAUNCH_TOP) { start_open = !was_open; return 1; }
+            int i = (y - LAUNCH_TOP) / LAUNCH_SLOT;
+            if (i >= 0 && i < N_APPS) toggle_app(i);
+            return 1;
+        }
+        return 0;
+    }
+    if (y < H - TB_H) return 0;
+    if (x < 68) { start_open = !was_open; return 1; }
+    int bx = 74, bw = tb_bw();
+    for (int a = 0; a < N_APPS; a++) {
+        if (!wins[a].open) continue;
+        if (inrect(x, y, bx, H - TB_H + 3, bw, TB_H - 6)) { toggle_app(a); return 1; }
+        bx += bw + 4;
+    }
+    return 1;
 }
 static void on_press(int x, int y) {
     int was_open = start_open;
     if (start_open) {
         start_open = 0;
-        if (inrect(x, y, SM_X, SM_Y + SM_HEAD, SM_W, SM_N * SM_ITEM)) { start_item((y - SM_Y - SM_HEAD) / SM_ITEM); return; }
+        if (inrect(x, y, sm_x, sm_y + SM_HEAD, SM_W, SM_N * SM_ITEM)) { start_item((y - sm_y - SM_HEAD) / SM_ITEM); return; }
     }
-    if (y >= H - TB_H) {
-        if (x < 68) { start_open = !was_open; return; }
-        int bx = 74;
-        for (int a = 0; a < N_APPS; a++) {
-            if (!wins[a].open) continue;
-            if (inrect(x, y, bx, H - TB_H + 3, 104, TB_H - 6)) {
-                if (wins[a].min || top_app() != a) raise_app(a); else wins[a].min = 1;
-                return;
-            }
-            bx += 108;
-        }
-        return;
-    }
+    if (panel_press(x, y, was_open)) return;
     for (int i = nz - 1; i >= 0; i--) {
         int a = zo[i]; struct win *w = &wins[a];
         if (w->min || !inrect(x, y, w->x, w->y, w->w, w->h)) continue;
         raise_app(a);
-        if (inrect(x, y, w->x + w->w - 24, w->y + 6, 18, 18)) { close_app(a); return; }
-        if (inrect(x, y, w->x + w->w - 46, w->y + 6, 18, 18)) { w->min = 1; return; }
+        int bx, by, bw, bh;
+        close_rect(a, &bx, &by, &bw, &bh);
+        if (inrect(x, y, bx, by, bw, bh)) { close_app(a); return; }
+        min_rect(a, &bx, &by, &bw, &bh);
+        if (inrect(x, y, bx, by, bw, bh)) { w->min = 1; return; }
         if (y < w->y + 3 + TITLE_H) { drag_app = a; drag_dx = x - w->x; drag_dy = y - w->y; return; }
         press_app = a;
         app_click(a, x - CX(a), y - CY(a));
@@ -1465,14 +1830,12 @@ static void on_press(int x, int y) {
     }
     /* desktop icons */
     icon_sel = -1;
-    for (int i = 0; i < 8; i++) {
-        if (inrect(x, y, ICON_X(i), ICON_Y(i), 64, 56)) {
+    if (!show_icons) return;
+    for (int i = 0; i < N_ICONS; i++) {
+        if (inrect(x, y, icon_x(i), icon_y(i), 64, 56)) {
             int dbl = icon_last == i && ticks - icon_tick < 60;
             icon_sel = i; icon_last = i; icon_tick = ticks;
-            if (dbl) {
-                if (i < 7) open_app(i == 0 ? A_TERM : i == 1 ? A_NOTE : i == 2 ? A_PAINT : i == 3 ? A_FILES : i == 4 ? A_CLOCK : i == 5 ? A_ABOUT : A_INSTALL);
-                else reboot_now();
-            }
+            if (dbl) { if (i < N_APPS) open_app(i); else reboot_now(); }
             return;
         }
     }
@@ -1484,10 +1847,7 @@ static void on_move_held(int x, int y) {
     if (drag_app >= 0) {
         struct win *w = &wins[drag_app];
         w->x = x - drag_dx; w->y = y - drag_dy;
-        if (w->y < 0) w->y = 0;
-        if (w->y > H - TB_H - 26) w->y = H - TB_H - 26;
-        if (w->x < 80 - w->w) w->x = 80 - w->w;
-        if (w->x > W - 80) w->x = W - 80;
+        clamp_win(w);
     } else if (press_app == A_PAINT && wins[A_PAINT].open) {
         paint_drag(x - CX(A_PAINT), y - CY(A_PAINT));
     }
@@ -1497,10 +1857,12 @@ static void on_move_held(int x, int y) {
 /* Frame / main                                                        */
 /* ------------------------------------------------------------------ */
 static void os_draw(void) {
+    frame_count++;
+    if (ticks - fps_t >= 100) { fps = (frame_count - fps_f) * 100 / (ticks - fps_t); fps_f = frame_count; fps_t = ticks; }
     clip_reset();
     draw_desktop();
     for (int i = 0; i < nz; i++) if (!wins[zo[i]].min) draw_window(zo[i]);
-    draw_taskbar();
+    draw_bar();
     if (start_open) draw_startmenu();
     draw_cursor();
 }
@@ -1527,12 +1889,13 @@ static void os_init(u32 magic, const u32 *mbi) {
     mem_kb = 262144;
 #endif
     video_init();
-    build_wallpaper();
     memset(canvas, 1, sizeof canvas);
     ps2_init();
     ata_identify();
     fs_check();
     fs_load();
+    settings_load();
+    theme_apply(th_id);
     irq_init();
     open_app(A_TERM);
 }

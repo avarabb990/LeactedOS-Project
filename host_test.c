@@ -98,13 +98,49 @@ int main(void) {
     /* close via X */
     click(wins[a].x + wins[a].w - 15, wins[a].y + 15); assert(!wins[a].open);
     /* minimize via taskbar */
-    int top = top_app(); int bx = 74; for (int k = 0; k < top; k++) if (wins[k].open) bx += 108;
+    int top = top_app(); int bx = 74; for (int k = 0; k < top; k++) if (wins[k].open) bx += tb_bw() + 4;
     click(bx + 10, H - 12); assert(wins[top].min);
     click(bx + 10, H - 12); assert(!wins[top].min && top_app() == top);
     for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
     wins[A_FILES].x = 10; wins[A_FILES].y = 20; wins[A_CLOCK].x = 350; wins[A_CLOCK].y = 20;
     open_app(A_FILES); open_app(A_CLOCK); mx = 600; my = 400;
     frame_out("t6_files_clock.ppm");
+    /* ---- themes, settings, task manager ---- */
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    wins[A_TERM].x = 90; wins[A_TERM].y = 24;
+    open_app(A_TERM); cmd("theme unity"); assert(th_id == TH_UNITY);
+    cmd("theme"); cmd("help");
+    open_app(A_SETTINGS); open_app(A_TASK);
+    mx = 300; my = 300; start_open = 0;
+    frame_out("t7_unity.ppm");
+    start_open = 1; frame_out("t7b_unity_dash.ppm"); start_open = 0;
+    /* launcher click toggles an app */
+    click(20, LAUNCH_TOP + A_CLOCK * LAUNCH_SLOT + 10); assert(wins[A_CLOCK].open);
+    click(20, LAUNCH_TOP + A_CLOCK * LAUNCH_SLOT + 10); assert(wins[A_CLOCK].min);
+    /* unity close button on the left */
+    int cx0, cy0, cw0, ch0; close_rect(A_CLOCK, &cx0, &cy0, &cw0, &ch0); raise_app(A_CLOCK);
+    click(cx0 + 5, cy0 + 5); assert(!wins[A_CLOCK].open);
+    cmd("theme kde"); assert(th_id == TH_KDE);
+    frame_out("t8_kde.ppm");
+    start_open = 1; frame_out("t8b_kde_menu.ppm"); start_open = 0;
+    cmd("theme xp"); assert(th_id == TH_XP);
+    frame_out("t9_xp.ppm");
+    /* settings persistence: theme survives a reload */
+    cmd("theme unity");
+    th_id = 0; show_icons = 1; term_color_idx = 0;
+    settings_load(); assert(th_id == TH_UNITY);
+    /* settings window click: pick KDE row, toggle icons, term colour */
+    raise_app(A_SETTINGS); int sx = CX(A_SETTINGS), sy = CY(A_SETTINGS);
+    click(sx + 100, sy + SET_ROW(2) + 10); assert(th_id == TH_KDE);
+    click(sx + 20, sy + 172); assert(!show_icons);
+    click(sx + 20 + 2 * 40, sy + 215); assert(term_color_idx == 2);
+    frame_out("t10_kde_settings_noicons.ppm");
+    click(sx + 20, sy + 172); assert(show_icons);
+    /* task manager: end task */
+    tsel = A_SETTINGS;
+    raise_app(A_TASK); int tx = CX(A_TASK), ty = CY(A_TASK);
+    click(tx + 20, ty + 150); assert(!wins[A_SETTINGS].open);
+    for (int k = 0; k < 3; k++) { theme_apply(k); for (int a2 = 0; a2 < N_APPS; a2++) { open_app(a2); assert(wins[a2].y >= area_y0); } }
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }
