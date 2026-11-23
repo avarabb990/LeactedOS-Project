@@ -14,6 +14,8 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int32_t i32;
 
+#include "sdk/lapp_load.h"      /* LAPP app format: header check + relocation */
+
 #ifdef HOST
 #include <string.h>
 #else
@@ -987,7 +989,8 @@ static void power_off(void) {
 /* ------------------------------------------------------------------ */
 /* Window manager                                                      */
 /* ------------------------------------------------------------------ */
-enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, A_OPENWITH, A_HEX, A_IMG, N_APPS };
+enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, A_OPENWITH, A_HEX, A_IMG, A_EXT0, A_EXT1, A_EXT2, A_EXT3, N_APPS };
+#define N_EXT 4                  /* loaded apps (.lapp) that can run at once */
 #define N_PIN A_OPENWITH         /* apps shown in menus, launcher and on the desktop */
 static void theme_apply(int id);
 static void settings_save(void);
@@ -1004,7 +1007,7 @@ static struct win wins[N_APPS] = {
     [A_SETTINGS] = { 0, 0, 120, 50, 380, 300, "Settings" },
     [A_TASK]    = { 0, 0, 100, 30, 380, 336, "Task Manager" },
     [A_CALC]    = { 0, 0, 260, 40, 232, 300, "Calculator" },
-    [A_OPENWITH] = { 0, 0, 170, 100, 300, 270, "Open With" },
+    [A_OPENWITH] = { 0, 0, 170, 70, 300, 310, "Open With" },
     [A_HEX]     = { 0, 0, 120, 50, 380, 330, "Hex Viewer" },
     [A_IMG]     = { 0, 0, 90, 40, 440, 360, "Image Viewer" },
 };
@@ -1033,7 +1036,118 @@ static void open_app(int a) {
     if (!wins[a].open) { wins[a].open = 1; app_init(a); }
     raise_app(a);
 }
-static void close_app(int a) { wins[a].open = 0; wins[a].min = 0; z_remove(a); }
+static void xapp_on_close(int a);
+static void close_app(int a) {
+    if (a >= A_EXT0 && wins[a].open) xapp_on_close(a);
+    wins[a].open = 0; wins[a].min = 0; z_remove(a);
+}
+
+/* ------------------------------------------------------------------ */
+/* Loadable apps (.lapp): slots, kernel API, event dispatch            */
+/* ------------------------------------------------------------------ */
+#define APP_FILE_MAX (LAPP_HDR_SIZE + LAPP_MAX_MEM + LAPP_MAX_RELOC * 4u)
+typedef int (*lapp_entry_fn)(const struct leact_api *, const struct leact_event *);
+struct xapp { int used, want_close; u32 entry; u8 *mem; char title[25]; lapp_entry_fn native; };
+static struct xapp xapp[N_EXT];
+static u8 app_mem[N_EXT][LAPP_MAX_MEM] __attribute__((aligned(16)));
+static u8 app_tmp[APP_FILE_MAX];
+static int xdraw, xox, xoy, xcur = -1;        /* drawing allowed / origin / running slot */
+static const char *lapp_run_fref(const struct fref *f);
+static void tputc(char c);
+
+static u32 xrng = 2463534242u; static int xrng_seeded;
+static u32 x_rand(void) {
+    if (!xrng_seeded) { xrng ^= ticks * 2654435761u; if (!xrng) xrng = 1; xrng_seeded = 1; }
+    xrng ^= xrng << 13; xrng ^= xrng >> 17; xrng ^= xrng << 5;
+    return xrng;
+}
+static void x_rect(int x, int y, int w, int h, u32 c) { if (xdraw) rect(xox + x, xoy + y, w, h, c); }
+static void x_frame(int x, int y, int w, int h, u32 c) { if (xdraw) frame(xox + x, xoy + y, w, h, c); }
+static void x_line(int x0, int y0, int x1, int y1, u32 c) {
+    if (xdraw && x0 > -4000 && x0 < 4000 && y0 > -4000 && y0 < 4000 && x1 > -4000 && x1 < 4000 && y1 > -4000 && y1 < 4000)
+        line(xox + x0, xoy + y0, xox + x1, xoy + y1, c);
+}
+static void x_circle(int cx, int cy, int r, u32 c) { if (xdraw && r >= 0 && r <= 300) fill_circle(xox + cx, xoy + cy, r, c); }
+static void x_pixel(int x, int y, u32 c) { if (xdraw) pset(xox + x, xoy + y, c); }
+static int x_text(int x, int y, const char *s, u32 c) { if (!xdraw) return x; return draw_str_s(xox + x, xoy + y, s, c, 1) - xox; }
+static int x_text_scaled(int x, int y, const char *s, u32 c, int sc) {
+    if (!xdraw) return x;
+    if (sc < 1) sc = 1;
+    if (sc > 8) sc = 8;
+    return draw_str_s(xox + x, xoy + y, s, c, sc) - xox;
+}
+static void x_button(int x, int y, int w, int h, const char *l, int pr) { if (xdraw) button(xox + x, xoy + y, w, h, l, pr); }
+static void x_blit(int x, int y, int w, int h, const u32 *src) {
+    if (xdraw && src && w > 0 && h > 0 && w <= 640 && h <= 480) blit_argb(xox + x, xoy + y, w, h, src);
+}
+static u32 x_ticks(void) { return ticks; }
+static void x_beep(u32 hz, u32 ms) { beep(hz, ms > 1000 ? 1000 : ms); }
+static void x_set_title(const char *t) { if (xcur >= 0 && t) kstrcpy(xapp[xcur].title, t, sizeof xapp[xcur].title); }
+static void x_close(void) { if (xcur >= 0) xapp[xcur].want_close = 1; }
+static void x_log(const char *t) { if (t) for (int i = 0; t[i] && i < 200; i++) tputc(t[i]); }
+static int x_file_read(const char *name, void *buf, u32 max) {
+    int i = name ? fs_find(name) : -1;
+    if (i < 0 || !buf) return -1;
+    u32 n = fsdir[i].size < max ? fsdir[i].size : max;
+    memcpy(buf, fsdata[i], n);
+    return (int)n;
+}
+static int x_file_write(const char *name, const void *buf, u32 len) {
+    if (!name || !*name || (len && !buf) || len > FS_SLOT) return -1;
+    int i = fs_create(name);
+    if (i < 0) return -1;
+    return fs_store(i, buf, len) < 0 ? -1 : 0;
+}
+static int x_file_delete(const char *name) {
+    int i = name ? fs_find(name) : -1;
+    if (i < 0) return -1;
+    return fs_delete(i) < 0 ? -1 : 0;
+}
+static int x_file_name(int idx, char *out, u32 max) {
+    int k = 0;
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
+        if (k++ != idx) continue;
+        if (out && max) kstrcpy(out, fsdir[i].name, (int)max);
+        return (int)fsdir[i].size;
+    }
+    return -1;
+}
+static struct leact_api xapi = {
+    .size = sizeof(struct leact_api), .version = LAPP_API_VERSION,
+    .rect = x_rect, .frame = x_frame, .line = x_line, .circle = x_circle, .pixel = x_pixel,
+    .text = x_text, .text_scaled = x_text_scaled, .button = x_button, .blit = x_blit,
+    .ticks = x_ticks, .rand = x_rand, .beep = x_beep, .set_title = x_set_title, .close = x_close, .log = x_log,
+    .file_read = x_file_read, .file_write = x_file_write, .file_delete = x_file_delete, .file_name = x_file_name,
+};
+
+/* deliver one event to the app living in window slot a */
+static int xcall(int a, int type, int x, int y, int key, int btn) {
+    int s = a - A_EXT0;
+    if (s < 0 || s >= N_EXT || !xapp[s].used) return 0;
+    struct xapp *p = &xapp[s];
+    struct leact_event ev = { type, x, y, key, btn, CW(a), CH(a) };
+    xapi.c_face = C_FACE; xapi.c_text = C_TEXT; xapi.c_light = C_LIGHT; xapi.c_dark = C_DARK;
+    int prev = xcur, r = 0;
+    xcur = s;
+    if (p->native) r = p->native(&xapi, &ev);
+#ifndef HOST
+    else r = ((lapp_entry_fn)(uintptr_t)(p->mem + p->entry))(&xapi, &ev);
+#endif
+    xcur = prev;
+    return r;
+}
+static void xapp_on_close(int a) {
+    int s = a - A_EXT0;
+    if (s < 0 || s >= N_EXT || !xapp[s].used) return;
+    xcall(a, EV_CLOSE, 0, 0, 0, 0);
+    xapp[s].used = 0; xapp[s].want_close = 0; xapp[s].native = 0;
+}
+static void xapp_reap(void) {
+    for (int s = 0; s < N_EXT; s++) if (xapp[s].used && xapp[s].want_close) close_app(A_EXT0 + s);
+}
+static void xapp_tick(void) {
+    for (int s = 0; s < N_EXT; s++) if (xapp[s].used && wins[A_EXT0 + s].open) xcall(A_EXT0 + s, EV_TICK, 0, 0, 0, 0);
+}
 
 /* ------------------------------------------------------------------ */
 /* Terminal                                                            */
@@ -1141,6 +1255,36 @@ static void cmd_echo_redirect(char *line) {
     print_store_result(fs_store(i, buf, len));
 }
 static void run_cmd(char *line);
+static int ext_is(const char *name, const char *ext);
+static int find_app_file(const char *arg) {
+    int i = fs_find(arg);
+    if (i >= 0) return i;
+    char nm[FS_NAME]; ksnprintf(nm, sizeof nm, "%s.lapp", arg);
+    return fs_find(nm);
+}
+static void cmd_apps(void) {
+    int n = 0;
+    tputs("Apps on LeactedFS:\n");
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && ext_is(fsdir[i].name, "lapp")) { tprintf(" %s  %u bytes\n", fsdir[i].name, fsdir[i].size); n++; }
+    if (!n) tputs(" (none - copy .lapp files in with the File Manager)\n");
+    n = 0;
+    for (int k = 0; k < N_EXT; k++) if (xapp[k].used) { if (!n++) tputs("Running:\n"); tprintf(" %s\n", xapp[k].title); }
+}
+static void cmd_appinfo(const char *arg) {
+    int i = find_app_file(arg);
+    if (i < 0) { tputs("File not found.\n"); return; }
+    struct lapp_header h; const char *err = lapp_check(fsdata[i], fsdir[i].size, &h);
+    if (err) { tprintf("%s\n", err); return; }
+    tprintf("%s\n window %dx%d, memory %u bytes\n needs API %u, %u relocations\n", h.name, h.win_w, h.win_h, h.image_size + h.bss_size, h.api_min, h.nreloc);
+}
+static void cmd_run(const char *arg) {
+    int i = find_app_file(arg);
+    if (i < 0) { tputs("App not found. Type apps to list them.\n"); return; }
+    struct fref f = { 1, fs_drive, (u32)i, fsdir[i].size, "" };
+    kstrcpy(f.name, fsdir[i].name, sizeof f.name);
+    const char *err = lapp_run_fref(&f);
+    if (err) tprintf("Cannot run: %s\n", err);
+}
 static void cmd_help(void) {
     tputs("Commands:\n");
     tputs(" help clear about ver uptime date mem disk\n");
@@ -1153,6 +1297,9 @@ static void cmd_help(void) {
     tputs(" beep [hz]     PC speaker\n");
     tputs(" open APP      term note paint files clock\n");
     tputs("               about install settings task calc\n");
+    tputs(" run APP       start a .lapp app\n");
+    tputs(" apps          list apps\n");
+    tputs(" appinfo APP   show app details\n");
     tputs(" theme NAME    xp | unity | kde\n");
     tputs(" super         toggle root mode\n");
     tputs(" reboot  shutdown  exit\n");
@@ -1244,6 +1391,15 @@ static void run_cmd(char *line) {
         else if (!kstrcmp(a, "task")) open_app(A_TASK);
         else if (!kstrcmp(a, "calc")) open_app(A_CALC);
         else tputs("Unknown app.\n");
+    }
+    else if (!kstrcmp(c, "run") || !kstrcmp(c, "start")) {
+        if (ac < 2) { tputs("Usage: run APP   (see: apps)\n"); return; }
+        cmd_run(av[1]);
+    }
+    else if (!kstrcmp(c, "apps")) cmd_apps();
+    else if (!kstrcmp(c, "appinfo")) {
+        if (ac < 2) { tputs("Usage: appinfo APP\n"); return; }
+        cmd_appinfo(av[1]);
     }
     else if (!kstrcmp(c, "install")) open_app(A_INSTALL);
     else if (!kstrcmp(c, "theme")) {
@@ -1598,8 +1754,10 @@ static void img_draw(int x, int y, int w, int h) {
 /* ------------------------------------------------------------------ */
 static struct fref ow_ref;
 static int ow_sel, ow_rec;
-static const char *ow_apps[3] = { "Notepad", "Image Viewer", "Hex Viewer" };
-static const char *ow_desc[3] = { "View and edit text files", "View BMP pictures", "Show the raw bytes of any file" };
+#define OW_N 4
+static char ow_msg[48];
+static const char *ow_apps[OW_N] = { "Notepad", "Image Viewer", "Hex Viewer", "Run as app" };
+static const char *ow_desc[OW_N] = { "View and edit text files", "View BMP pictures", "Show raw bytes of any file", "Start a LeactedOS app" };
 
 static int ext_is(const char *name, const char *ext) {
     const char *dot = NULL;
@@ -1613,10 +1771,11 @@ static int ow_recommend(const char *name) {
     static const char *txt[] = { "txt", "cfg", "c", "h", "md", "log", "ini", "bat", "csv", "sh", "py", "json", "asm", "s", "xml", "html", "htm", "conf", "inf", NULL };
     for (int i = 0; txt[i]; i++) if (ext_is(name, txt[i])) return 0;
     if (ext_is(name, "bmp")) return 1;
+    if (ext_is(name, "lapp")) return 3;
     return 2;
 }
 static void openwith_show(const struct fref *f) {
-    ow_ref = *f;
+    ow_ref = *f; ow_msg[0] = 0;
     ow_rec = ow_recommend(f->name);
     ow_sel = ow_rec;
     open_app(A_OPENWITH);
@@ -1624,6 +1783,12 @@ static void openwith_show(const struct fref *f) {
 }
 static void ow_launch(void) {
     struct fref f = ow_ref;
+    if (ow_sel == 3) {
+        const char *err = lapp_run_fref(&f);
+        if (err) { kstrcpy(ow_msg, err, sizeof ow_msg); return; }
+        close_app(A_OPENWITH);
+        return;
+    }
     close_app(A_OPENWITH);
     if (ow_sel == 0) {
         if (f.kind == 1) note_open_file(f.name);
@@ -1640,29 +1805,30 @@ static void ow_draw(int x, int y, int w, int h) {
     draw_str(x + 10, y + 10, "Open file with:", C_TEXT);
     draw_str(x + 10, y + 24, nm, RGB(0, 70, 190));
     drawf(x + 10, y + 36, C_DARK, "%u bytes", ow_ref.size);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < OW_N; i++) {
         int ry = y + 54 + i * 40, sel = ow_sel == i;
         rect(x + 8, ry, w - 16, 36, sel ? RGB(255, 255, 255) : C_FACE);
         frame(x + 8, ry, w - 16, 36, sel ? RGB(49, 106, 197) : C_DARK);
-        rect(x + 14, ry + 6, 22, 22, i == 0 ? RGB(60, 110, 220) : i == 1 ? RGB(60, 170, 70) : RGB(90, 100, 120));
+        rect(x + 14, ry + 6, 22, 22, i == 0 ? RGB(60, 110, 220) : i == 1 ? RGB(60, 170, 70) : i == 2 ? RGB(90, 100, 120) : RGB(230, 140, 40));
         draw_str(x + 44, ry + 8, ow_apps[i], C_TEXT);
         draw_str(x + 44, ry + 21, ow_desc[i], C_DARK);
         if (i == ow_rec) draw_str(x + w - 108, ry + 8, "recommended", RGB(0, 110, 0));
         fill_circle(x + w - 24, ry + 26, 5, C_DARK); fill_circle(x + w - 24, ry + 26, 4, C_LIGHT);
         if (sel) fill_circle(x + w - 24, ry + 26, 2, RGB(49, 106, 197));
     }
+    if (ow_msg[0]) draw_str(x + 6, y + h - 46, ow_msg, RGB(190, 20, 20));
     button(x + w - 146, y + h - 30, 62, 22, "Open", 0);
     button(x + w - 76, y + h - 30, 62, 22, "Cancel", 0);
 }
 static void ow_click(int rx, int ry) {
     int w = CW(A_OPENWITH), h = CH(A_OPENWITH);
-    for (int i = 0; i < 3; i++) if (inrect(rx, ry, 8, 54 + i * 40, w - 16, 36)) { ow_sel = i; return; }
+    for (int i = 0; i < OW_N; i++) if (inrect(rx, ry, 8, 54 + i * 40, w - 16, 36)) { ow_sel = i; ow_msg[0] = 0; return; }
     if (inrect(rx, ry, w - 146, h - 30, 62, 22)) ow_launch();
     else if (inrect(rx, ry, w - 76, h - 30, 62, 22)) close_app(A_OPENWITH);
 }
 static void ow_key(int k) {
     if (k == K_UP && ow_sel > 0) ow_sel--;
-    else if (k == K_DOWN && ow_sel < 2) ow_sel++;
+    else if (k == K_DOWN && ow_sel < OW_N - 1) ow_sel++;
     else if (k == '\n') ow_launch();
     else if (k == K_ESC) close_app(A_OPENWITH);
 }
@@ -2064,6 +2230,7 @@ static void task_draw(int x, int y, int w, int h) {
     for (int a = 0; a < N_APPS; a++) {
         if (!wins[a].open) continue;
         n++;
+        if (row >= 11) continue;
         int ry = y + 35 + row * 11;
         if (a == tsel) rect(x + 7, ry - 1, w - 14, 11, RGB(49, 106, 197));
         u32 fg = a == tsel ? C_LIGHT : C_TEXT;
@@ -2078,7 +2245,7 @@ static void task_draw(int x, int y, int w, int h) {
     draw_str(x + 8, y + 202, "System", C_TEXT);
     u32 s = ticks / 100;
     drawf(x + 12, y + 216, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
-    u32 used_kb = (u32)((sizeof back + sizeof bgimg + sizeof fsdata + sizeof canvas + sizeof tg + 65536) / 1024);
+    u32 used_kb = (u32)((sizeof back + sizeof bgimg + sizeof fsdata + sizeof canvas + sizeof tg + sizeof app_mem + sizeof app_tmp + 65536) / 1024);
     drawf(x + 12, y + 230, C_TEXT, "Kernel  : %u KB of %u KB", used_kb, mem_kb ? mem_kb : used_kb);
     int bw = w - 24, fill = mem_kb ? (int)((u32)bw * used_kb / mem_kb) : bw;
     if (fill < 2) fill = 2;
@@ -2091,7 +2258,7 @@ static void task_draw(int x, int y, int w, int h) {
 static void task_click(int rx, int ry) {
     int w = CW(A_TASK);
     int row = 0;
-    for (int a = 0; a < N_APPS; a++) {
+    for (int a = 0; a < N_APPS && row < 11; a++) {
         if (!wins[a].open) continue;
         if (inrect(rx, ry, 7, 35 + row * 11 - 1, w - 14, 11)) { tsel = a; return; }
         row++;
@@ -2245,6 +2412,7 @@ static void app_init(int a) {
     else if (a == A_CALC) calc_reset();
     else if (a == A_FILES) { if (fm_drive < 0 || (fm_drive != FM_RAM && !drv[fm_drive].present)) fm_pick_drive(fs_on_disk ? fs_drive : FM_RAM); else fm_refresh(); }
     else if (a == A_INSTALL) { inst_state = 0; install_pick_default(); }
+    else if (a >= A_EXT0) { if (xcall(a, EV_INIT, 0, 0, 0, 0)) xapp[a - A_EXT0].want_close = 1; }
 }
 static void app_draw(int a, int x, int y, int w, int h) {
     clip_set(x, y, w, h);
@@ -2263,6 +2431,8 @@ static void app_draw(int a, int x, int y, int w, int h) {
     case A_OPENWITH: ow_draw(x, y, w, h); break;
     case A_HEX: hex_draw(x, y, w, h); break;
     case A_IMG: img_draw(x, y, w, h); break;
+    default:
+        if (a >= A_EXT0) { xdraw = 1; xox = x; xoy = y; xcall(a, EV_DRAW, 0, 0, 0, 0); xdraw = 0; }
     }
     clip_reset();
 }
@@ -2278,6 +2448,7 @@ static void app_click(int a, int rx, int ry) {
     case A_CALC: calc_click(rx, ry); break;
     case A_OPENWITH: ow_click(rx, ry); break;
     case A_HEX: hex_click(rx, ry); break;
+    default: if (a >= A_EXT0) xcall(a, EV_CLICK, rx, ry, 0, 1);
     }
 }
 static void app_key(int a, int k) {
@@ -2287,6 +2458,7 @@ static void app_key(int a, int k) {
     else if (a == A_FILES) files_key(k);
     else if (a == A_OPENWITH) ow_key(k);
     else if (a == A_HEX) hex_key(k);
+    else if (a >= A_EXT0) xcall(a, EV_KEY, 0, 0, k, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2347,6 +2519,33 @@ static void clamp_win(struct win *w) {
     if (w->x < area_x0 + 80 - w->w) w->x = area_x0 + 80 - w->w;
     if (w->x > W - 80) w->x = W - 80;
 }
+
+/* Start an app from a complete .lapp file in memory. Returns NULL or an error message. */
+static const char *lapp_start(const u8 *file, u32 len, const char *fname, lapp_entry_fn native) {
+    struct lapp_header h; const char *err = lapp_check(file, len, &h);
+    if (err) return err;
+    int s = 0; while (s < N_EXT && xapp[s].used) s++;
+    if (s == N_EXT) return "Too many apps running (4 at most)";
+    err = lapp_load(file, &h, app_mem[s], (u32)(uintptr_t)app_mem[s]);
+    if (err) return err;
+    struct xapp *p = &xapp[s];
+    memset(p, 0, sizeof *p);
+    p->used = 1; p->mem = app_mem[s]; p->entry = h.entry_off; p->native = native;
+    kstrcpy(p->title, h.name[0] ? h.name : fname, sizeof p->title);
+    int a = A_EXT0 + s; struct win *w = &wins[a];
+    w->title = p->title; w->w = h.win_w + 6; w->h = h.win_h + 6 + TITLE_H;
+    w->x = area_x0 + 30 + s * 26; w->y = area_y0 + 16 + s * 26;
+    clamp_win(w);
+    open_app(a);
+    return NULL;
+}
+static const char *lapp_run_fref(const struct fref *f) {
+    if (f->size > APP_FILE_MAX) return "App file is too big";
+    u32 n = fref_load(f, app_tmp, APP_FILE_MAX);
+    if (n != f->size) return "Could not read the app file";
+    return lapp_start(app_tmp, n, f->name, 0);
+}
+
 static int start_open;
 #define SM_W 200
 #define SM_ITEM 24
@@ -2453,7 +2652,7 @@ static void draw_window(int a) {
         rect(bx, by, bw, bh, RGB(50, 110, 230)); frame(bx, by, bw, bh, C_LIGHT);
         rect(bx + 4, by + 11, 8, 3, C_LIGHT);
     }
-    if (a >= N_PIN) {                    /* helper windows cannot be minimised */
+    if (a >= N_PIN && a < A_EXT0) {      /* helper windows cannot be minimised */
         u32 c1 = focus ? th->ta1 : th->ti1, c2 = focus ? th->ta2 : th->ti2;
         min_rect(a, &bx, &by, &bw, &bh);
         for (int j = 0; j < bh; j++) rect(bx, by + j, bw, 1, mix(c1, c2, by + j - (w->y + 3), TITLE_H - 1));
@@ -2633,7 +2832,7 @@ static void on_press(int x, int y) {
         close_rect(a, &bx, &by, &bw, &bh);
         if (inrect(x, y, bx, by, bw, bh)) { close_app(a); return; }
         min_rect(a, &bx, &by, &bw, &bh);
-        if (inrect(x, y, bx, by, bw, bh)) { if (a < N_PIN) w->min = 1; return; }
+        if (inrect(x, y, bx, by, bw, bh)) { if (a < N_PIN || a >= A_EXT0) w->min = 1; return; }
         if (y < w->y + 3 + TITLE_H) { drag_app = a; drag_dx = x - w->x; drag_dy = y - w->y; return; }
         press_app = a;
         app_click(a, x - CX(a), y - CY(a));
@@ -2652,6 +2851,7 @@ static void on_press(int x, int y) {
     }
 }
 static void on_release(void) {
+    if (press_app >= A_EXT0 && wins[press_app].open) xcall(press_app, EV_RELEASE, mx - CX(press_app), my - CY(press_app), 0, 0);
     drag_app = -1; press_app = -1; plastx = -1;
 }
 static void on_move_held(int x, int y) {
@@ -2661,6 +2861,8 @@ static void on_move_held(int x, int y) {
         clamp_win(w);
     } else if (press_app == A_PAINT && wins[A_PAINT].open) {
         paint_drag(x - CX(A_PAINT), y - CY(A_PAINT));
+    } else if (press_app >= A_EXT0 && wins[press_app].open) {
+        xcall(press_app, EV_MOVE, x - CX(press_app), y - CY(press_app), 0, 1);
     }
 }
 
@@ -2671,15 +2873,18 @@ static void os_draw(void) {
     frame_count++;
     if (ticks - fps_t >= 100) { fps = (frame_count - fps_f) * 100 / (ticks - fps_t); fps_f = frame_count; fps_t = ticks; }
     clip_reset();
+    xapp_tick();
     draw_desktop();
     for (int i = 0; i < nz; i++) if (!wins[zo[i]].min) draw_window(zo[i]);
     draw_bar();
     if (start_open) draw_startmenu();
     draw_cursor();
+    xapp_reap();
 }
 
 static int prev_btn;
 static void os_events(void) {
+    xapp_reap();
     input_poll();
     int k;
     while ((k = kq_pop())) {

@@ -17,6 +17,13 @@ static u8 *readfile(const char *fn, long *len) {
     u8 *b = malloc(*len + 1); assert(fread(b, 1, *len, f) == (size_t)*len); fclose(f);
     return b;
 }
+extern int hello_main(const struct leact_api *, const struct leact_event *);
+extern int snake_main(const struct leact_api *, const struct leact_event *);
+extern int doodle_main(const struct leact_api *, const struct leact_event *);
+static int term_has(const char *needle) {
+    for (int r = 0; r < TR; r++) if (strstr(tg[r], needle)) return 1;
+    return 0;
+}
 static int find_ent(const char *n) { for (int i = 0; i < fm_n; i++) if (!strcmp(fm_ents[i].name, n)) return i; return -1; }
 static void ppm(const char *fn) {
     FILE *f = fopen(fn, "wb"); fprintf(f, "P6\n%d %d\n255\n", W, H);
@@ -287,6 +294,152 @@ int main(void) {
 
     /* installer lists all drives and can target another one */
     open_app(A_INSTALL); frame_out("t26_installer.ppm"); close_app(A_INSTALL);
+
+    /* ================= v6: loadable apps (.lapp) ================= */
+    {
+    long hn, sn, dn;
+    u8 *hello = readfile("sdk/out/hello.lapp", &hn), *snake = readfile("sdk/out/snake.lapp", &sn), *doodle = readfile("sdk/out/doodle.lapp", &dn);
+    struct lapp_header h;
+    assert(!lapp_check(hello, hn, &h) && !strcmp(h.name, "Hello") && h.win_w == 340 && h.win_h == 190 && h.nreloc > 0 && h.entry_off == 0);
+    assert(!lapp_check(snake, sn, &h) && !strcmp(h.name, "Snake") && h.win_w == 320 && h.win_h == 248);
+    assert(!lapp_check(doodle, dn, &h) && !strcmp(h.name, "Doodle") && h.bss_size > 30000);
+    /* damaged / hostile files are refused with a clear message */
+    u8 *bad = malloc(hn + 16);
+    memcpy(bad, hello, hn); bad[0] ^= 1;               assert(!strcmp(lapp_check(bad, hn, &h), "Not a LeactedOS app (bad signature)"));
+    memcpy(bad, hello, hn); bad[100] ^= 0x10;          assert(!strcmp(lapp_check(bad, hn, &h), "App file is damaged (checksum)"));
+    memcpy(bad, hello, hn);                            assert(!strcmp(lapp_check(bad, hn - 3, &h), "App file is truncated"));
+    assert(!strcmp(lapp_check(bad, 10, &h), "Not a LeactedOS app (file too small)"));
+    memcpy(bad, hello, hn); bad[32] = 5; bad[33] = 0;  assert(!strcmp(lapp_check(bad, hn, &h), "App has a bad window size"));
+    memcpy(bad, hello, hn); bad[8] = 99;               assert(!strcmp(lapp_check(bad, hn, &h), "App needs a newer LeactedOS"));
+    memcpy(bad, hello, hn); bad[4] = 7;                assert(!strcmp(lapp_check(bad, hn, &h), "Unsupported app file version"));
+    memcpy(bad, hello, hn); bad[12] = 0xFF; bad[13] = 0xFF; assert(!strcmp(lapp_check(bad, hn, &h), "App has a bad entry point"));
+    memcpy(bad, hello, hn); bad[16] = 0xFF; bad[17] = 0xFF; assert(!strcmp(lapp_check(bad, hn, &h), "App is too big (64 KB limit)"));
+    { /* a relocation that points outside the image is caught while loading (CRC fixed up) */
+      memcpy(bad, hello, hn); struct lapp_header t; lapp_check(bad, hn, &t);
+      u8 *last = bad + LAPP_HDR_SIZE + t.image_size + (t.nreloc - 1) * 4; last[0] = 0xF0; last[1] = 0xFF;
+      u32 c = lapp_crc32(bad + LAPP_HDR_SIZE, t.image_size + t.nreloc * 4); memcpy(bad + 28, &c, 4);
+      assert(!lapp_check(bad, hn, &t));
+      static u8 mem[LAPP_MAX_MEM]; assert(!strcmp(lapp_load(bad, &t, mem, 0x100000), "App has a bad relocation")); }
+    /* relocation arithmetic: every listed word moves by exactly the base */
+    { struct lapp_header t; lapp_check(hello, hn, &t);
+      static u8 m0[LAPP_MAX_MEM], m1[LAPP_MAX_MEM];
+      assert(!lapp_load(hello, &t, m0, 0) && !lapp_load(hello, &t, m1, 0x00400000));
+      const u8 *rel = hello + LAPP_HDR_SIZE + t.image_size; int diff = 0;
+      for (u32 i = 0; i < t.image_size; i++) if (m0[i] != m1[i]) diff++;
+      assert(diff > 0);
+      for (u32 i = 0; i < t.nreloc; i++) { u32 o = lapp_rd32(rel + i * 4); assert(lapp_rd32(m1 + o) - lapp_rd32(m0 + o) == 0x00400000); } }
+
+    /* apps from the terminal */
+    int hi = fs_create("HELLO.LAPP"); assert(hi >= 0 && fs_store(hi, hello, hn) >= 0);
+    int si = fs_create("SNAKE.LAPP"); assert(si >= 0 && fs_store(si, snake, sn) >= 0);
+    int bi = fs_create("BAD.LAPP");   assert(bi >= 0 && fs_store(bi, "this is not an app, just text, long enough to pass the size check.....", 64) >= 0);
+    tclear(); cmd("apps"); assert(term_has("HELLO.LAPP") && term_has("SNAKE.LAPP"));
+    tclear(); cmd("appinfo hello"); assert(term_has("Hello") && term_has("340x190"));
+    tclear(); cmd("appinfo bad"); assert(term_has("Not a LeactedOS app"));
+    tclear(); cmd("run nosuch"); assert(term_has("App not found"));
+    tclear(); cmd("run bad"); assert(term_has("Cannot run: Not a LeactedOS app") && !wins[A_EXT0].open);
+    tclear(); cmd("run hello");                                    /* loads and opens a window (not executed on the PC test build) */
+    assert(wins[A_EXT0].open && xapp[0].used && !strcmp(wins[A_EXT0].title, "Hello") && wins[A_EXT0].w == 346 && wins[A_EXT0].h == 190 + 6 + TITLE_H);
+    tclear(); cmd("apps"); assert(term_has("Running:") && term_has("Hello"));
+    close_app(A_EXT0); assert(!xapp[0].used && !wins[A_EXT0].open);
+
+    /* real execution of the same sources (built natively for this test) through the real dispatcher */
+    tclear();
+    assert(!lapp_start(hello, hn, "HELLO.LAPP", hello_main));
+    assert(wins[A_EXT0].open && top_app() == A_EXT0 && term_has("hello.lapp started"));
+    int ex = CX(A_EXT0), ey = CY(A_EXT0);
+    frame_out("t30_app_hello.ppm");
+    click(ex + 100, ey + 190 - 30 + 5);                            /* Files button: app asks the kernel for the file list and logs */
+    assert(term_has("hello.lapp: listed files"));
+    app_key(A_EXT0, 'q');
+    /* drag the window by its title bar */
+    { int ox0 = wins[A_EXT0].x, oy0 = wins[A_EXT0].y;
+      on_press(ox0 + 100, oy0 + 8); on_move_held(ox0 + 160, oy0 + 48); on_release();
+      assert(wins[A_EXT0].x == ox0 + 60 && wins[A_EXT0].y == oy0 + 40); }
+    /* minimise via the title bar button; the app keeps getting ticks */
+    { int bx, by, bw, bh; min_rect(A_EXT0, &bx, &by, &bw, &bh); click(bx + 3, by + 3); assert(wins[A_EXT0].min); toggle_app(A_EXT0); assert(!wins[A_EXT0].min); }
+    /* the app closes itself through the API */
+    ex = CX(A_EXT0); ey = CY(A_EXT0);
+    click(ex + 200, ey + 190 - 30 + 5);
+    frame_out("t31_after_self_close.ppm");
+    assert(!wins[A_EXT0].open && !xapp[0].used && term_has("hello.lapp closed"));
+
+    /* kernel API rules */
+    { u32 before = back[5 * W + 5]; xapi.rect(0, 0, 640, 480, 0x123456); assert(back[5 * W + 5] == before); }   /* drawing outside EV_DRAW does nothing */
+    assert(xapi.file_write("T1.BIN", "abc", 3) == 0 && xapi.file_write("T1.BIN", "abcd", 4) == 0);
+    { char b[8] = {0}; assert(xapi.file_read("t1.bin", b, 8) == 4 && !strcmp(b, "abcd")); assert(xapi.file_read("t1.bin", b, 2) == 2); }
+    assert(xapi.file_read("NOPE", 0, 0) == -1 && xapi.file_write("X", "y", 5000) == -1);
+    { char nm[24]; int k, found = 0; for (k = 0; k < FS_MAX; k++) if (xapi.file_name(k, nm, sizeof nm) >= 0 && !strcmp(nm, "T1.BIN")) found = 1; assert(found); }
+    assert(xapi.file_delete("T1.BIN") == 0 && xapi.file_delete("T1.BIN") == -1);
+    assert(xapi.size == sizeof(struct leact_api) && xapi.version == LAPP_API_VERSION);
+    { u32 a = xapi.rand(), b = xapi.rand(); assert(a != b); }
+
+    /* four at once, the fifth is refused, a freed slot can be reused */
+    for (int i = 0; i < 4; i++) assert(!lapp_start(hello, hn, "HELLO.LAPP", hello_main));
+    assert(xapp[0].used && xapp[3].used);
+    assert(!strcmp(lapp_start(hello, hn, "HELLO.LAPP", hello_main), "Too many apps running (4 at most)"));
+    frame_out("t32_four_apps.ppm");
+    { open_app(A_TASK); tsel = A_EXT1; int tw = CX(A_TASK), ty = CY(A_TASK);
+      frame_out("t33_taskmgr_apps.ppm");
+      click(tw + 6 + 10, ty + 166 + 5);                            /* End Task */
+      assert(!xapp[1].used && !wins[A_EXT1].open && xapp[2].used);
+      close_app(A_TASK); }
+    assert(!lapp_start(snake, sn, "SNAKE.LAPP", snake_main) && xapp[1].used && !strcmp(wins[A_EXT1].title, "Snake"));
+    for (int s = 0; s < N_EXT; s++) if (wins[A_EXT0 + s].open) close_app(A_EXT0 + s);
+    for (int s = 0; s < N_EXT; s++) assert(!xapp[s].used);
+
+    /* Snake: tick-driven, keyboard-driven */
+    assert(!lapp_start(snake, sn, "SNAKE.LAPP", snake_main));
+    for (int i = 0; i < 20; i++) { app_key(top_app(), K_DOWN); ticks += 3; os_draw(); }
+    frame_out("t34_app_snake.ppm");
+    for (int i = 0; i < 300; i++) { ticks += 3; os_draw(); }       /* runs into a wall */
+    frame_out("t35_snake_over.ppm");
+    close_app(A_EXT0);
+
+    /* Doodle: mouse press, drag and release reach the app */
+    assert(!lapp_start(doodle, dn, "DOODLE.LAPP", doodle_main));
+    ex = CX(A_EXT0); ey = CY(A_EXT0);
+    click(ex + 8 + 2 * 22 + 4, ey + 10);                           /* pick red */
+    on_press(ex + 8 + 18, ey + 32 + 20); on_move_held(ex + 8 + 60, ey + 32 + 20); on_move_held(ex + 8 + 60, ey + 32 + 70); on_release();
+    click(ex + 8 + 5 * 22 + 4, ey + 10);                           /* pick green */
+    on_press(ex + 8 + 100, ey + 32 + 40); on_move_held(ex + 8 + 150, ey + 32 + 90); on_release();
+    xapp_tick(); os_draw();
+    assert(back[(ey + 32 + 20) * W + ex + 8 + 40] == 0xE03030);
+    assert(back[(ey + 32 + 50) * W + ex + 8 + 60] == 0xE03030);
+    assert(back[(ey + 32 + 65) * W + ex + 8 + 125] == 0x30B040);
+    assert(back[(ey + 32 + 110) * W + ex + 8 + 200] == 0xFFFFFF);
+    frame_out("t36_app_doodle.ppm");
+    close_app(A_EXT0);
+
+    /* File Manager -> Open With -> Run as app, from LeactedFS and from a FAT drive */
+    free(fakedisk[3]); fakedisk[3] = loadimg("tests/out/apps.img", &fakesect[3]); drive_probe(3);
+    assert(drv[3].type == DT_FAT);
+    open_app(A_FILES); fm_pick_drive(0);
+    assert(find_ent("HELLO.LAPP") >= 0); fm_sel = find_ent("BAD.LAPP"); fm_open_sel();
+    assert(wins[A_OPENWITH].open && ow_rec == 3 && ow_sel == 3);
+    ow_launch(); assert(wins[A_OPENWITH].open && !strcmp(ow_msg, "Not a LeactedOS app (bad signature)"));
+    frame_out("t37_openwith_error.ppm");
+    ow_key(K_UP); assert(ow_sel == 2); ow_key(K_DOWN); ow_key(K_DOWN); assert(ow_sel == 3);
+    close_app(A_OPENWITH);
+    fm_sel = find_ent("HELLO.LAPP"); fm_open_sel(); assert(ow_rec == 3);
+    frame_out("t38_openwith_app.ppm");
+    ow_launch(); assert(!wins[A_OPENWITH].open && xapp[0].used && wins[A_EXT0].open);
+    close_app(A_EXT0);
+    fm_pick_drive(3); assert(find_ent("snake.lapp") >= 0 && find_ent("README.TXT") >= 0);
+    fm_sel = find_ent("snake.lapp"); fm_open_sel(); assert(ow_rec == 3 && ow_ref.kind == 2);
+    ow_launch(); assert(xapp[0].used && !strcmp(wins[A_EXT0].title, "Snake"));
+    close_app(A_EXT0);
+    fm_sel = find_ent("README.TXT"); fm_open_sel(); assert(ow_rec == 0);
+    ow_sel = 3; ow_launch(); assert(!strcmp(ow_msg, "Not a LeactedOS app (bad signature)")); close_app(A_OPENWITH);
+    /* the same app window in the other themes */
+    assert(!lapp_start(hello, hn, "HELLO.LAPP", hello_main));
+    theme_apply(TH_UNITY); frame_out("t39_unity_app.ppm");
+    theme_apply(TH_KDE); frame_out("t40_kde_app.ppm");
+    theme_apply(TH_XP);
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    free(hello); free(snake); free(doodle); free(bad);
+    }
+
     /* the same screens in the other themes */
     theme_apply(TH_UNITY); open_app(A_FILES); fm_pick_drive(2); fm_sel = find_ent("pic24.bmp"); fm_open_sel(); frame_out("t27_unity_openwith.ppm");
     ow_launch(); frame_out("t28_unity_image.ppm");

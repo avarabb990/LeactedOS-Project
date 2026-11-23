@@ -1,0 +1,10 @@
+*.o
+*.elf
+*.bin
+*.img
+*.ppm
+host_test
+tests/run32
+tests/out/
+sdk/out/
+__pycache__/

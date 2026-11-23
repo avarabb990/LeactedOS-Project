@@ -62,4 +62,12 @@ for name, kind, mbr in (("fat16.img", 16, True), ("fat32.img", 32, False), ("fat
 for n, d in files.items():
     open(os.path.join(out, "exp_" + n.replace(" ", "_")), "wb").write(d)
 open(os.path.join(out, "exp_huge.bin"), "wb").write(prng(900000, 7))
+# a small FAT16 disk holding the sample apps (handy for trying them in QEMU too)
+appdir = os.path.join(os.path.dirname(__file__), "..", "sdk", "out")
+apps = {"README.TXT": b"LeactedOS sample apps. Open a .lapp file in the File Manager and choose Run as app.\n"}
+if os.path.isdir(appdir):
+    for fn in sorted(os.listdir(appdir)):
+        if fn.endswith(".lapp"):
+            apps[fn] = open(os.path.join(appdir, fn), "rb").read()
+open(os.path.join(out, "apps.img"), "wb").write(mkfat.build(16, apps))
 print("images written to", out)
