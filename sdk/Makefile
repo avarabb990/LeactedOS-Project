@@ -2,7 +2,7 @@
 CC      = gcc
 CFLAGS  = -m32 -std=gnu11 -Os -Wall -Wextra -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
           -fno-builtin -fno-asynchronous-unwind-tables -fcf-protection=none -mno-sse -mno-mmx -nostdlib
-APPS    = hello snake doodle
+APPS    = hello snake doodle minesweeper tetris game2048 pong stopwatch
 OUT     = out
 
 NAME_hello  = Hello
@@ -11,6 +11,16 @@ NAME_snake  = Snake
 SIZE_snake  = 320x248
 NAME_doodle = Doodle
 SIZE_doodle = 256x184
+NAME_minesweeper = Minesweeper
+SIZE_minesweeper = 216x254
+NAME_tetris = Tetris
+SIZE_tetris = 290x336
+NAME_game2048 = 2048
+SIZE_game2048 = 320x380
+NAME_pong = Pong
+SIZE_pong = 400x280
+NAME_stopwatch = Stopwatch
+SIZE_stopwatch = 280x270
 
 
 

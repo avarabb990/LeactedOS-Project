@@ -1,1 +1,10 @@
-LEACT-REPO Test hi from github XD
+LEACT-REPO 1
+# name|file|version|description
+doodle|pkg/doodle.lapp|1.0|Simple drawing pad
+game2048|pkg/game2048.lapp|1.0|2048 sliding tile puzzle
+hello|pkg/hello.lapp|1.0|Hello demo app
+minesweeper|pkg/minesweeper.lapp|1.0|Minesweeper 9x9 with flags, chording and best time
+pong|pkg/pong.lapp|1.0|Pong against the computer, first to 7
+snake|pkg/snake.lapp|1.0|Classic snake game
+stopwatch|pkg/stopwatch.lapp|1.0|Stopwatch with laps and a countdown timer
+tetris|pkg/tetris.lapp|1.0|Tetris with ghost piece, levels and high score

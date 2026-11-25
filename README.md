@@ -13,6 +13,19 @@ GitHub only speaks HTTPS and LeactedOS has no TLS yet, so run the gateway on the
 ```
 python3 tools/leact-gateway.py
 ```
+Apps available right now:
+
+| Name | What it is |
+|------|------------|
+| `minesweeper` | Minesweeper 9x9, flags, chording, best time |
+| `tetris` | Tetris with ghost piece, levels, high score |
+| `game2048` | 2048 sliding tile puzzle (installs as "2048") |
+| `pong` | Pong against the computer, first to 7 |
+| `stopwatch` | Stopwatch with laps and a countdown timer |
+| `snake`, `doodle`, `hello` | Snake, a drawing pad, and the SDK demo |
+
+To add your own app: write it in `sdk/apps/`, run `make -C sdk`, then `python3 tools/mkrepo.py --dir repo sdk/out/*.lapp` and push.
+
 See the README section "The HTTPS gateway" in [BUILDING.md](BUILDING.md). Build instructions and the app SDK guide are in [BUILDING.md](BUILDING.md).
 
 ## Versions

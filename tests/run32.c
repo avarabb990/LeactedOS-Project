@@ -30,7 +30,7 @@ static int drawing;
 static char tlog[4096]; static int tlen;       /* every string drawn with text() */
 static char klog[512]; static int klen;        /* log() output */
 static int nbeeps, last_hz, closed;
-static uint32_t now = 1000, rnd_seq[8], rnd_i;
+static uint32_t now = 1000, rnd_seq[32], rnd_i, rnd_state = 1;
 static char fname[8][24]; static uint8_t fdata[8][4096]; static uint32_t fsize[8]; static int fused[8];
 
 static void put(int x, int y, uint32_t c) {
@@ -60,7 +60,7 @@ static void a_button(int x, int y, int w, int h, const char *l, int p) {
 }
 static void a_blit(int x, int y, int w, int h, const uint32_t *s) { for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) put(x + i, y + j, s[j * w + i] & 0xFFFFFF); }
 static uint32_t a_ticks(void) { return now; }
-static uint32_t a_rand(void) { return rnd_i < 8 && rnd_seq[rnd_i] != 0xFFFFFFFFu ? rnd_seq[rnd_i++] : (now * 1103515245u + 12345u) >> 4; }
+static uint32_t a_rand(void) { if (rnd_i < 32 && rnd_seq[rnd_i] != 0xFFFFFFFFu) return rnd_seq[rnd_i++]; rnd_state = rnd_state * 1103515245u + 12345u; return (rnd_state >> 8) ^ (now >> 3); }
 static void a_beep(uint32_t hz, uint32_t ms) { (void)ms; nbeeps++; last_hz = hz; }
 static void a_set_title(const char *s) { (void)s; }
 static void a_close(void) { closed = 1; }
@@ -108,8 +108,9 @@ static int has(const char *needle) {
 static uint32_t hash_canvas(void) { uint32_t h = 2166136261u; for (int j = 0; j < oh; j++) for (int i = 0; i < ow; i++) h = (h ^ cv[(oy + j) * CW + ox + i]) * 16777619u; return h; }
 static void reset_state(void) {
     for (int i = 0; i < CW * CH; i++) cv[i] = 0x123456;
-    tlen = 0; klen = 0; klog[0] = 0; nbeeps = 0; closed = 0; now = 1000; rnd_i = 0;
-    for (int i = 0; i < 8; i++) { rnd_seq[i] = 0xFFFFFFFFu; fused[i] = 0; }
+    tlen = 0; klen = 0; klog[0] = 0; nbeeps = 0; closed = 0; now = 1000; rnd_i = 0; rnd_state = 1;
+    for (int i = 0; i < 32; i++) rnd_seq[i] = 0xFFFFFFFFu;
+    for (int i = 0; i < 8; i++) fused[i] = 0;
 }
 static uint32_t at(int x, int y) { return cv[(oy + y) * CW + ox + x]; }
 
@@ -197,6 +198,100 @@ static void write_ppm(const char *path) {
     sc(6, fd, 0, 0);
 }
 
+static void cell_click(int cx, int cy) { send(EV_CLICK, cx * 24 + 5, 34 + cy * 24 + 5, 0); }
+static int is_mine(int x, int y) { return (y == 8 && x <= 7) || (y == 7 && x >= 7 && x <= 8); }
+static void mines_seed(void) {         /* row 8 up to x=7, plus (7,7) and (8,7): the corner (8,8) is walled in */
+    for (int i = 0; i < 8; i++) { rnd_seq[2 * i] = i; rnd_seq[2 * i + 1] = 8; }
+    rnd_seq[16] = 7; rnd_seq[17] = 7; rnd_seq[18] = 8; rnd_seq[19] = 7; rnd_i = 0;
+}
+static uint32_t scenario_minesweeper(void) {
+    send(EV_INIT, 0, 0, 0); redraw();
+    CHECK(has("Mines 10") && has("New|") && has("Flag|"));
+    CHECK(at(10, 34 + 10) == 0xC0C0C0);                           /* closed square */
+    send(EV_CLICK, 130, 10, 0);                                   /* Flag mode */
+    cell_click(3, 3); redraw(); CHECK(has("Mines 09"));
+    cell_click(3, 3); redraw(); CHECK(has("Mines 10"));           /* second click removes it */
+    send(EV_CLICK, 130, 10, 0);                                   /* back to opening mode */
+    mines_seed();
+    cell_click(0, 0); redraw();                                   /* first click: floods the safe area */
+    CHECK(at(10, 34 + 10) == 0xDEDEDE && at(10, 34 + 8 * 24 + 10) == 0xC0C0C0 && at(8 * 24 + 10, 34 + 8 * 24 + 10) == 0xC0C0C0);
+    redraw(); CHECK(!has("YOU WIN"));
+    now += 1234; send(EV_TICK, 0, 0, 0); redraw(); CHECK(has("012|"));
+    for (int y = 0; y < 9; y++) for (int x = 0; x < 9; x++) if (!is_mine(x, y)) cell_click(x, y);
+    redraw(); CHECK(has("YOU WIN") && has("Best 12s"));
+    int f = ffind("MINES.BST"); CHECK(f >= 0 && fsize[f] == 2 && fdata[f][0] == '1' && fdata[f][1] == '2');
+    uint32_t h = hash_canvas();
+    send(EV_KEY, 0, 0, 'n'); redraw(); CHECK(has("Mines 10") && has("Best 12s") && !has("YOU WIN"));
+    mines_seed(); cell_click(0, 0); cell_click(0, 8);             /* step on a mine */
+    redraw(); CHECK(has("BOOM") && at(4, 34 + 8 * 24 + 4) == 0xFF5050 && nbeeps >= 1);
+    cell_click(5, 0); redraw(); CHECK(has("BOOM"));               /* the board is frozen */
+    return h;
+}
+static uint32_t scenario_tetris(void) {
+    rnd_seq[0] = 6; rnd_seq[1] = 5; rnd_seq[2] = 4; rnd_seq[3] = 3; rnd_seq[4] = 2; rnd_seq[5] = 1;
+    send(EV_INIT, 0, 0, 0); redraw();
+    CHECK(has("SCORE|0|") && has("LEVEL|1|") && has("NEXT"));
+    send(EV_KEY, 0, 0, 'p'); redraw(); CHECK(has("PAUSED"));
+    for (int i = 0; i < 100; i++) send(EV_TICK, 0, 0, 0);         /* paused: nothing moves */
+    send(EV_KEY, 0, 0, 'p'); redraw(); CHECK(!has("PAUSED"));
+    for (int i = 0; i < 30 * 20 * 14; i++) send(EV_TICK, 0, 0, 0);   /* gravity alone stacks the pieces up */
+    redraw(); CHECK(has("GAME OVER") && ffind("TETRIS.SCR") < 0);
+    send(EV_KEY, 0, 0, 'r'); redraw(); CHECK(!has("GAME OVER") && has("SCORE|0|"));
+    send(EV_KEY, 0, 0, LK_LEFT); send(EV_KEY, 0, 0, LK_UP); send(EV_KEY, 0, 0, LK_RIGHT); send(EV_KEY, 0, 0, LK_DOWN);
+    redraw(); CHECK(!has("SCORE|0|"));                            /* soft drop scored */
+    for (int i = 0; i < 40; i++) send(EV_KEY, 0, 0, ' ');         /* hard drops until the stack reaches the top */
+    redraw(); CHECK(has("GAME OVER") && nbeeps >= 1);
+    int f = ffind("TETRIS.SCR"); CHECK(f >= 0 && fsize[f] >= 1 && fdata[f][0] >= '1' && fdata[f][0] <= '9');
+    return hash_canvas();
+}
+static uint32_t scenario_2048(void) {
+    rnd_seq[0] = 0; rnd_seq[1] = 1; rnd_seq[2] = 14; rnd_seq[3] = 1;   /* a 2 at the top left and one at the bottom right */
+    rnd_seq[4] = 0; rnd_seq[5] = 1; rnd_seq[6] = 0; rnd_seq[7] = 1;    /* then new 2s in the first free squares */
+    send(EV_INIT, 0, 0, 0); redraw();
+    CHECK(at(12, 58) == 0xEEE4DA && at(12 + 3 * 76, 58 + 3 * 76) == 0xEEE4DA && at(12 + 76, 58) == 0xCDC1B4);
+    send(EV_KEY, 0, 0, LK_LEFT); redraw();                        /* bottom 2 slides left, new 2 appears next to the top one */
+    CHECK(at(12, 58 + 3 * 76) == 0xEEE4DA && at(12 + 76, 58) == 0xEEE4DA && has("SCORE|0|"));
+    send(EV_KEY, 0, 0, LK_LEFT); redraw();                        /* the pair merges into a 4 */
+    CHECK(at(12, 58) == 0xEDE0C8 && has("SCORE|4|"));
+    int f = ffind("G2048.SCR"); CHECK(f >= 0 && fsize[f] == 1 && fdata[f][0] == '4');
+    send(EV_KEY, 0, 0, 'r'); redraw(); CHECK(has("SCORE|0|") && has("BEST|4|"));
+    for (int i = 0; i < 400; i++) send(EV_KEY, 0, 0, (i % 4) == 0 ? LK_LEFT : (i % 4) == 1 ? LK_DOWN : (i % 4) == 2 ? LK_RIGHT : LK_UP);
+    redraw(); CHECK(has("GAME OVER") || !has("SCORE|0|"));       /* played on or jammed: either is fine, nothing crashed */
+    return hash_canvas();
+}
+static uint32_t scenario_pong(void) {
+    send(EV_INIT, 0, 0, 0); redraw(); CHECK(has("Space = serve"));
+    CHECK(at(15, 116) == 0xF0F0F0 && at(15, 115) == 0x0A0A10);    /* left paddle starts centred */
+    send(EV_KEY, 0, 0, LK_UP); redraw(); CHECK(at(15, 116 - 14) == 0xF0F0F0);
+    send(EV_MOVE, 0, 200, 0); redraw(); CHECK(at(15, 200) == 0xF0F0F0);
+    send(EV_MOVE, 0, 9999, 0); redraw(); CHECK(at(15, 279) == 0xF0F0F0);   /* clamped inside the table */
+    for (int t = 0; t < 40000 && !has("YOU "); t++) {
+        if (t % 50 == 0) { send(EV_KEY, 0, 0, ' '); }
+        send(EV_TICK, 0, 0, 0);
+        if (t % 50 == 49) redraw();
+    }
+    redraw(); CHECK(has("YOU WIN") || has("YOU LOSE")); CHECK(nbeeps > 3);
+    uint32_t h = hash_canvas();
+    send(EV_KEY, 0, 0, ' '); redraw(); CHECK(has("Space = serve") && !has("YOU "));
+    return h;
+}
+static uint32_t scenario_stopwatch(void) {
+    send(EV_INIT, 0, 0, 0); redraw(); CHECK(has("00:00.00") && has("STOPWATCH") && has("Start|"));
+    send(EV_KEY, 0, 0, ' '); now += 1234; redraw(); CHECK(has("00:12.34") && has("Stop|"));
+    send(EV_KEY, 0, 0, 'l'); now += 100; send(EV_KEY, 0, 0, 'l'); redraw();
+    CHECK(has("1  00:12.34|") && has("2  00:01.00|"));
+    send(EV_CLICK, 20, 100, 0); now += 500; redraw(); CHECK(has("00:13.34") && has("Start|"));   /* Stop button */
+    send(EV_KEY, 0, 0, 'r'); redraw(); CHECK(has("00:00.00") && !has("1  00:"));
+    send(EV_CLICK, 200, 100, 0); redraw(); CHECK(has("COUNTDOWN") && has("Set: 1 min"));          /* Timer button */
+    send(EV_KEY, 0, 0, LK_UP); redraw(); CHECK(has("Set: 2 min") && has("02:00.00"));
+    send(EV_KEY, 0, 0, ' '); now += 6000; redraw(); CHECK(has("01:00.00"));
+    send(EV_KEY, 0, 0, LK_UP); redraw(); CHECK(has("Set: 2 min"));                                 /* ignored while running */
+    now += 6000; send(EV_TICK, 0, 0, 0); redraw();
+    CHECK(nbeeps == 2 && has("00:00.00") && has("Start|"));
+    send(EV_KEY, 0, 0, ' '); now += 3000; redraw(); CHECK(has("01:30.00"));                        /* restarts from the full time */
+    return hash_canvas();
+}
+
 static int run_one(int which, uint32_t *hash) {
     reset_state();
     uint32_t base = (uint32_t)(uintptr_t)arena[which];
@@ -207,6 +302,11 @@ static int run_one(int which, uint32_t *hash) {
     if (nameeq(hdr.name, "Hello")) *hash = scenario_hello();
     else if (nameeq(hdr.name, "Snake")) *hash = scenario_snake();
     else if (nameeq(hdr.name, "Doodle")) *hash = scenario_doodle();
+    else if (nameeq(hdr.name, "Minesweeper")) *hash = scenario_minesweeper();
+    else if (nameeq(hdr.name, "Tetris")) *hash = scenario_tetris();
+    else if (nameeq(hdr.name, "2048")) *hash = scenario_2048();
+    else if (nameeq(hdr.name, "Pong")) *hash = scenario_pong();
+    else if (nameeq(hdr.name, "Stopwatch")) *hash = scenario_stopwatch();
     else { out("  no scenario for this app; only loaded + drew\n"); send(EV_INIT, 0, 0, 0); redraw(); *hash = hash_canvas(); }
     return 0;
 }
