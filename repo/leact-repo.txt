@@ -1,5 +1,1 @@
-LEACT-REPO 1
-# name|file|version|description
-doodle|pkg/doodle.lapp|1.0|Simple drawing pad
-hello|pkg/hello.lapp|1.0|Hello demo app
-snake|pkg/snake.lapp|1.0|Classic snake game
+LEACT-REPO Test hi from github XD
