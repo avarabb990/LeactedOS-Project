@@ -768,7 +768,7 @@ int main(void) {
     int hn, sn, dn; u8 *hello = slurp("sdk/out/hello.lapp", &hn), *snake = slurp("sdk/out/snake.lapp", &sn), *doodle = slurp("sdk/out/doodle.lapp", &dn);
     const char *idx = "LEACT-REPO 1\r\n# online test\r\nhello|pkg/hello.lapp|1.0|Hello demo\r\nsnake|pkg/snake.lapp|1.1|Classic snake\r\n"
                       "doodle|pkg/doodle.lapp|1.0|Drawing pad\r\nbroken|pkg/broken.lapp|0.1|Corrupt\r\nghost|pkg/ghost.lapp|0.1|Missing\r\nbad name!|x|1|skipped\r\n";
-    const char *roots[] = { "/repo/", "/avarabb990/leactedos-project/main/repo/" };       /* the same files for plain http and the github path */
+    const char *roots[] = { "/repo/", "/avarabb990/LeactedOS-Project/main/repo/" };       /* the same files for plain http and the github path */
     for (int r = 0; r < 2; r++) {
         char pth[200];
         snprintf(pth, sizeof pth, "%sleact-repo.txt", roots[r]); fake_add_file(pth, (const u8 *)idx, (int)strlen(idx));
@@ -795,7 +795,7 @@ int main(void) {
     /* update: publish a different (valid) build of hello and leave the others alone */
     { u8 *nh = malloc((size_t)hn); memcpy(nh, hello, (size_t)hn); struct lapp_header h; memcpy(&h, nh, sizeof h);
       nh[LAPP_HDR_SIZE + h.image_size - 1] ^= 0x5A; u32 c = lapp_crc32(nh + LAPP_HDR_SIZE, h.image_size + h.nreloc * 4u); memcpy(nh + 28, &c, 4);
-      fake_add_file("/avarabb990/leactedos-project/main/repo/pkg/hello.lapp", nh, hn); free(nh); }
+      fake_add_file("/avarabb990/LeactedOS-Project/main/repo/pkg/hello.lapp", nh, hn); free(nh); }
     u32 old_crc = lapp_rd32(fsdata[fs_find("hello.lapp")] + 28);
     tclear(); cmd("leact-get update"); assert(tjob == TJ_LGET); net_idle(15000); assert(term_has("Updated hello") && !term_has("Updated snake"));
     assert(lapp_rd32(fsdata[fs_find("hello.lapp")] + 28) != old_crc);

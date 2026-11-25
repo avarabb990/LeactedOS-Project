@@ -2000,7 +2000,7 @@ static const char *lg_install(const struct tpath *repo, const struct lg_app *a, 
 }
 
 /* ---- online repositories: the index and packages come over http(s) as a background job ---- */
-#define LG_DEFAULT_REPO "https://raw.githubusercontent.com/avarabb990/leactedos-project/main/repo/"
+#define LG_DEFAULT_REPO "https://raw.githubusercontent.com/avarabb990/LeactedOS-Project/main/repo/"
 enum { LGO_LIST, LGO_INFO, LGO_INSTALL, LGO_UPDATE };
 static char lg_url[200] = LG_DEFAULT_REPO;
 static int lg_url_set;                                     /* the user chose online (a URL, or "default") */
