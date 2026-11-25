@@ -81,9 +81,11 @@ static int kvsnprintf(char *b, int n, const char *f, va_list ap) {
     for (; *f; f++) {
         if (*f != '%') { PUT(*f); continue; }
         f++;
-        int zero = 0, wd = 0;
+        int zero = 0, wd = 0, left = 0;
+        if (*f == '-') { left = 1; f++; }
         if (*f == '0') { zero = 1; f++; }
-        while (*f >= '0' && *f <= '9') { wd = wd * 10 + (*f - '0'); f++; }
+        if (*f == '*') { wd = va_arg(ap, int); if (wd < 0) wd = 0; f++; }
+        else while (*f >= '0' && *f <= '9') { wd = wd * 10 + (*f - '0'); f++; }
         char tmp[16]; int tl = 0;
         switch (*f) {
         case 'd': case 'u': case 'x': {
@@ -100,8 +102,10 @@ static int kvsnprintf(char *b, int n, const char *f, va_list ap) {
         }
         case 's': { const char *s = va_arg(ap, const char *); if (!s) s = "(null)";
             int l = 0; while (s[l]) l++;
-            for (int i = l; i < wd; i++) PUT(' ');
-            while (*s) { PUT(*s); s++; } break; }
+            if (!left) for (int i = l; i < wd; i++) PUT(' ');
+            while (*s) { PUT(*s); s++; }
+            if (left) for (int i = l; i < wd; i++) PUT(' ');
+            break; }
         case 'c': PUT((char)va_arg(ap, int)); break;
         case '%': PUT('%'); break;
         default: PUT('?'); break;
@@ -389,6 +393,105 @@ static u32 pci_read(int bus, int dev, int fn, int off) {
     outl(0xCF8, 0x80000000u | (bus << 16) | (dev << 11) | (fn << 8) | (off & 0xFC));
     return inl(0xCFC);
 }
+
+/* ------------------------------------------------------------------ */
+/* Network card: Realtek RTL8139 (qemu ... -nic user,model=rtl8139)    */
+/* ------------------------------------------------------------------ */
+static int nic_send(const u8 *f, int n);
+static int nic_recv(u8 *b, int max);
+static u32 net_ms(void);
+static u32 net_rand(void);
+#include "net.h"
+
+static void pci_write(int bus, int dev, int fn, int off, u32 v) {
+    outl(0xCF8, 0x80000000u | (bus << 16) | (dev << 11) | (fn << 8) | (off & 0xFC));
+    outl(0xCFC, v);
+}
+static u32 net_rng = 0x2545F491u;
+static u32 net_rand(void) {
+    net_rng ^= ticks * 2654435761u + 0x9E3779B9u;
+    net_rng ^= net_rng << 13; net_rng ^= net_rng >> 17; net_rng ^= net_rng << 5;
+    return net_rng;
+}
+static u32 net_ms(void) { return ticks * 10u; }
+
+#ifdef HOST
+static int host_nic_send(const u8 *f, int n);
+static int host_nic_recv(u8 *b, int max);
+static int host_nic_on;
+static int nic_init(void) {
+    static const u8 m[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+    if (!host_nic_on) return 0;
+    memcpy(net_mac, m, 6);
+    return 1;
+}
+static int nic_send(const u8 *f, int n) { return host_nic_send(f, n); }
+static int nic_recv(u8 *b, int max) { return host_nic_recv(b, max); }
+#else
+#define RTL_RXLEN 8192
+static u16 rtl_io;
+static u8 rtl_rx[RTL_RXLEN + 16 + 2048] __attribute__((aligned(16)));
+static u8 rtl_tx[4][2048] __attribute__((aligned(16)));
+static u32 rtl_off;
+static int rtl_txd, rtl_txbusy[4];
+static void rtl_rx_setup(void) {
+    outb(rtl_io + 0x37, 0x04);                               /* receiver off, transmitter on */
+    outl(rtl_io + 0x30, (u32)(unsigned long)rtl_rx);
+    outw(rtl_io + 0x3C, 0);                                  /* no interrupts: we poll */
+    outl(rtl_io + 0x44, 0x8F);                               /* accept broadcast, multicast, ours; WRAP */
+    outb(rtl_io + 0x37, 0x0C);
+    rtl_off = 0;
+}
+static int nic_init(void) {
+    for (int bus = 0; bus < 2; bus++)
+        for (int dev = 0; dev < 32; dev++) {
+            if (pci_read(bus, dev, 0, 0) != 0x813910ECu) continue;
+            u32 bar = pci_read(bus, dev, 0, 0x10);
+            if (!(bar & 1)) continue;
+            rtl_io = (u16)(bar & ~3u);
+            pci_write(bus, dev, 0, 4, pci_read(bus, dev, 0, 4) | 7);      /* I/O, memory, bus master */
+            outb(rtl_io + 0x52, 0);                                       /* power on */
+            outb(rtl_io + 0x37, 0x10);                                    /* reset */
+            for (int i = 0; i < 200000 && (inb(rtl_io + 0x37) & 0x10); i++) { }
+            for (int i = 0; i < 6; i++) net_mac[i] = inb(rtl_io + i);
+            rtl_rx_setup();
+            return 1;
+        }
+    return 0;
+}
+static int nic_recv(u8 *buf, int max) {
+    if (!rtl_io || (inb(rtl_io + 0x37) & 1)) return 0;               /* receive buffer empty */
+    const u8 *h = rtl_rx + rtl_off;
+    u32 st = (u32)h[0] | (u32)h[1] << 8 | (u32)h[2] << 16 | (u32)h[3] << 24;
+    int len = (int)(st >> 16);
+    if (!(st & 1) || len < 18 || len > 1800) { rtl_rx_setup(); return 0; }   /* damaged: start over */
+    int n = len - 4;                                                  /* drop the CRC */
+    if (n > max) n = max;
+    memcpy(buf, h + 4, (size_t)n);
+    rtl_off = (rtl_off + (u32)len + 4 + 3) & ~3u;
+    outw(rtl_io + 0x38, (u16)(rtl_off - 16));
+    rtl_off %= RTL_RXLEN;
+    return n;
+}
+static int nic_send(const u8 *f, int n) {
+    if (!rtl_io || n > 1792) return -1;
+    int d = rtl_txd;
+    if (rtl_txbusy[d]) { for (int i = 0; i < 200000 && !(inl(rtl_io + 0x10 + 4 * d) & 0x2000); i++) { } rtl_txbusy[d] = 0; }
+    memcpy(rtl_tx[d], f, (size_t)n);
+    outl(rtl_io + 0x20 + 4 * d, (u32)(unsigned long)rtl_tx[d]);
+    outl(rtl_io + 0x10 + 4 * d, (u32)(n < 60 ? 60 : n));
+    rtl_txbusy[d] = 1;
+    rtl_txd = (d + 1) & 3;
+    return n;
+}
+#endif
+static void net_init(void) {
+    net_have_nic = nic_init();
+    http_tcp_up = net_have_nic;
+    http_proxy_on = 1;                                      /* QEMU: the PC is 10.0.2.2, see tools/leact-gateway.py */
+    if (net_have_nic) dhcp_start();
+}
+
 static void text_fatal(const char *msg) {
 #ifndef HOST
     volatile u16 *v = (volatile u16 *)0xB8000;
@@ -639,9 +742,14 @@ static int ata_read(int d, u32 lba, int count, void *buf) {
     return 1;
 #endif
 }
+#ifdef HOST
+static int host_fail_after = -1;                 /* tests: fail every write after this many good ones */
+#endif
 static int ata_write(int d, u32 lba, int count, const void *buf) {
     if (d < 0 || d >= N_DRIVES || !drv[d].present || count < 1 || count > 255 || lba + count > drv[d].sectors) return 0;
 #ifdef HOST
+    if (host_fail_after == 0) return 0;
+    if (host_fail_after > 0) host_fail_after--;
     memcpy(fakedisk[d] + (size_t)lba * 512, buf, (size_t)count * 512); return 1;
 #else
     int ch = d >> 1; u16 base = ata_base[ch];
@@ -809,20 +917,36 @@ static u32 fat_read_file(const struct fatvol *v, u32 cluster, u32 size, u8 *buf,
 
 /* ------------------------------------------------------------------ */
 /* LeactedFS (lives on one drive: fs_drive)                            */
-/*  sector 0 : MBR with one partition (type 0xDA, non-FS data)         */
-/*  sector 1 : superblock "LEACTEDFS" 0x01, total sectors at +0x10     */
-/*  sector 2 : directory "LDIR" + 15 x { name[24], size, used }        */
-/*  sector 8+: file slots, 8 sectors (4 KB) each                       */
+/*  v2 layout (new disks, up to 64 files of 128 KB)                    */
+/*   sector 0      MBR with one partition (type 0xDA, non-FS data)     */
+/*   sector 1      superblock "LEACTEDFS" 0x02, total sectors at +0x10 */
+/*   sectors 3-7   directory "LDIR" + 64 x { name[24], size, used }    */
+/*   sectors 16+   2048 sectors reserved for a boot loader + kernel    */
+/*   sector 2064+  file slots of 256 sectors (128 KB) each             */
+/*  v1 layout (older disks, still readable): 15 files of 4 KB,         */
+/*   directory in sector 2, file slots from sector 8.                  */
 /* ------------------------------------------------------------------ */
-#define FS_MAX 15
-#define FS_SLOT 4096
+#define FS_MAX 64
+#define FS_SLOT 131072u
 #define FS_NAME 24
-#define FS_DATA_LBA 8
+#define FS2_DIR_LBA 3
+#define FS2_DIR_SECS 5
+#define FS2_BOOT_LBA 16
+#define FS2_BOOT_SECS 2048
+#define FS2_DATA_LBA 2064
+#define FS2_SLOT_SECS 256
+#define FS2_MIN_SECTORS (FS2_DATA_LBA + FS_MAX * FS2_SLOT_SECS)
+#define FS1_MAX 15
+#define FS1_SLOT 4096u
+#define FS1_DATA_LBA 8
 struct fent { char name[FS_NAME]; u32 size; u32 used; };
 static struct fent fsdir[FS_MAX];
 static u8 fsdata[FS_MAX][FS_SLOT];
 static int fs_on_disk;                           /* LeactedFS volume present */
 static int fs_drive = -1;                        /* which drive holds it */
+static int fs_ver = 2;                           /* 1 = old small layout, 2 = current */
+static int fs_max_files = FS_MAX;                /* limits of the mounted volume */
+static u32 fs_slot_limit = FS_SLOT;
 
 static void fs_norm(char *d, const char *s) {
     int i = 0;
@@ -836,24 +960,40 @@ static int fs_find(const char *name) {
 }
 static int fs_count(void) { int c = 0; for (int i = 0; i < FS_MAX; i++) c += fsdir[i].used ? 1 : 0; return c; }
 
+static u32 fs_data_lba(int i) { return fs_ver == 1 ? (u32)(FS1_DATA_LBA + i * 8) : (u32)(FS2_DATA_LBA + i * FS2_SLOT_SECS); }
+/* read/write many sectors on the LeactedFS drive (ata_* handle at most 255 per call) */
+static int fs_io(int wr, u32 lba, u32 secs, void *buf) {
+    u8 *p = buf;
+    while (secs) {
+        int n = secs > 128 ? 128 : (int)secs;
+        if (!(wr ? ata_write(fs_drive, lba, n, p) : ata_read(fs_drive, lba, n, p))) return 0;
+        lba += n; secs -= n; p += n * 512;
+    }
+    return 1;
+}
+static u8 fs_dirbuf[FS2_DIR_SECS * 512];
 static int fs_flush_dir(void) {
     if (!fs_on_disk) return 1;
-    u8 sec[512]; memset(sec, 0, 512);
-    memcpy(sec, "LDIR", 4);
-    memcpy(sec + 4, fsdir, sizeof(fsdir));
-    return ata_write(fs_drive, 2, 1, sec);
+    memset(fs_dirbuf, 0, sizeof fs_dirbuf);
+    memcpy(fs_dirbuf, "LDIR", 4);
+    if (fs_ver == 1) {
+        memcpy(fs_dirbuf + 4, fsdir, FS1_MAX * sizeof(struct fent));
+        return ata_write(fs_drive, 2, 1, fs_dirbuf);
+    }
+    memcpy(fs_dirbuf + 16, fsdir, sizeof fsdir);
+    return fs_io(1, FS2_DIR_LBA, FS2_DIR_SECS, fs_dirbuf);
 }
 static int fs_flush_file(int i) {
     if (!fs_on_disk) return 1;
-    int secs = (fsdir[i].size + 511) / 512;
-    if (secs && !ata_write(fs_drive, FS_DATA_LBA + i * 8, secs, fsdata[i])) return 0;
+    u32 secs = (fsdir[i].size + 511) / 512;
+    if (secs && !fs_io(1, fs_data_lba(i), secs, fsdata[i])) return 0;
     return fs_flush_dir();
 }
 /* returns slot or -1 (full) */
 static int fs_create(const char *name) {
     int i = fs_find(name);
     if (i >= 0) return i;
-    for (i = 0; i < FS_MAX; i++) if (!fsdir[i].used) {
+    for (i = 0; i < fs_max_files; i++) if (!fsdir[i].used) {
         memset(&fsdir[i], 0, sizeof fsdir[i]);
         fs_norm(fsdir[i].name, name);
         fsdir[i].used = 1;
@@ -864,7 +1004,8 @@ static int fs_create(const char *name) {
 }
 /* 0 = ok in RAM+disk, 1 = ok RAM only (no disk), -1 = error */
 static int fs_store(int i, const void *data, u32 len) {
-    if (len > FS_SLOT) len = FS_SLOT;
+    if (len > fs_slot_limit) len = fs_slot_limit;
+    if (fsdir[i].size > len) memset(fsdata[i] + len, 0, fsdir[i].size - len);
     memcpy(fsdata[i], data, len);
     fsdir[i].size = len;
     if (!fs_on_disk) return 1;
@@ -875,9 +1016,15 @@ static int fs_delete(int i) {
     if (!fs_on_disk) return 1;
     return fs_flush_dir() ? 0 : -1;
 }
+/* 0 = ok, 1 = ok RAM only, -1 = error */
+static int fs_rename(int i, const char *name) {
+    fs_norm(fsdir[i].name, name);
+    if (!fs_on_disk) return 1;
+    return fs_flush_dir() ? 0 : -1;
+}
 static void fs_defaults(void) {
     static const char readme[] =
-        "Welcome to LeactedOS XP Edition 3.0!\n"
+        "Welcome to LeactedOS XP Edition!\n"
         "Open Terminal and type help.\n"
         "Files live in RAM until you install\n"
         "a disk with the Installer.\n";
@@ -903,15 +1050,27 @@ static int fs_check(void) {
 }
 static void fs_load(void) {
     memset(fsdir, 0, sizeof fsdir);
+    fs_ver = 2; fs_max_files = FS_MAX; fs_slot_limit = FS_SLOT;
     if (fs_on_disk) {
-        u8 sec[512];
-        if (ata_read(fs_drive, 2, 1, sec) && !memcmp(sec, "LDIR", 4)) {
-            memcpy(fsdir, sec + 4, sizeof fsdir);
+        u8 sb[512];
+        int ver = ata_read(fs_drive, 1, 1, sb) ? sb[9] : 0;
+        if (ver != 1 && ver != 2) { fs_on_disk = 0; fs_drive = -1; fs_defaults(); return; }   /* unknown (newer?) layout: do not touch it */
+        int ok = 0;
+        if (ver == 1) {
+            fs_ver = 1; fs_max_files = FS1_MAX; fs_slot_limit = FS1_SLOT;
+            ok = ata_read(fs_drive, 2, 1, fs_dirbuf) && !memcmp(fs_dirbuf, "LDIR", 4);
+            if (ok) memcpy(fsdir, fs_dirbuf + 4, FS1_MAX * sizeof(struct fent));
+        } else {
+            ok = fs_io(0, FS2_DIR_LBA, FS2_DIR_SECS, fs_dirbuf) && !memcmp(fs_dirbuf, "LDIR", 4);
+            if (ok) memcpy(fsdir, fs_dirbuf + 16, sizeof fsdir);
+        }
+        if (ok) {
             for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
-                if (fsdir[i].size > FS_SLOT) fsdir[i].size = FS_SLOT;
+                if (i >= fs_max_files) { memset(&fsdir[i], 0, sizeof fsdir[i]); continue; }
+                if (fsdir[i].size > fs_slot_limit) fsdir[i].size = fs_slot_limit;
                 fsdir[i].name[FS_NAME - 1] = 0;
-                int secs = (fsdir[i].size + 511) / 512;
-                if (secs) ata_read(fs_drive, FS_DATA_LBA + i * 8, secs, fsdata[i]);
+                u32 secs = (fsdir[i].size + 511) / 512;
+                if (secs) fs_io(0, fs_data_lba(i), secs, fsdata[i]);
             }
             return;
         }
@@ -921,27 +1080,50 @@ static void fs_load(void) {
     }
     fs_defaults();
 }
-/* format drive d as LeactedFS and copy the files that are in RAM onto it */
-static int fs_install(int d) {
-    if (d < 0 || d >= N_DRIVES || !drv[d].present || drv[d].sectors < FS_DATA_LBA + FS_MAX * 8) return 0;
+static int fs_write_super(int d, u32 sectors) {
     u8 sec[512];
     memset(sec, 0, 512);
-    /* partition entry: type 0xDA, LBA 8, rest of disk */
+    memcpy(sec, "LEACTEDFS\x02", 10);
+    u32 v[5] = { sectors, FS_MAX, FS2_SLOT_SECS, FS2_BOOT_LBA, FS2_BOOT_SECS };
+    memcpy(sec + 0x10, v, sizeof v);
+    return ata_write(d, 1, 1, sec);
+}
+/* format drive d as LeactedFS (v2) and copy the files that are in RAM onto it */
+static int fs_install(int d) {
+    if (d < 0 || d >= N_DRIVES || !drv[d].present || drv[d].sectors < FS2_MIN_SECTORS) return 0;
+    u8 sec[512];
+    memset(sec, 0, 512);
+    /* partition entry: type 0xDA, from sector 16 to the end of the disk */
     sec[0x1BE] = 0x00; sec[0x1BE + 4] = 0xDA;
-    u32 start = 8, len = drv[d].sectors - 8;
+    u32 start = FS2_BOOT_LBA, len = drv[d].sectors - FS2_BOOT_LBA;
     memcpy(sec + 0x1BE + 8, &start, 4); memcpy(sec + 0x1BE + 12, &len, 4);
     sec[510] = 0x55; sec[511] = 0xAA;
     fat_cache_drive = -1;
     if (!ata_write(d, 0, 1, sec)) return 0;
-    memset(sec, 0, 512);
-    memcpy(sec, "LEACTEDFS\x01", 10);
-    memcpy(sec + 0x10, &drv[d].sectors, 4);
-    if (!ata_write(d, 1, 1, sec)) return 0;
-    fs_on_disk = 1; fs_drive = d;
-    if (!fs_flush_dir()) { fs_on_disk = 0; fs_drive = -1; return 0; }
+    if (!fs_write_super(d, drv[d].sectors)) return 0;
+    fs_on_disk = 1; fs_drive = d; fs_ver = 2; fs_max_files = FS_MAX; fs_slot_limit = FS_SLOT;
     for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && !fs_flush_file(i)) { fs_on_disk = 0; fs_drive = -1; return 0; }
+    if (!fs_flush_dir()) { fs_on_disk = 0; fs_drive = -1; return 0; }
     drive_probe(d);
     return 1;
+}
+/* Move a mounted v1 volume to the v2 layout. Files are written first, the
+ * superblock last, so a power cut leaves the old volume intact.
+ * Returns 1 = upgraded, 0 = failed / too small, -1 = nothing to do. */
+static int fs_upgrade(void) {
+    if (!fs_on_disk || fs_ver != 1) return -1;
+    if (drv[fs_drive].sectors < FS2_MIN_SECTORS) return 0;
+    fs_ver = 2; fs_max_files = FS_MAX; fs_slot_limit = FS_SLOT;
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
+        u32 secs = (fsdir[i].size + 511) / 512;
+        if (secs && !fs_io(1, fs_data_lba(i), secs, fsdata[i])) goto fail;
+    }
+    if (!fs_flush_dir()) goto fail;
+    if (!fs_write_super(fs_drive, drv[fs_drive].sectors)) goto fail;
+    return 1;
+fail:
+    fs_ver = 1; fs_max_files = FS1_MAX; fs_slot_limit = FS1_SLOT;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -989,7 +1171,7 @@ static void power_off(void) {
 /* ------------------------------------------------------------------ */
 /* Window manager                                                      */
 /* ------------------------------------------------------------------ */
-enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, A_OPENWITH, A_HEX, A_IMG, A_EXT0, A_EXT1, A_EXT2, A_EXT3, N_APPS };
+enum { A_TERM, A_NOTE, A_PAINT, A_FILES, A_CLOCK, A_ABOUT, A_INSTALL, A_SETTINGS, A_TASK, A_CALC, A_BROWSER, A_OPENWITH, A_HEX, A_IMG, A_EXT0, A_EXT1, A_EXT2, A_EXT3, N_APPS };
 #define N_EXT 4                  /* loaded apps (.lapp) that can run at once */
 #define N_PIN A_OPENWITH         /* apps shown in menus, launcher and on the desktop */
 static void theme_apply(int id);
@@ -1007,11 +1189,12 @@ static struct win wins[N_APPS] = {
     [A_SETTINGS] = { 0, 0, 120, 50, 380, 300, "Settings" },
     [A_TASK]    = { 0, 0, 100, 30, 380, 336, "Task Manager" },
     [A_CALC]    = { 0, 0, 260, 40, 232, 300, "Calculator" },
+    [A_BROWSER] = { 0, 0, 20, 8, 600, 412, "Browser" },
     [A_OPENWITH] = { 0, 0, 170, 70, 300, 310, "Open With" },
     [A_HEX]     = { 0, 0, 120, 50, 380, 330, "Hex Viewer" },
     [A_IMG]     = { 0, 0, 90, 40, 440, 360, "Image Viewer" },
 };
-static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager", "Calculator", "Open With", "Hex Viewer", "Image Viewer" };
+static const char *app_names[N_APPS] = { "Terminal", "Notepad", "Paint", "File Manager", "Clock", "About", "Installer", "Settings", "Task Manager", "Calculator", "Browser", "Open With", "Hex Viewer", "Image Viewer" };
 static int zo[N_APPS], nz;
 
 #define TITLE_H 22
@@ -1037,7 +1220,10 @@ static void open_app(int a) {
     raise_app(a);
 }
 static void xapp_on_close(int a);
+static int br_wait;
+static void http_cancel(void);
 static void close_app(int a) {
+    if (a == A_BROWSER && br_wait) { http_cancel(); br_wait = 0; }
     if (a >= A_EXT0 && wins[a].open) xapp_on_close(a);
     wins[a].open = 0; wins[a].min = 0; z_remove(a);
 }
@@ -1093,7 +1279,7 @@ static int x_file_read(const char *name, void *buf, u32 max) {
     return (int)n;
 }
 static int x_file_write(const char *name, const void *buf, u32 len) {
-    if (!name || !*name || (len && !buf) || len > FS_SLOT) return -1;
+    if (!name || !*name || (len && !buf) || len > fs_slot_limit) return -1;
     int i = fs_create(name);
     if (i < 0) return -1;
     return fs_store(i, buf, len) < 0 ? -1 : 0;
@@ -1153,23 +1339,26 @@ static void xapp_tick(void) {
 /* Terminal                                                            */
 /* ------------------------------------------------------------------ */
 #define TC 56
-#define TR 29
-#define ILMAX 48
-static char tg[TR][TC + 1];
-static int tcol, trow;
+#define TR 29                    /* visible rows */
+#define TB 300                   /* rows kept (scrollback) */
+#define ILMAX 96
+#define NHIST 32
+static char tg[TB][TC + 1];
+static int tcol, trow, tscroll;
 static char iline[ILMAX + 1]; static int ilen;
-static char hist[8][ILMAX + 1]; static int nhist, hpos;
+static char hist[NHIST][ILMAX + 1]; static int nhist, hpos;
 static int is_root;
 
-static void tclear(void) { memset(tg, 0, sizeof tg); tcol = 0; trow = 0; }
+static void tclear(void) { memset(tg, 0, sizeof tg); tcol = 0; trow = 0; tscroll = 0; }
 static void tnl(void) {
-    tcol = 0; trow++;
-    if (trow >= TR) { memmove(tg[0], tg[1], (TR - 1) * (TC + 1)); memset(tg[TR - 1], 0, TC + 1); trow = TR - 1; }
+    tcol = 0; trow++; tscroll = 0;
+    if (trow >= TB) { memmove(tg[0], tg[1], (TB - 1) * (TC + 1)); memset(tg[TB - 1], 0, TC + 1); trow = TB - 1; }
 }
 static void tputc(char c) {
     if (c == '\n') { tnl(); return; }
     if (c == '\r') return;
     if (c == '\t') c = ' ';
+    if ((u8)c < 32 || (u8)c > 126) c = '.';
     if (tcol >= TC) tnl();
     tg[trow][tcol++] = c; tg[trow][tcol] = 0;
 }
@@ -1177,10 +1366,156 @@ static void tputs(const char *s) { while (*s) tputc(*s++); }
 static void tprintf(const char *f, ...) {
     char b[160]; va_list ap; va_start(ap, f); kvsnprintf(b, sizeof b, f, ap); va_end(ap); tputs(b);
 }
-static const char *prompt(void) { return is_root ? "leacted# " : "leacted> "; }
+
+/* ------------------------------------------------------------------ */
+/* Paths for the terminal: drives C:-F:, folders on FAT, LeactedFS     */
+/*  drive -1 = the mounted LeactedFS volume (or the RAM disk, R:)      */
+/* ------------------------------------------------------------------ */
+#define FM_RAM 4                        /* pseudo drive R: (files held in RAM) */
+#define TP_DEPTH 12
+struct tpath { int drive, depth; u32 stack[TP_DEPTH + 1]; char rel[64]; };
+static struct tpath tcwd = { -1, 0, { 0 }, "" };
+static struct dent tp_ents[MAX_DENT];
+static u8 tbuf[FS_SLOT + 1];
+
+static char tp_letter(int drive) { return drive < 0 ? (fs_on_disk ? (char)('C' + fs_drive) : 'R') : (char)('C' + drive); }
+static void tp_root(struct tpath *p, int drive) { p->drive = drive; p->depth = 0; p->stack[0] = 0; p->rel[0] = 0; }
+static void tp_show(const struct tpath *p, char *out, int max) { ksnprintf(out, max, "%c:\\%s", tp_letter(p->drive), p->rel); }
+static int tp_push(struct tpath *p, const char *name, u32 cluster) {
+    int rl = slen(p->rel), nl = slen(name);
+    if (p->depth >= TP_DEPTH || rl + nl + 2 >= (int)sizeof p->rel) return 0;
+    p->stack[++p->depth] = cluster;
+    memcpy(p->rel + rl, name, nl); p->rel[rl + nl] = '\\'; p->rel[rl + nl + 1] = 0;
+    return 1;
+}
+static void tp_pop(struct tpath *p) {
+    if (!p->depth) return;
+    p->depth--;
+    int rl = slen(p->rel) - 1;                    /* drop the trailing backslash, then the last name */
+    while (rl > 0 && p->rel[rl - 1] != '\\') rl--;
+    p->rel[rl > 0 ? rl : 0] = 0;
+}
+static int tp_ieq(const char *a, const char *b) {
+    for (; *a && kupper(*a) == kupper(*b); a++, b++) ;
+    return *a == *b;
+}
+static int tp_less(const struct dent *a, const struct dent *b) {      /* folders first, then by name */
+    if (a->isdir != b->isdir) return a->isdir;
+    for (int i = 0;; i++) {
+        char x = kupper(a->name[i]), y = kupper(b->name[i]);
+        if (x != y) return x < y;
+        if (!x) return 0;
+    }
+}
+static void tp_sort(struct dent *e, int n) {
+    for (int i = 1; i < n; i++) {
+        struct dent t = e[i]; int j = i - 1;
+        while (j >= 0 && tp_less(&t, &e[j])) { e[j + 1] = e[j]; j--; }
+        e[j + 1] = t;
+    }
+}
+/* entries of a folder; -1 if the drive cannot be read */
+static int tp_list(const struct tpath *p, struct dent *out, int max) {
+    int n = 0;
+    if (p->drive < 0) {
+        for (int i = 0; i < FS_MAX && n < max; i++) if (fsdir[i].used) {
+            kstrcpy(out[n].name, fsdir[i].name, sizeof out[n].name);
+            out[n].size = fsdir[i].size; out[n].cluster = (u32)i; out[n].isdir = 0; n++;
+        }
+        return n;
+    }
+    if (p->drive >= N_DRIVES || !drv[p->drive].present || drv[p->drive].type != DT_FAT) return -1;
+    struct fatvol v;
+    if (!fat_mount(p->drive, &v)) return -1;
+    return fat_readdir(&v, p->stack[p->depth], out, max);
+}
+/* 0 = folder (in *out), 1 = file (its folder in *out, entry in *fe),
+ * -1 not found, -2 drive not usable, -3 not a folder, -4 path too deep */
+static int tp_resolve(const char *arg, struct tpath *out, struct dent *fe) {
+    struct tpath p = tcwd;
+    const char *s = arg;
+    if (s[0] && s[1] == ':') {
+        char L = kupper(s[0]);
+        if (L == 'R' && !fs_on_disk) tp_root(&p, -1);
+        else if (L >= 'C' && L < 'C' + N_DRIVES && drv[L - 'C'].present) {
+            int d = L - 'C';
+            if (fs_on_disk && d == fs_drive) tp_root(&p, -1);
+            else if (drv[d].type == DT_FAT) tp_root(&p, d);
+            else return -2;
+        } else return -2;
+        s += 2;
+    } else if (*s == '/' || *s == '\\') tp_root(&p, p.drive);
+    int is_file = 0;
+    while (*s) {
+        while (*s == '/' || *s == '\\') s++;
+        if (!*s) break;
+        char comp[48]; int n = 0;
+        while (*s && *s != '/' && *s != '\\') { if (n < 47) comp[n++] = *s; s++; }
+        comp[n] = 0;
+        if (is_file) return -3;
+        if (!kstrcmp(comp, ".")) continue;
+        if (!kstrcmp(comp, "..")) { tp_pop(&p); continue; }
+        int cnt = tp_list(&p, tp_ents, MAX_DENT);
+        if (cnt < 0) return -2;
+        int k = 0;
+        while (k < cnt && !tp_ieq(tp_ents[k].name, comp)) k++;
+        if (k == cnt) return -1;
+        if (tp_ents[k].isdir) { if (!tp_push(&p, tp_ents[k].name, tp_ents[k].cluster)) return -4; }
+        else { *fe = tp_ents[k]; is_file = 1; }
+    }
+    *out = p;
+    return is_file;
+}
+static void tp_err(int r, const char *arg) {
+    if (r == -1) tprintf("Not found: %s\n", arg);
+    else if (r == -2) tprintf("Cannot use that drive: %s\n(drives: C: to F:, FAT or LeactedFS; see disk)\n", arg);
+    else if (r == -3) tprintf("Not a folder: %s\n", arg);
+    else tprintf("Path too deep: %s\n", arg);
+}
+static void tp_fref(const struct tpath *dir, const struct dent *e, struct fref *f) {
+    memset(f, 0, sizeof *f);
+    if (dir->drive < 0) { f->kind = 1; f->drive = fs_on_disk ? fs_drive : -1; }
+    else { f->kind = 2; f->drive = dir->drive; }
+    f->cluster = e->cluster; f->size = e->size;
+    kstrcpy(f->name, e->name, sizeof f->name);
+}
+/* find a file (also tries NAME.lapp when asked); prints the error and returns 0 if it fails */
+static int tp_find_file(const char *arg, struct fref *f, int try_lapp) {
+    struct tpath dir; struct dent e;
+    int r = tp_resolve(arg, &dir, &e);
+    if (r == -1 && try_lapp && slen(arg) < 40) {
+        char nm[48]; ksnprintf(nm, sizeof nm, "%s.lapp", arg);
+        r = tp_resolve(nm, &dir, &e);
+    }
+    if (r == 0) { tprintf("That is a folder: %s\n", arg); return 0; }
+    if (r < 0) { tp_err(r, arg); return 0; }
+    tp_fref(&dir, &e, f);
+    return 1;
+}
+/* load a whole file into tbuf (cut at the LeactedFS slot size) */
+static int tp_read(const char *arg, u32 *len, int *cut, struct fref *fo) {
+    struct fref f;
+    if (!tp_find_file(arg, &f, 0)) return 0;
+    u32 want = f.size < FS_SLOT ? f.size : FS_SLOT;
+    u32 n = want ? fref_load(&f, tbuf, FS_SLOT) : 0;
+    if (n != want) { tputs("Disk read error.\n"); return 0; }
+    tbuf[n] = 0;
+    *len = n; *cut = f.size > FS_SLOT;
+    if (fo) *fo = f;
+    return 1;
+}
+static const char *prompt(void) {
+    static char pb[48];
+    if ((tcwd.drive < 0 && !tcwd.depth)) return is_root ? "leacted# " : "leacted> ";
+    char sh[64]; tp_show(&tcwd, sh, sizeof sh);
+    int l = slen(sh);
+    if (l > 30) ksnprintf(pb, sizeof pb, "...%s%s ", sh + l - 27, is_root ? "#" : ">");
+    else ksnprintf(pb, sizeof pb, "%s%s ", sh, is_root ? "#" : ">");
+    return pb;
+}
 
 /* Notepad state is needed by the terminal (edit command) */
-#define NOTE_MAX 4000
+#define NOTE_MAX 16000
 static char nbuf[NOTE_MAX + 1]; static int nlen;
 static char nname[FS_NAME] = "UNTITLED.TXT";
 static char nmsg[40];
@@ -1211,8 +1546,13 @@ static int split_args(char *s, char **argv, int max) {
     while (*s && n < max) {
         while (*s == ' ') s++;
         if (!*s) break;
-        argv[n++] = s;
-        while (*s && *s != ' ') s++;
+        if (*s == '"') {                          /* "quoted text" is one argument */
+            argv[n++] = ++s;
+            while (*s && *s != '"') s++;
+        } else {
+            argv[n++] = s;
+            while (*s && *s != ' ') s++;
+        }
         if (*s) *s++ = 0;
     }
     return n;
@@ -1230,10 +1570,245 @@ static void print_store_result(int r) {
     else if (r == 1) tputs("Saved (RAM only - run the Installer to keep files).\n");
     else tputs("Disk write failed!\n");
 }
-static void cmd_ls(void) {
-    int n = 0;
-    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) { tprintf(" %s %u bytes\n", fsdir[i].name, fsdir[i].size); n++; }
-    tprintf("%d file(s), %s\n", n, fs_on_disk ? "stored on disk" : "RAM only");
+static void fmt_size(char *o, int max, u32 n) {
+    if (n >= 1048576) ksnprintf(o, max, "%u MB", n / 1048576);
+    else if (n >= 1024) ksnprintf(o, max, "%u KB", n / 1024);
+    else ksnprintf(o, max, "%u B", n);
+}
+static void cmd_ls(const char *arg) {
+    struct tpath dir; struct dent fe;
+    int r = arg ? tp_resolve(arg, &dir, &fe) : (dir = tcwd, 0);
+    if (r == 1) { char z[16]; fmt_size(z, sizeof z, fe.size); tprintf(" %s  %s\n", fe.name, z); return; }
+    if (r < 0) { tp_err(r, arg); return; }
+    int n = tp_list(&dir, tp_ents, MAX_DENT);
+    if (n < 0) { tputs("Cannot read that drive (not FAT or LeactedFS).\n"); return; }
+    tp_sort(tp_ents, n);
+    int dirs = 0;
+    for (int i = 0; i < n; i++) {
+        char z[16];
+        if (tp_ents[i].isdir) { dirs++; kstrcpy(z, "<DIR>", sizeof z); } else fmt_size(z, sizeof z, tp_ents[i].size);
+        tprintf(" %-34s %s\n", tp_ents[i].name, z);
+    }
+    tprintf("%d file(s), %d folder(s)", n - dirs, dirs);
+    if (dir.drive < 0) tprintf(", %s", fs_on_disk ? "stored on disk" : "RAM only");
+    tputc('\n');
+}
+static void cmd_cd(const char *arg) {
+    if (!arg) { tp_root(&tcwd, -1); return; }
+    struct tpath dir; struct dent fe;
+    int r = tp_resolve(arg, &dir, &fe);
+    if (r == 1) { tprintf("Not a folder: %s\n", arg); return; }
+    if (r < 0) { tp_err(r, arg); return; }
+    tcwd = dir;
+}
+/* tree: every level has its own small buffer so the kernel stack stays small */
+static int tree_lines, tree_files, tree_dirs;
+static struct dent tree_ents[4][48];
+static void tree_walk(const struct tpath *p, int level) {
+    int n = tp_list(p, tree_ents[level], 48);
+    if (n < 0) return;
+    tp_sort(tree_ents[level], n);
+    for (int i = 0; i < n; i++) {
+        struct dent *e = &tree_ents[level][i];
+        if (tree_lines >= 250) return;
+        tree_lines++;
+        if (e->isdir) tree_dirs++; else tree_files++;
+        tprintf("%*s%s%s\n", level * 2 + 1, "", e->name, e->isdir ? "\\" : "");
+        if (e->isdir && level < 3) { struct tpath q = *p; if (tp_push(&q, e->name, e->cluster)) tree_walk(&q, level + 1); }
+    }
+}
+static void cmd_tree(const char *arg) {
+    struct tpath dir; struct dent fe;
+    int r = arg ? tp_resolve(arg, &dir, &fe) : (dir = tcwd, 0);
+    if (r == 1) { tprintf("Not a folder: %s\n", arg); return; }
+    if (r < 0) { tp_err(r, arg); return; }
+    char sh[64]; tp_show(&dir, sh, sizeof sh); tprintf("%s\n", sh);
+    tree_lines = tree_files = tree_dirs = 0;
+    tree_walk(&dir, 0);
+    tprintf("%d file(s), %d folder(s)%s\n", tree_files, tree_dirs, tree_lines >= 250 ? " (list cut)" : "");
+}
+static void cmd_cat(const char *arg) {
+    u32 len; int cut;
+    if (!tp_read(arg, &len, &cut, 0)) return;
+    u32 show = len < 16384 ? len : 16384;
+    for (u32 k = 0; k < show; k++) tputc((char)tbuf[k]);
+    if (show && tbuf[show - 1] != '\n') tputc('\n');
+    if (show < len || cut) tputs("(cut: use head, tail or hexdump for the rest)\n");
+}
+static int arg_count(char **av, int ac, int *n) {         /* parses -n N (returns args used) */
+    *n = 10;
+    if (ac >= 3 && !kstrcmp(av[1], "-n")) { i32 v; if (!parse_int(av[2], &v) || v < 1) v = 10; *n = v; return 2; }
+    return 0;
+}
+static void cmd_head(char **av, int ac) {
+    int n, used = arg_count(av, ac, &n);
+    if (ac < 2 + used) { tputs("Usage: head [-n N] FILE\n"); return; }
+    u32 len; int cut;
+    if (!tp_read(av[1 + used], &len, &cut, 0)) return;
+    u32 k = 0; int lines = 0;
+    while (k < len && lines < n) { if (tbuf[k] == '\n') lines++; tputc((char)tbuf[k]); k++; }
+    if (k && tbuf[k - 1] != '\n') tputc('\n');
+}
+static void cmd_tail(char **av, int ac) {
+    int n, used = arg_count(av, ac, &n);
+    if (ac < 2 + used) { tputs("Usage: tail [-n N] FILE\n"); return; }
+    u32 len; int cut;
+    if (!tp_read(av[1 + used], &len, &cut, 0)) return;
+    u32 end = len; if (end && tbuf[end - 1] == '\n') end--;
+    u32 k = end; int lines = 0;
+    while (k > 0) { if (tbuf[k - 1] == '\n' && ++lines == n) break; k--; }
+    for (; k < len; k++) tputc((char)tbuf[k]);
+    if (len && tbuf[len - 1] != '\n') tputc('\n');
+    if (cut) tputs("(file is longer than 128 KB: this is the end of the first 128 KB)\n");
+}
+static void cmd_wc(const char *arg) {
+    u32 len; int cut;
+    if (!tp_read(arg, &len, &cut, 0)) return;
+    u32 lines = 0, words = 0; int in = 0;
+    for (u32 k = 0; k < len; k++) {
+        u8 c = tbuf[k];
+        if (c == '\n') lines++;
+        int sp = c == ' ' || c == '\n' || c == '\t' || c == '\r';
+        if (!sp && !in) words++;
+        in = !sp;
+    }
+    tprintf("%u lines  %u words  %u bytes%s\n", lines, words, len, cut ? "+ (first 128 KB)" : "");
+}
+static int has_sub(const u8 *line, u32 n, const char *pat, int icase) {
+    int pl = slen(pat);
+    for (u32 i = 0; i + pl <= n; i++) {
+        int k = 0;
+        while (k < pl && (icase ? kupper((char)line[i + k]) == kupper(pat[k]) : (char)line[i + k] == pat[k])) k++;
+        if (k == pl) return 1;
+    }
+    return 0;
+}
+static int grep_buf(const char *pat, int icase, int num, int count_only, const char *label, u32 len) {
+    u32 k = 0, ln = 0; int hits = 0;
+    while (k < len) {
+        u32 e = k; while (e < len && tbuf[e] != '\n') e++;
+        ln++;
+        u32 n = e - k; if (n && tbuf[e - 1] == '\r') n--;
+        if (has_sub(tbuf + k, n, pat, icase)) {
+            hits++;
+            if (!count_only) {
+                if (label) tprintf("%s:", label);
+                if (num) tprintf("%u:", ln);
+                for (u32 i = 0; i < n; i++) tputc((char)tbuf[k + i]);
+                tputc('\n');
+            }
+        }
+        k = e + 1;
+    }
+    return hits;
+}
+static void cmd_grep(char **av, int ac) {
+    int icase = 0, num = 0, cnt = 0, a = 1;
+    while (a < ac && av[a][0] == '-' && av[a][1]) {
+        for (const char *f = av[a] + 1; *f; f++) { if (*f == 'i') icase = 1; else if (*f == 'n') num = 1; else if (*f == 'c') cnt = 1; }
+        a++;
+    }
+    if (a >= ac) { tputs("Usage: grep [-i] [-n] [-c] TEXT [FILE]\n(without FILE: search every file in this folder)\n"); return; }
+    const char *pat = av[a++];
+    if (a < ac) {
+        u32 len; int cut;
+        if (!tp_read(av[a], &len, &cut, 0)) return;
+        int h = grep_buf(pat, icase, num, cnt, 0, len);
+        if (cnt) tprintf("%d\n", h); else if (!h) tputs("(no match)\n");
+        return;
+    }
+    int n = tp_list(&tcwd, tp_ents, MAX_DENT), total = 0;
+    if (n < 0) { tputs("Cannot read this drive.\n"); return; }
+    static struct dent list[64]; if (n > 64) n = 64;
+    memcpy(list, tp_ents, n * sizeof(struct dent));
+    for (int i = 0; i < n; i++) if (!list[i].isdir) {
+        struct fref f; tp_fref(&tcwd, &list[i], &f);
+        u32 want = f.size < FS_SLOT ? f.size : FS_SLOT;
+        u32 got = want ? fref_load(&f, tbuf, FS_SLOT) : 0;
+        if (got != want) continue;
+        tbuf[got] = 0;
+        int h = grep_buf(pat, icase, num, cnt, list[i].name, got);
+        if (cnt && h) tprintf("%s:%d\n", list[i].name, h);
+        total += h;
+    }
+    if (!total) tputs("(no match)\n");
+}
+static void cmd_hexdump(const char *arg, const char *off) {
+    u32 len; int cut; i32 start = 0;
+    if (off && !parse_int(off, &start)) start = 0;
+    if (start < 0) start = 0;
+    if (!tp_read(arg, &len, &cut, 0)) return;
+    start &= ~7;
+    if ((u32)start >= len && len) { tputs("Offset is past the end.\n"); return; }
+    u32 pos = (u32)start;
+    for (int row = 0; row < 16 && pos < len; row++, pos += 8) {
+        char line[64]; int p = ksnprintf(line, sizeof line, "%05x ", pos);
+        for (int i = 0; i < 8; i++) p += pos + i < len ? ksnprintf(line + p, sizeof line - p, " %02x", tbuf[pos + i]) : ksnprintf(line + p, sizeof line - p, "   ");
+        line[p++] = ' '; line[p++] = ' ';
+        for (int i = 0; i < 8 && pos + i < len; i++) { u8 c = tbuf[pos + i]; line[p++] = (c >= 32 && c < 127) ? (char)c : '.'; }
+        line[p] = 0;
+        tprintf("%s\n", line);
+    }
+    if (pos < len) tprintf("(more: hexdump %s %u)\n", arg, pos);
+}
+/* where a copy/move target lands: always the root of LeactedFS. 0 = ok */
+static const char *dest_name(const char *dst, const char *srcname, char *out) {
+    const char *d = dst;
+    if (d[0] && d[1] == ':') {
+        char L = kupper(d[0]);
+        int ok = fs_on_disk ? (L == 'C' + fs_drive) : L == 'R';
+        if (!ok) return "Files can only be copied into LeactedFS (FAT drives are read-only).";
+        d += 2;
+    }
+    while (*d == '/' || *d == '\\') d++;
+    for (const char *q = d; *q; q++) if ((*q == '/' || *q == '\\') && q[1]) return "LeactedFS has no folders: give a plain file name.";
+    char nm[FS_NAME]; int n = 0;
+    const char *use = *d ? d : srcname;
+    for (; use[n] && use[n] != '/' && use[n] != '\\' && n < FS_NAME - 1; n++) nm[n] = use[n];
+    nm[n] = 0;
+    if (!n) return "Missing file name.";
+    fs_norm(out, nm);
+    return 0;
+}
+static void cmd_cp(const char *src, const char *dst) {
+    struct fref f;
+    if (!tp_find_file(src, &f, 0)) return;
+    char nm[FS_NAME]; const char *err = dest_name(dst, f.name, nm);
+    if (err) { tprintf("%s\n", err); return; }
+    int ex = fs_find(nm);
+    if (f.kind == 1 && ex == (int)f.cluster) { tputs("Source and target are the same file.\n"); return; }
+    if (ex >= 0 && !is_root) { tprintf("%s exists. Use 'super' to overwrite.\n", nm); return; }
+    u32 want = f.size < fs_slot_limit ? f.size : fs_slot_limit;
+    u32 n = want ? fref_load(&f, tbuf, fs_slot_limit) : 0;
+    if (n != want) { tputs("Disk read error.\n"); return; }
+    int i = fs_create(nm);
+    if (i < 0) { tprintf("LeactedFS is full (%d files).\n", fs_max_files); return; }
+    int r = fs_store(i, tbuf, n);
+    if (f.size > fs_slot_limit) tprintf("Copied the first %u KB of %u bytes.\n", fs_slot_limit / 1024, f.size);
+    print_store_result(r);
+}
+static void cmd_mv(const char *from, const char *to) {
+    int i = fs_find(from[0] && from[1] == ':' ? from + 2 : from);
+    if (i < 0) { tprintf("Not found in LeactedFS: %s\n", from); return; }
+    char nm[FS_NAME]; const char *err = dest_name(to, fsdir[i].name, nm);
+    if (err) { tprintf("%s\n", err); return; }
+    int ex = fs_find(nm);
+    if (ex == i) { tputs("Same name.\n"); return; }
+    if (ex >= 0) { tprintf("%s already exists.\n", nm); return; }
+    int r = fs_rename(i, nm);
+    tputs(r < 0 ? "Disk write failed!\n" : "Renamed.\n");
+}
+static void cmd_touch(const char *name) {
+    char nm[FS_NAME]; const char *err = dest_name(name, "", nm);
+    if (err) { tprintf("%s\n", err); return; }
+    if (fs_find(nm) >= 0) { tputs("Already exists.\n"); return; }
+    int i = fs_create(nm);
+    if (i < 0) { tprintf("LeactedFS is full (%d files).\n", fs_max_files); return; }
+    print_store_result(fs_store(i, "", 0));
+}
+static void cmd_history(void) {
+    for (int i = 0; i < nhist; i++) tprintf("%3d  %s\n", i + 1, hist[i]);
+    if (!nhist) tputs("(empty)\n");
 }
 static void cmd_echo_redirect(char *line) {
     /* echo TEXT > FILE   or   echo TEXT >> FILE */
@@ -1247,21 +1822,21 @@ static void cmd_echo_redirect(char *line) {
     if (!*name) { tputs("Usage: echo text > file\n"); return; }
     int tl = slen(line); while (tl > 0 && line[tl - 1] == ' ') line[--tl] = 0;
     int i = fs_create(name);
-    if (i < 0) { tputs("Disk full (15 files max).\n"); return; }
-    char buf[FS_SLOT + 2]; u32 len = 0;
+    if (i < 0) { tprintf("Disk full (%d files max).\n", fs_max_files); return; }
+    static char buf[FS_SLOT + 2]; u32 len = 0;
     if (append) { len = fsdir[i].size; memcpy(buf, fsdata[i], len); }
-    for (int k = 0; line[k] && len < FS_SLOT - 1; k++) buf[len++] = line[k];
+    for (int k = 0; line[k] && len < fs_slot_limit - 1; k++) buf[len++] = line[k];
     buf[len++] = '\n';
     print_store_result(fs_store(i, buf, len));
 }
 static void run_cmd(char *line);
+enum { TJ_NONE, TJ_PING, TJ_LOOKUP, TJ_WGET, TJ_DHCP, TJ_LGET };
+static int tjob;
+static int net_job_ok(void);
+static void tjob_cancel(void);
+static int net_command(const char *c, char **av, int ac);
 static int ext_is(const char *name, const char *ext);
-static int find_app_file(const char *arg) {
-    int i = fs_find(arg);
-    if (i >= 0) return i;
-    char nm[FS_NAME]; ksnprintf(nm, sizeof nm, "%s.lapp", arg);
-    return fs_find(nm);
-}
+static void fm_refresh(void);
 static void cmd_apps(void) {
     int n = 0;
     tputs("Apps on LeactedFS:\n");
@@ -1271,43 +1846,366 @@ static void cmd_apps(void) {
     for (int k = 0; k < N_EXT; k++) if (xapp[k].used) { if (!n++) tputs("Running:\n"); tprintf(" %s\n", xapp[k].title); }
 }
 static void cmd_appinfo(const char *arg) {
-    int i = find_app_file(arg);
-    if (i < 0) { tputs("File not found.\n"); return; }
-    struct lapp_header h; const char *err = lapp_check(fsdata[i], fsdir[i].size, &h);
+    struct fref f;
+    if (!tp_find_file(arg, &f, 1)) return;
+    if (f.size > FS_SLOT) { tputs("Not a LeactedOS app (file too big).\n"); return; }
+    u32 n = f.size ? fref_load(&f, tbuf, FS_SLOT) : 0;
+    struct lapp_header h; const char *err = lapp_check(tbuf, n, &h);
     if (err) { tprintf("%s\n", err); return; }
     tprintf("%s\n window %dx%d, memory %u bytes\n needs API %u, %u relocations\n", h.name, h.win_w, h.win_h, h.image_size + h.bss_size, h.api_min, h.nreloc);
 }
 static void cmd_run(const char *arg) {
-    int i = find_app_file(arg);
-    if (i < 0) { tputs("App not found. Type apps to list them.\n"); return; }
-    struct fref f = { 1, fs_drive, (u32)i, fsdir[i].size, "" };
-    kstrcpy(f.name, fsdir[i].name, sizeof f.name);
+    struct fref f;
+    if (!tp_find_file(arg, &f, 1)) return;
     const char *err = lapp_run_fref(&f);
     if (err) tprintf("Cannot run: %s\n", err);
 }
+
+/* ------------------------------------------------------------------ */
+/* Leact-get: install apps from a repository on a drive                */
+/*  A repository is a folder holding leact-repo.txt and the .lapp      */
+/*  files it lists:                                                    */
+/*      LEACT-REPO 1                                                   */
+/*      name|path/to/file.lapp|version|one line description            */
+/* ------------------------------------------------------------------ */
+#define LG_MAX 48
+struct lg_app { char name[24]; char file[64]; char ver[12]; char desc[64]; };
+static struct lg_app lg_apps[LG_MAX];
+static int lg_n;
+static struct tpath lg_repo;                    /* chosen with: leact-get repo PATH */
+static int lg_repo_set;
+static const char LG_INDEX[] = "leact-repo.txt";
+
+static int lg_has_index(const struct tpath *dir) {
+    int n = tp_list(dir, tp_ents, MAX_DENT);
+    for (int i = 0; i < n; i++) if (!tp_ents[i].isdir && tp_ieq(tp_ents[i].name, LG_INDEX)) return 1;
+    return 0;
+}
+/* the folder to use: the chosen one, else the first FAT drive with an index, else LeactedFS */
+static int lg_find_repo(struct tpath *out) {
+    if (lg_repo_set && lg_has_index(&lg_repo)) { *out = lg_repo; return 1; }
+    struct tpath p;
+    for (int d = 0; d < N_DRIVES; d++) {
+        if (!drv[d].present || drv[d].type != DT_FAT) continue;
+        tp_root(&p, d);
+        if (lg_has_index(&p)) { *out = p; return 1; }
+    }
+    tp_root(&p, -1);
+    if (lg_has_index(&p)) { *out = p; return 1; }
+    return 0;
+}
+/* look a path up relative to a folder (no drive prefix) */
+static int lg_resolve(const struct tpath *base, const char *rel, struct fref *f) {
+    struct tpath keep = tcwd, dir; struct dent e;
+    tcwd = *base;
+    int r = tp_resolve(rel, &dir, &e);
+    tcwd = keep;
+    if (r != 1) return 0;
+    tp_fref(&dir, &e, f);
+    return 1;
+}
+static void lg_field(char *dst, int max, const char *s, int n) {
+    while (n > 0 && *s == ' ') { s++; n--; }
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\r')) n--;
+    if (n > max - 1) n = max - 1;
+    memcpy(dst, s, n); dst[n] = 0;
+}
+static int lg_name_ok(const char *n) {
+    int l = slen(n);
+    if (l < 1 || l > 17) return 0;
+    for (int i = 0; i < l; i++) { char c = n[i]; if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) return 0; }
+    return 1;
+}
+/* parse index text into lg_apps; returns the number of apps or -1 (message printed) */
+static int lg_parse(const u8 *buf, u32 len) {
+    lg_n = 0; int seen_head = 0, bad = 0;
+    for (u32 k = 0; k < len;) {
+        u32 e = k; while (e < len && buf[e] != '\n') e++;
+        const char *ln = (const char *)buf + k; int n = (int)(e - k);
+        k = e + 1;
+        while (n > 0 && (*ln == ' ' || *ln == '\t')) { ln++; n--; }
+        if (n > 0 && ln[n - 1] == '\r') n--;
+        if (!n || *ln == '#') continue;
+        if (!seen_head) {
+            if (n < 10 || memcmp(ln, "LEACT-REPO", 10)) { tputs("Not a Leact-get repository (missing LEACT-REPO line).\n"); return -1; }
+            seen_head = 1; continue;
+        }
+        const char *fld[4]; int fl[4], nf = 0, st = 0;
+        for (int i = 0; i <= n && nf < 4; i++) if (i == n || ln[i] == '|') { fld[nf] = ln + st; fl[nf] = i - st; nf++; st = i + 1; }
+        if (nf < 2 || lg_n >= LG_MAX) { bad++; continue; }
+        struct lg_app *a = &lg_apps[lg_n];
+        memset(a, 0, sizeof *a);
+        lg_field(a->name, sizeof a->name, fld[0], fl[0]);
+        lg_field(a->file, sizeof a->file, fld[1], fl[1]);
+        if (nf > 2) lg_field(a->ver, sizeof a->ver, fld[2], fl[2]);
+        if (nf > 3) lg_field(a->desc, sizeof a->desc, fld[3], fl[3]);
+        if (!lg_name_ok(a->name) || !a->file[0]) { bad++; continue; }
+        lg_n++;
+    }
+    if (!seen_head) { tputs("Not a Leact-get repository (empty index).\n"); return -1; }
+    if (bad) tprintf("(skipped %d bad line(s) in the index)\n", bad);
+    return lg_n;
+}
+/* read the index of a repository on a drive */
+static int lg_load(struct tpath *repo) {
+    if (!lg_find_repo(repo)) {
+        tputs("No repository found. Attach a disk that holds\nleact-repo.txt (see README), or: leact-get repo PATH\n");
+        return -1;
+    }
+    struct fref f;
+    if (!lg_resolve(repo, LG_INDEX, &f)) { tputs("Cannot read the repository index.\n"); return -1; }
+    u32 want = f.size < FS_SLOT ? f.size : FS_SLOT;
+    u32 len = want ? fref_load(&f, tbuf, FS_SLOT) : 0;
+    if (len != want) { tputs("Cannot read the repository index.\n"); return -1; }
+    return lg_parse(tbuf, len);
+}
+static int lg_find(const char *name) {
+    for (int i = 0; i < lg_n; i++) if (tp_ieq(lg_apps[i].name, name)) return i;
+    return -1;
+}
+static int lg_installed(const char *name) {
+    char nm[FS_NAME]; ksnprintf(nm, sizeof nm, "%s.lapp", name);
+    return fs_find(nm);
+}
+/* header checksum of the repository copy (reads only the first 64 bytes); 0 if unreadable */
+static u32 lg_remote_crc(const struct tpath *repo, const struct lg_app *a) {
+    struct fref f; u8 h[LAPP_HDR_SIZE];
+    if (!lg_resolve(repo, a->file, &f) || f.size < LAPP_HDR_SIZE) return 0;
+    if (fref_load(&f, h, LAPP_HDR_SIZE) < LAPP_HDR_SIZE) return 0;
+    return lapp_rd32(h + 28);
+}
+/* check a package and save it as NAME.LAPP; NULL and *state: 0 new, 1 updated, 2 already current */
+static const char *lg_store(const struct lg_app *a, const u8 *data, u32 n, int *state) {
+    if (n > APP_FILE_MAX) return "Package is too big.";
+    struct lapp_header h; const char *err = lapp_check(data, n, &h);
+    if (err) return err;
+    char nm[FS_NAME]; ksnprintf(nm, sizeof nm, "%s.lapp", a->name);
+    int ex = fs_find(nm);
+    if (ex >= 0 && fsdir[ex].size >= LAPP_HDR_SIZE && lapp_rd32(fsdata[ex] + 28) == h.crc32) { *state = 2; return 0; }
+    int i = fs_create(nm);
+    if (i < 0) return "LeactedFS is full.";
+    *state = ex >= 0 ? 1 : 0;
+    int r = fs_store(i, data, n);
+    if (r < 0) return "Disk write failed!";
+    return 0;
+}
+/* install or update from a repository on a drive */
+static const char *lg_install(const struct tpath *repo, const struct lg_app *a, int *state) {
+    struct fref f;
+    if (!lg_resolve(repo, a->file, &f)) return "Package file not found in the repository.";
+    if (f.size > APP_FILE_MAX) return "Package is too big.";
+    u32 n = fref_load(&f, tbuf, FS_SLOT);
+    if (n != f.size) return "Disk read error.";
+    return lg_store(a, tbuf, n, state);
+}
+
+/* ---- online repositories: the index and packages come over http(s) as a background job ---- */
+#define LG_DEFAULT_REPO "https://raw.githubusercontent.com/avarabb990/leactedos-project/main/repo/"
+enum { LGO_LIST, LGO_INFO, LGO_INSTALL, LGO_UPDATE };
+static char lg_url[200] = LG_DEFAULT_REPO;
+static int lg_url_set;                                     /* the user chose online (a URL, or "default") */
+static int lg_op, lg_stage, lg_ui, lg_cur, lg_changed;
+static char lg_arg[24];
+static int lg_use_remote(void) {
+    struct tpath r;
+    if (lg_url_set) return 1;
+    if (lg_repo_set) return 0;
+    if (lg_find_repo(&r)) return 0;
+    return net_have_nic;                                   /* nothing attached: go online */
+}
+static void lg_remote_start(int op, const char *arg) {
+    if (!net_job_ok()) return;
+    lg_op = op; lg_stage = 0; lg_changed = 0; lg_ui = 0; lg_cur = -1;
+    kstrcpy(lg_arg, arg ? arg : "", sizeof lg_arg);
+    char u[320]; url_join(lg_url, LG_INDEX, u, sizeof u);
+    http_start(u);
+    tjob = TJ_LGET;
+    tputs("Contacting the repository...\n");
+}
+static int lg_next_update(void) {                          /* start downloading the next installed app; 0 when done */
+    while (lg_ui < lg_n) {
+        int i = lg_ui++;
+        if (lg_arg[0] && !tp_ieq(lg_apps[i].name, lg_arg)) continue;
+        if (lg_installed(lg_apps[i].name) < 0) continue;
+        char u[320]; url_join(lg_url, lg_apps[i].file, u, sizeof u);
+        lg_cur = i; http_start(u);
+        return 1;
+    }
+    return 0;
+}
+static void lg_job_tick(void) {
+    if (http_active()) return;
+    if (lg_stage == 0) {                                   /* the index arrived (or failed) */
+        if (http_st == H_ERR) { tprintf("Cannot reach the repository: %s\n", http_msg); tjob = TJ_NONE; return; }
+        if (http_code != 200) { tprintf("The repository answered %d.\nCheck the address with: leact-get repo\n", http_code); tjob = TJ_NONE; return; }
+        int n = lg_parse(http_body, http_len);
+        if (n < 0) { tjob = TJ_NONE; return; }
+        if (lg_op == LGO_LIST) {
+            tprintf("Online repository: %d app(s)   * = installed\n", n);
+            for (int i = 0; i < n; i++)
+                tprintf("%s %-14s %-5s %s\n", lg_installed(lg_apps[i].name) >= 0 ? "*" : " ", lg_apps[i].name, lg_apps[i].ver, lg_apps[i].desc);
+            tputs("Update installed apps with: leact-get update\n");
+            tjob = TJ_NONE; return;
+        }
+        if (lg_op == LGO_INFO) {
+            int i = lg_find(lg_arg);
+            if (i < 0) tprintf("No app called %s in the repository.\n", lg_arg);
+            else tprintf("%s  version %s\n%s\nfile: %s\nInstalled: %s\n", lg_apps[i].name, lg_apps[i].ver[0] ? lg_apps[i].ver : "?", lg_apps[i].desc, lg_apps[i].file, lg_installed(lg_apps[i].name) < 0 ? "no" : "yes");
+            tjob = TJ_NONE; return;
+        }
+        if (lg_op == LGO_INSTALL) {
+            int i = lg_find(lg_arg);
+            if (i < 0) { tprintf("No app called %s in the repository. Try: leact-get list\n", lg_arg); tjob = TJ_NONE; return; }
+            char u[320]; url_join(lg_url, lg_apps[i].file, u, sizeof u);
+            lg_cur = i; http_start(u); lg_stage = 1;
+            tprintf("Downloading %s...\n", lg_apps[i].name);
+            return;
+        }
+        if (!lg_next_update()) { tputs(lg_arg[0] ? "That app is not installed.\n" : "No installed apps to update.\n"); tjob = TJ_NONE; return; }
+        lg_stage = 1;
+        return;
+    }
+    /* stage 1: a package arrived (or failed) */
+    const struct lg_app *a = &lg_apps[lg_cur];
+    int st = 0; const char *err = 0;
+    if (http_st == H_ERR) err = http_msg;
+    else if (http_code != 200) { static char m[40]; ksnprintf(m, sizeof m, "the server answered %d", http_code); err = m; }
+    else if (http_trunc) err = "Package is too big.";
+    else err = lg_store(a, http_body, http_len, &st);
+    if (lg_op == LGO_INSTALL) {
+        if (err) tprintf("Could not install %s: %s\n", a->name, err);
+        else if (st == 2) tprintf("%s is already installed and up to date.\n", a->name);
+        else tprintf("%s %s. Start it with: run %s\n", st ? "Updated" : "Installed", a->name, a->name);
+        tjob = TJ_NONE; return;
+    }
+    if (err) tprintf("%s: %s\n", a->name, err);
+    else if (st == 1) { tprintf("Updated %s\n", a->name); lg_changed++; }
+    if (lg_next_update()) return;
+    if (!lg_changed) tputs("Everything is up to date.\n");
+    tjob = TJ_NONE;
+}
+static void cmd_leactget(char **av, int ac) {
+    const char *sub = ac > 1 ? av[1] : "help";
+    struct tpath repo;
+    if (!kstrcmp(sub, "help") || !kstrcmp(sub, "?")) {
+        tputs("leact-get list            apps in the repository\n");
+        tputs("leact-get info NAME       details\n");
+        tputs("leact-get install NAME    install (or: leact-get NAME)\n");
+        tputs("leact-get update [NAME]   get newer versions\n");
+        tputs("leact-get remove NAME     uninstall\n");
+        tputs("leact-get repo [URL|PATH|default|auto]\n");
+        tputs("                         show / choose the repository\n");
+        tputs("Apps are saved in LeactedFS. Start one with: run NAME\n");
+        return;
+    }
+    if (!kstrcmp(sub, "repo")) {
+        if (ac > 2 && (n_starts(av[2], "http://") || n_starts(av[2], "https://"))) {
+            kstrcpy(lg_url, av[2], sizeof lg_url);
+            int l = slen(lg_url); if (l && l < (int)sizeof lg_url - 1 && lg_url[l - 1] != '/') { lg_url[l] = '/'; lg_url[l + 1] = 0; }
+            lg_url_set = 1; lg_repo_set = 0;
+        } else if (ac > 2 && !kstrcmp(av[2], "default")) { kstrcpy(lg_url, LG_DEFAULT_REPO, sizeof lg_url); lg_url_set = 1; lg_repo_set = 0; }
+        else if (ac > 2 && !kstrcmp(av[2], "auto")) { lg_url_set = 0; lg_repo_set = 0; }
+        else if (ac > 2) {
+            struct tpath dir; struct dent e; int r = tp_resolve(av[2], &dir, &e);
+            if (r != 0) { if (r == 1) tprintf("Not a folder: %s\n", av[2]); else tp_err(r, av[2]); return; }
+            if (!lg_has_index(&dir)) { tprintf("No %s in that folder.\n", LG_INDEX); return; }
+            lg_repo = dir; lg_repo_set = 1;
+        }
+        if (ac > 2 && lg_url_set == 0 && (n_starts(av[2], "http") || !kstrcmp(av[2], "default"))) lg_url_set = 1;
+        if (lg_use_remote()) tprintf("Online repository:\n%s\n", lg_url);
+        else if (lg_find_repo(&repo)) { char sh[64]; tp_show(&repo, sh, sizeof sh); tprintf("Repository: %s\n", sh); }
+        else tputs("No repository found.\n");
+        return;
+    }
+    if (!kstrcmp(sub, "list") || !kstrcmp(sub, "ls")) {
+        if (lg_use_remote()) { lg_remote_start(LGO_LIST, 0); return; }
+        int n = lg_load(&repo);
+        if (n < 0) return;
+        char sh[64]; tp_show(&repo, sh, sizeof sh);
+        tprintf("Repository %s: %d app(s)   * = installed\n", sh, n);
+        for (int i = 0; i < n; i++) {
+            int ins = lg_installed(lg_apps[i].name);
+            const char *mark = " ";
+            if (ins >= 0) { u32 rc = lg_remote_crc(&repo, &lg_apps[i]); mark = (rc && rc != lapp_rd32(fsdata[ins] + 28)) ? "!" : "*"; }
+            tprintf("%s %-14s %-5s %s\n", mark, lg_apps[i].name, lg_apps[i].ver, lg_apps[i].desc);
+        }
+        tputs("! = newer version available (leact-get update)\n");
+        return;
+    }
+    if (!kstrcmp(sub, "info")) {
+        if (ac < 3) { tputs("Usage: leact-get info NAME\n"); return; }
+        if (lg_use_remote()) { lg_remote_start(LGO_INFO, av[2]); return; }
+        if (lg_load(&repo) < 0) return;
+        int i = lg_find(av[2]);
+        if (i < 0) { tprintf("No app called %s in the repository.\n", av[2]); return; }
+        tprintf("%s  version %s\n%s\nfile: %s\n", lg_apps[i].name, lg_apps[i].ver[0] ? lg_apps[i].ver : "?", lg_apps[i].desc, lg_apps[i].file);
+        int ins = lg_installed(lg_apps[i].name);
+        tprintf("Installed: %s\n", ins < 0 ? "no" : "yes");
+        return;
+    }
+    if (!kstrcmp(sub, "remove") || !kstrcmp(sub, "uninstall")) {
+        if (ac < 3) { tputs("Usage: leact-get remove NAME\n"); return; }
+        int ins = lg_installed(av[2]);
+        if (ins < 0) { tprintf("%s is not installed.\n", av[2]); return; }
+        char nm[FS_NAME]; kstrcpy(nm, fsdir[ins].name, sizeof nm);
+        int r = fs_delete(ins);
+        if (r < 0) tputs("Disk write failed!\n"); else tprintf("Removed %s.\n", nm);
+        return;
+    }
+    if (!kstrcmp(sub, "update") || !kstrcmp(sub, "upgrade")) {
+        if (lg_use_remote()) { lg_remote_start(LGO_UPDATE, ac > 2 ? av[2] : 0); return; }
+        if (lg_load(&repo) < 0) return;
+        int done = 0, checked = 0;
+        for (int i = 0; i < lg_n; i++) {
+            if (ac > 2 && !tp_ieq(lg_apps[i].name, av[2])) continue;
+            if (lg_installed(lg_apps[i].name) < 0) continue;
+            checked++;
+            int st = 0; const char *err = lg_install(&repo, &lg_apps[i], &st);
+            if (err) tprintf("%s: %s\n", lg_apps[i].name, err);
+            else if (st == 1) { tprintf("Updated %s\n", lg_apps[i].name); done++; }
+        }
+        if (!checked) tputs(ac > 2 ? "That app is not installed.\n" : "No installed apps to update.\n");
+        else if (!done) tputs("Everything is up to date.\n");
+        return;
+    }
+    /* install: "leact-get install NAME" or just "leact-get NAME" */
+    const char *name = (!kstrcmp(sub, "install") || !kstrcmp(sub, "get")) ? (ac > 2 ? av[2] : 0) : sub;
+    if (!name) { tputs("Usage: leact-get install NAME\n"); return; }
+    if (lg_use_remote()) { lg_remote_start(LGO_INSTALL, name); return; }
+    if (lg_load(&repo) < 0) return;
+    int i = lg_find(name);
+    if (i < 0) { tprintf("No app called %s in the repository. Try: leact-get list\n", name); return; }
+    int st = 0; const char *err = lg_install(&repo, &lg_apps[i], &st);
+    if (err) { tprintf("Could not install %s: %s\n", lg_apps[i].name, err); return; }
+    if (st == 2) tprintf("%s is already installed and up to date.\n", lg_apps[i].name);
+    else tprintf("%s %s. Start it with: run %s\n", st ? "Updated" : "Installed", lg_apps[i].name, lg_apps[i].name);
+}
 static void cmd_help(void) {
-    tputs("Commands:\n");
-    tputs(" help clear about ver uptime date mem disk\n");
-    tputs(" ls            list files\n");
-    tputs(" cat FILE      show a file\n");
-    tputs(" edit FILE     open in Notepad\n");
-    tputs(" echo T > FILE write text (>> appends)\n");
-    tputs(" rm FILE       delete (needs super)\n");
-    tputs(" calc A op B   + - * / %\n");
-    tputs(" beep [hz]     PC speaker\n");
-    tputs(" open APP      term note paint files clock\n");
-    tputs("               about install settings task calc\n");
-    tputs(" run APP       start a .lapp app\n");
-    tputs(" apps          list apps\n");
-    tputs(" appinfo APP   show app details\n");
-    tputs(" theme NAME    xp | unity | kde\n");
-    tputs(" super         toggle root mode\n");
+    tputs("Files (paths like D:\\docs\\a.txt, quotes for spaces)\n");
+    tputs(" ls [P] cd [P] pwd tree [P]   look around\n");
+    tputs(" cat head tail wc hexdump P   read a file\n");
+    tputs(" grep [-i -n -c] TEXT [P]     search\n");
+    tputs(" cp SRC NAME   copy into LeactedFS (from any drive)\n");
+    tputs(" mv OLD NEW    rename     touch NAME   new file\n");
+    tputs(" echo T > F    write (>> appends)  rm F (super)\n");
+    tputs(" edit F        open in Notepad\n");
+    tputs("Apps\n");
+    tputs(" run P  apps  appinfo P  open APP  calc A op B\n");
+    tputs(" leact-get list | install NAME | remove NAME\n");
+    tputs("Network (QEMU: -nic user,model=rtl8139)\n");
+    tputs(" ifconfig  dhcp  ping H  nslookup H\n");
+    tputs(" wget URL [NAME]   browse [URL]\n");
+    tputs(" proxy [on|off|HOST:PORT]  (https gateway)\n");
+    tputs("System\n");
+    tputs(" disk fsupgrade date uptime mem about history\n");
+    tputs(" theme xp|unity|kde  beep [hz]  super  clear\n");
     tputs(" reboot  shutdown  exit\n");
+    tputs("PgUp / PgDn scroll the output.\n");
 }
 static void run_cmd(char *line) {
     char work[ILMAX + 2]; kstrcpy(work, line, sizeof work);
     char copy[ILMAX + 2]; kstrcpy(copy, line, sizeof copy);
-    char *av[6]; int ac = split_args(work, av, 6);
+    char *av[8]; int ac = split_args(work, av, 8);
     if (!ac) return;
     for (char *p = av[0]; *p; p++) *p = klower(*p);
     const char *c = av[0];
@@ -1321,14 +2219,32 @@ static void run_cmd(char *line) {
         char *t = copy + 4; while (*t == ' ') t++;
         cmd_echo_redirect(t);
     }
-    else if (!kstrcmp(c, "ls") || !kstrcmp(c, "dir")) cmd_ls();
+    else if (!kstrcmp(c, "ls") || !kstrcmp(c, "dir")) cmd_ls(ac > 1 ? av[1] : 0);
+    else if (!kstrcmp(c, "cd")) cmd_cd(ac > 1 ? av[1] : 0);
+    else if (!kstrcmp(c, "pwd")) { char sh[64]; tp_show(&tcwd, sh, sizeof sh); tprintf("%s\n", sh); }
+    else if (!kstrcmp(c, "tree")) cmd_tree(ac > 1 ? av[1] : 0);
     else if (!kstrcmp(c, "cat") || !kstrcmp(c, "type")) {
         if (ac < 2) { tputs("Usage: cat FILE\n"); return; }
-        int i = fs_find(av[1]);
-        if (i < 0) { tputs("File not found.\n"); return; }
-        for (u32 k = 0; k < fsdir[i].size; k++) tputc(fsdata[i][k]);
-        if (fsdir[i].size && fsdata[i][fsdir[i].size - 1] != '\n') tputc('\n');
+        cmd_cat(av[1]);
     }
+    else if (!kstrcmp(c, "head")) cmd_head(av, ac);
+    else if (!kstrcmp(c, "tail")) cmd_tail(av, ac);
+    else if (!kstrcmp(c, "wc")) { if (ac < 2) tputs("Usage: wc FILE\n"); else cmd_wc(av[1]); }
+    else if (!kstrcmp(c, "grep")) cmd_grep(av, ac);
+    else if (!kstrcmp(c, "hexdump") || !kstrcmp(c, "hd")) {
+        if (ac < 2) { tputs("Usage: hexdump FILE [OFFSET]\n"); return; }
+        cmd_hexdump(av[1], ac > 2 ? av[2] : 0);
+    }
+    else if (!kstrcmp(c, "cp") || !kstrcmp(c, "copy")) {
+        if (ac < 3) { tputs("Usage: cp SOURCE NAME   (copies into LeactedFS)\n"); return; }
+        cmd_cp(av[1], av[2]);
+    }
+    else if (!kstrcmp(c, "mv") || !kstrcmp(c, "rename") || !kstrcmp(c, "move")) {
+        if (ac < 3) { tputs("Usage: mv OLD NEW   (LeactedFS files)\n"); return; }
+        cmd_mv(av[1], av[2]);
+    }
+    else if (!kstrcmp(c, "touch")) { if (ac < 2) tputs("Usage: touch NAME\n"); else cmd_touch(av[1]); }
+    else if (!kstrcmp(c, "history")) cmd_history();
     else if (!kstrcmp(c, "edit") || !kstrcmp(c, "notepad")) {
         if (ac >= 2) note_open_file(av[1]); else open_app(A_NOTE);
     }
@@ -1371,7 +2287,7 @@ static void run_cmd(char *line) {
             char t[16]; dtype_str(d, t, sizeof t);
             tprintf(" %c: %s  %u MB  %s\n", 'C' + d, drv[d].model, drv[d].sectors / 2048, t);
         }
-        tprintf("LeactedFS: %s\n", fs_on_disk ? "mounted from a drive" : "RAM only (use the Installer)");
+        tprintf("LeactedFS: %s\n", fs_on_disk ? (fs_ver == 1 ? "mounted from a drive (old v1: 15 files of 4 KB, see fsupgrade)" : "mounted from a drive (v2: 64 files of 128 KB)") : "RAM only (use the Installer)");
     }
     else if (!kstrcmp(c, "beep")) {
         i32 hz = 880; if (ac > 1) parse_int(av[1], &hz);
@@ -1396,6 +2312,14 @@ static void run_cmd(char *line) {
         if (ac < 2) { tputs("Usage: run APP   (see: apps)\n"); return; }
         cmd_run(av[1]);
     }
+    else if (!kstrcmp(c, "fsupgrade")) {
+        int r = fs_upgrade();
+        if (r < 0) tputs(fs_on_disk ? "Nothing to do: LeactedFS is already v2.\n" : "No LeactedFS drive is mounted.\n");
+        else if (r == 0) tputs("Could not upgrade (disk needs about 9 MB). Nothing changed.\n");
+        else { tputs("Upgraded to LeactedFS v2: 64 files of 128 KB.\n"); if (wins[A_FILES].open) fm_refresh(); }
+    }
+    else if (!kstrcmp(c, "leact-get") || !kstrcmp(c, "leactget")) cmd_leactget(av, ac);
+    else if (net_command(c, av, ac)) { }
     else if (!kstrcmp(c, "apps")) cmd_apps();
     else if (!kstrcmp(c, "appinfo")) {
         if (ac < 2) { tputs("Usage: appinfo APP\n"); return; }
@@ -1424,13 +2348,17 @@ static void term_commit(void) {
     tputs(prompt()); tputs(iline); tputc('\n');
     char cmd[ILMAX + 1]; kstrcpy(cmd, iline, sizeof cmd);
     if (ilen) {
-        if (nhist == 8) { memmove(hist[0], hist[1], 7 * (ILMAX + 1)); nhist--; }
+        if (nhist == NHIST) { memmove(hist[0], hist[1], (NHIST - 1) * (ILMAX + 1)); nhist--; }
         kstrcpy(hist[nhist++], iline, ILMAX + 1);
     }
     hpos = nhist; ilen = 0; iline[0] = 0;
     run_cmd(cmd);
 }
 static void term_key(int k) {
+    if (k == K_PGUP) { int mx = trow >= TR ? trow - TR + 1 : 0; tscroll += TR - 3; if (tscroll > mx) tscroll = mx; return; }
+    if (k == K_PGDN) { tscroll -= TR - 3; if (tscroll < 0) tscroll = 0; return; }
+    if (tjob) { if (k == 3) tjob_cancel(); return; }
+    tscroll = 0;
     if (k >= 32 && k < 127) { if (ilen < ILMAX) { iline[ilen++] = k; iline[ilen] = 0; } }
     else if (k == '\b') { if (ilen) iline[--ilen] = 0; }
     else if (k == '\n') term_commit();
@@ -1446,14 +2374,20 @@ static const u32 term_cols[4] = { RGB(120, 230, 120), RGB(210, 210, 210), RGB(25
 static void term_draw(int x, int y, int w, int h) {
     rect(x, y, w, h, RGB(12, 12, 12));
     u32 tfg = term_cols[term_color_idx];
-    for (int r = 0; r < TR && r <= trow; r++)
-        if (r < trow) draw_str(x + 6, y + 6 + r * 10, tg[r], tfg);
-    /* current output row may hold partial text (no newline yet) */
-    if (tcol) draw_str(x + 6, y + 6 + trow * 10, tg[trow], tfg);
-    int px = x + 6 + tcol * 8, py = y + 6 + trow * 10;
-    px = draw_str(px, py, prompt(), RGB(80, 255, 80));
-    px = draw_str(px, py, iline, RGB(230, 230, 230));
-    if ((ticks / 50) & 1) rect(px, py, 8, 8, RGB(230, 230, 230));
+    int top = trow >= TR ? trow - TR + 1 : 0;
+    top -= tscroll; if (top < 0) top = 0;
+    for (int r = top; r < top + TR && r <= trow; r++) {
+        int py = y + 6 + (r - top) * 10;
+        if (r < trow || tcol) draw_str(x + 6, py, tg[r], tfg);
+        if (r == trow && !tjob) {
+            int px = x + 6 + tcol * 8;
+            px = draw_str(px, py, prompt(), RGB(80, 255, 80));
+            int avail = TC - tcol - slen(prompt()) - 1, il = slen(iline);
+            px = draw_str(px, py, il > avail && avail > 0 ? iline + il - avail : iline, RGB(230, 230, 230));
+            if ((ticks / 50) & 1) rect(px, py, 8, 8, RGB(230, 230, 230));
+        }
+    }
+    if (tscroll) draw_str(x + w - 8 * 8 - 14, y + 6, "[scroll]", RGB(255, 200, 80));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1836,7 +2770,6 @@ static void ow_key(int k) {
 /* ------------------------------------------------------------------ */
 /* File manager: drives, folders, files                                */
 /* ------------------------------------------------------------------ */
-#define FM_RAM 4                        /* pseudo drive R: (files held in RAM) */
 #define FM_ROWS 22
 static int fm_drive = -1, fm_depth, fm_n, fm_sel = -1, fm_scroll;
 static u32 fm_stack[16];
@@ -1918,11 +2851,11 @@ static void fm_import(void) {
     struct dent *e = &fm_ents[fm_sel];
     static u8 tmp[FS_SLOT];
     struct fref f = { 2, fm_drive, e->cluster, e->size, "" };
-    u32 n = fref_load(&f, tmp, FS_SLOT);
+    u32 n = fref_load(&f, tmp, fs_slot_limit);
     int i = fs_create(e->name);
-    if (i < 0) { kstrcpy(fm_msg, "LeactedFS is full (15 files).", sizeof fm_msg); return; }
+    if (i < 0) { ksnprintf(fm_msg, sizeof fm_msg, "LeactedFS is full (%d files).", fs_max_files); return; }
     int r = fs_store(i, tmp, n);
-    char b[64]; ksnprintf(b, sizeof b, "%s%s %s", r < 0 ? "Disk error: " : "Imported ", fsdir[i].name, e->size > FS_SLOT ? "(cut to 4 KB)" : "");
+    char b[64]; ksnprintf(b, sizeof b, "%s%s %s", r < 0 ? "Disk error: " : "Imported ", fsdir[i].name, e->size > fs_slot_limit ? (fs_slot_limit > 4096 ? "(cut to 128 KB)" : "(cut to 4 KB)") : "");
     kstrcpy(fm_msg, b, sizeof fm_msg);
 }
 static void fm_delete(void) {
@@ -2066,7 +2999,7 @@ static void about_draw(int x, int y, int w, int h) {
     else drawf(x + 14, y + 156, C_TEXT, "Memory  : unknown");
     if (n_drives()) drawf(x + 14, y + 170, C_TEXT, "Disk    : %d drive(s)", n_drives());
     else drawf(x + 14, y + 170, C_TEXT, "Disk    : none detected");
-    drawf(x + 14, y + 184, C_TEXT, "FS      : %s", fs_on_disk ? "LeactedFS v1" : "none");
+    drawf(x + 14, y + 184, C_TEXT, "FS      : %s", fs_on_disk ? (fs_ver == 1 ? "LeactedFS v1 (small)" : "LeactedFS v2") : "none");
     drawf(x + 14, y + 198, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
     drawf(x + 14, y + 212, C_TEXT, "Mode    : %s", is_root ? "super (root)" : "normal");
     button(x + w - 74, y + h - 30, 62, 22, "OK", 0);
@@ -2111,7 +3044,8 @@ static void install_draw(int x, int y, int w, int h) {
     if (ty == DT_FAT) draw_str(x + 12, y + 130, "This drive has FAT files: they will be ERASED!", RGB(190, 0, 0));
     else if (ty == DT_LEACTED) draw_str(x + 12, y + 130, "Already LeactedFS (it will be reset)", RGB(160, 100, 0));
     else draw_str(x + 12, y + 130, "Drive is empty / unformatted", C_TEXT);
-    draw_str(x + 12, y + 144, "Files in RAM are copied to the drive.", C_TEXT);
+    if (inst_sel >= 0 && drv[inst_sel].sectors < FS2_MIN_SECTORS) draw_str(x + 12, y + 144, "Too small: needs about 9 MB or more.", RGB(190, 0, 0));
+    else draw_str(x + 12, y + 144, "Files in RAM are copied to the drive.", C_TEXT);
     button(x + w / 2 - 74, y + 164, 148, 26, inst_state == 1 ? "Click again to erase" : "Install Now", 0);
     if (inst_state == 2) draw_str_c(x + w / 2, y + 202, "Install successful!", RGB(0, 130, 0));
     if (inst_state == 3) draw_str_c(x + w / 2, y + 202, "Install FAILED", RGB(200, 0, 0));
@@ -2126,6 +3060,7 @@ static void install_click(int rx, int ry) {
         row++;
     }
     if (inrect(rx, ry, w / 2 - 74, 164, 148, 26)) {
+        if (inst_sel < 0 || drv[inst_sel].sectors < FS2_MIN_SECTORS) { inst_state = 3; return; }
         if (inst_state != 1) { inst_state = 1; return; }
         inst_state = fs_install(inst_sel) ? 2 : 3;
         if (inst_state == 2 && wins[A_FILES].open) fm_pick_drive(fs_drive);
@@ -2141,7 +3076,7 @@ static void settings_save(void) {
     char b[64];
     int n = ksnprintf(b, sizeof b, "theme=%d\nicons=%d\nterm=%d\n", th_id, show_icons, term_color_idx);
     int i = fs_create("SETTINGS.CFG");
-    if (i < 0) { kstrcpy(set_msg, "Not saved (15 files max)", sizeof set_msg); return; }
+    if (i < 0) { kstrcpy(set_msg, "Not saved (disk full)", sizeof set_msg); return; }
     int r = fs_store(i, b, n);
     kstrcpy(set_msg, r == 0 ? "Saved to disk." : r == 1 ? "Applied (RAM only)." : "Disk error!", sizeof set_msg);
 }
@@ -2251,7 +3186,7 @@ static void task_draw(int x, int y, int w, int h) {
     if (fill < 2) fill = 2;
     rect(x + 12, y + 242, bw, 8, C_LIGHT); frame(x + 12, y + 242, bw, 8, C_DARK);
     rect(x + 13, y + 243, fill > bw - 2 ? bw - 2 : fill, 6, RGB(60, 170, 70));
-    drawf(x + 12, y + 256, C_TEXT, "Files   : %d / %d", fs_count(), FS_MAX);
+    drawf(x + 12, y + 256, C_TEXT, "Files   : %d / %d", fs_count(), fs_max_files);
     drawf(x + 12, y + 270, C_TEXT, "Disk    : %d drive(s), LeactedFS %s", n_drives(), fs_on_disk ? "on disk" : "in RAM");
     drawf(x + 12, y + 284, C_TEXT, "Display : 640x480  %u fps  [%s]", fps, themes[th_id].name);
 }
@@ -2394,6 +3329,637 @@ static void calc_key(int k) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Network commands (run as background jobs) and the Browser           */
+/* ------------------------------------------------------------------ */
+static int tj_stage, tj_sent, tj_ok, tj_wait;
+static u32 tj_t, tj_ip;
+static char tj_host[100], tj_save[24];
+
+static void net_hint(void) { tputs("No network card found.\nStart QEMU with: -nic user,model=rtl8139\n"); }
+static int net_job_ok(void) {
+    if (!net_have_nic) { net_hint(); return 0; }
+    if (tjob || http_active()) { tputs("The network is busy. Wait, or press Ctrl+C.\n"); return 0; }
+    return 1;
+}
+/* 1 = we have an address, 0 = still waiting, -1 = DHCP failed */
+static int tj_wait_net(void) {
+    if (net_ip) return 1;
+    if (dhcp_state == 0) dhcp_start();
+    return dhcp_state == 4 ? -1 : 0;
+}
+static void tjob_cancel(void) {
+    if (tjob == TJ_WGET || tjob == TJ_LGET) http_cancel();
+    tjob = TJ_NONE;
+    tputs("^C\n");
+}
+static void dl_name(char *out, int max, const char *url, const char *given) {
+    if (given && given[0]) { kstrcpy(out, given, max); return; }
+    const char *p = url; int slash = 0;
+    for (const char *c = url; *c && *c != '?' && *c != '#'; c++) {
+        if (c[0] == ':' && c[1] == '/' && c[2] == '/') { p = c + 3; slash = 0; continue; }
+        if (*c == '/') { if (!slash && p != url && c >= p) { slash = 1; } p = c + 1; }
+    }
+    char seg[32]; int l = 0;
+    for (const char *c = p; *c && *c != '?' && *c != '#' && l < 23; c++) seg[l++] = *c;
+    seg[l] = 0;
+    for (int i = 0; i < l; i++) { char ch = seg[i]; if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '_')) seg[i] = '_'; }
+    /* a bare host name ("http://example.com") has no file name */
+    int has_path = 0; for (const char *c = url; *c && *c != '?' && *c != '#'; c++) if (*c == '/' && c[1] != '/' && c > url && c[-1] != '/') has_path = 1;
+    if (!l || !has_path) kstrcpy(seg, "index.html", sizeof seg);
+    kstrcpy(out, seg, max);
+}
+static int dl_save(const char *name, char *msg, int mmax) {
+    int i = fs_create(name);
+    if (i < 0) { ksnprintf(msg, mmax, "LeactedFS is full - could not save %s", name); return -1; }
+    u32 n = http_len > FS_SLOT ? FS_SLOT : http_len;
+    int r = fs_store(i, http_body, n);
+    if (r < 0) { ksnprintf(msg, mmax, "Disk write failed saving %s", name); return -1; }
+    ksnprintf(msg, mmax, "Saved %s (%u bytes)%s", fsdir[i].name, n, http_len > n ? ", cut at 128 KB" : "");
+    return 0;
+}
+static void cmd_ifconfig(void) {
+    if (!net_have_nic) { net_hint(); return; }
+    char b[20];
+    tprintf("MAC      %02x:%02x:%02x:%02x:%02x:%02x\n", net_mac[0], net_mac[1], net_mac[2], net_mac[3], net_mac[4], net_mac[5]);
+    net_fmt_ip(b, net_ip); tprintf("Address  %s\n", net_ip ? b : "(none)");
+    net_fmt_ip(b, net_mask); tprintf("Mask     %s\n", net_ip ? b : "(none)");
+    net_fmt_ip(b, net_gw); tprintf("Gateway  %s\n", net_gw ? b : "(none)");
+    net_fmt_ip(b, net_dns); tprintf("DNS      %s\n", net_dns ? b : "(none)");
+    tprintf("DHCP     %s\n", dhcp_state == 3 ? "bound" : dhcp_state == 4 ? "failed" : dhcp_state == 0 ? "idle" : "working...");
+    tprintf("Packets  in %u  out %u  dropped %u\n", net_stat_rx, net_stat_tx, net_stat_drop);
+}
+static void cmd_dhcp(void) {
+    if (!net_job_ok()) return;
+    dhcp_start(); tjob = TJ_DHCP; tj_t = net_ms();
+    tputs("Asking for an address...\n");
+}
+static void cmd_ping(char **av, int ac) {
+    if (ac < 2) { tputs("Usage: ping HOST\n"); return; }
+    if (!net_job_ok()) return;
+    kstrcpy(tj_host, av[1], sizeof tj_host);
+    tjob = TJ_PING; tj_stage = 0; tj_sent = 0; tj_ok = 0; tj_wait = 0; tj_t = net_ms();
+}
+static void cmd_nslookup(char **av, int ac) {
+    if (ac < 2) { tputs("Usage: nslookup HOST\n"); return; }
+    if (!net_job_ok()) return;
+    kstrcpy(tj_host, av[1], sizeof tj_host);
+    tjob = TJ_LOOKUP; tj_stage = 0; tj_t = net_ms();
+}
+static void cmd_wget(char **av, int ac) {
+    if (ac < 2) { tputs("Usage: wget URL [NAME]\n"); return; }
+    if (!net_job_ok()) return;
+    tj_save[0] = 0; if (ac > 2) kstrcpy(tj_save, av[2], sizeof tj_save);
+    http_start(av[1]); tjob = TJ_WGET; tj_t = net_ms();
+    tputs("Downloading... (Ctrl+C stops)\n");
+}
+static void tjob_tick(void) {
+    if (!tjob) return;
+    u32 now = net_ms(); char b[20];
+    switch (tjob) {
+    case TJ_DHCP:
+        if (dhcp_state == 3) { net_fmt_ip(b, net_ip); tprintf("Address %s\n", b); tjob = TJ_NONE; }
+        else if (dhcp_state == 4) { tputs("No DHCP answer.\n"); tjob = TJ_NONE; }
+        break;
+    case TJ_LOOKUP:
+        if (tj_stage == 0) {
+            int r = tj_wait_net();
+            if (r < 0) { tputs("No network address (DHCP failed).\n"); tjob = TJ_NONE; }
+            else if (r > 0) { dns_start(tj_host); tj_stage = 1; }
+        } else if (dns_state == 2) { net_fmt_ip(b, dns_ip); tprintf("%s has address %s\n", tj_host, b); tjob = TJ_NONE; }
+        else if (dns_state == 3) { tprintf(dns_nx ? "Host not found: %s\n" : "Lookup failed: %s\n", tj_host); tjob = TJ_NONE; }
+        break;
+    case TJ_PING:
+        if (tj_stage == 0) {
+            int r = tj_wait_net();
+            if (r < 0) { tputs("No network address (DHCP failed).\n"); tjob = TJ_NONE; }
+            else if (r > 0) { dns_start(tj_host); tj_stage = 1; }
+        } else if (tj_stage == 1) {
+            if (dns_state == 2) { tj_ip = dns_ip; net_fmt_ip(b, tj_ip); tprintf("Pinging %s [%s]\n", tj_host, b); tj_stage = 2; tj_t = now - 1000; }
+            else if (dns_state == 3) { tprintf("Cannot find %s\n", tj_host); tjob = TJ_NONE; }
+        } else {
+            if (!tj_wait && tj_sent < 4 && now - tj_t >= 1000) { ping_send(tj_ip, (u16)(++tj_sent)); tj_wait = 1; tj_t = now; }
+            if (tj_wait) {
+                if (ping_got == tj_sent) {
+                    net_fmt_ip(b, ping_from);
+                    if (ping_rtt < 10) tprintf("Reply from %s: time<10ms\n", b); else tprintf("Reply from %s: time=%ums\n", b, ping_rtt);
+                    tj_ok++; tj_wait = 0;
+                } else if (now - tj_t >= 2000) { tputs("Request timed out.\n"); tj_wait = 0; }
+            }
+            if (!tj_wait && tj_sent >= 4) { tprintf("%d sent, %d received\n", tj_sent, tj_ok); tjob = TJ_NONE; }
+        }
+        break;
+    case TJ_LGET: lg_job_tick(); break;
+    case TJ_WGET:
+        if (http_active()) break;
+        if (http_st == H_ERR) tprintf("Failed: %s\n", http_msg);
+        else {
+            char nm[24], msg[80];
+            dl_name(nm, sizeof nm, http_url, tj_save);
+            if (http_code >= 400) tprintf("The server answered %d - saving anyway.\n", http_code);
+            dl_save(nm, msg, sizeof msg); tputs(msg); tputc('\n');
+            int l = slen(nm);
+            if (l > 5 && !kstrcmp(nm + l - 5, ".lapp")) tputs("Start it with: run NAME\n");
+        }
+        tjob = TJ_NONE;
+        break;
+    }
+}
+
+/* ---------------------------- Browser ------------------------------ */
+#define BR_TXT 98304
+#define BR_ROWS 4000
+#define BR_LINKS 200
+#define BR_TB 30                    /* toolbar height */
+#define BR_SB 18                    /* status bar height */
+enum { BK_NORMAL, BK_H1, BK_H2, BK_H3, BK_PRE, BK_HR };
+struct brow { u32 off; u16 len; u8 kind, indent; };
+static char br_t[BR_TXT]; static u8 br_lk[BR_TXT], br_bd[BR_TXT];
+static struct brow br_rows[BR_ROWS];
+static int br_nrows, br_col, br_lastsp, br_cols = 70, br_full, br_txt_lim = BR_TXT - 64, br_row_lim = BR_ROWS - 4;
+static u32 br_n, br_rs;
+static int br_bk, br_ind, br_pre, br_bold, br_cur_link, br_intitle, br_depth, br_ol[4], br_cnt[4];
+static char br_links[BR_LINKS][160]; static int br_nlinks;
+static char br_title[64], br_base[320], br_url[320], br_addr[320], br_status[80], br_wtitle[96];
+static char br_hist[12][320];
+static int br_nh, br_alen, br_focus = 1, br_scroll, br_sel = 1;     /* br_sel: the address bar text is selected */
+
+static void br_push(u32 off, int len, int kind, int ind) {
+    if (br_nrows >= br_row_lim) { br_full = 1; return; }
+    br_rows[br_nrows].off = off; br_rows[br_nrows].len = (u16)len; br_rows[br_nrows].kind = (u8)kind; br_rows[br_nrows].indent = (u8)ind;
+    br_nrows++;
+}
+static void br_endrow(void) {
+    int len = (int)(br_n - br_rs);
+    if (!br_pre) while (len > 0 && br_t[br_rs + (u32)len - 1] == ' ') len--;
+    if (len > 0 || (br_pre && br_n > br_rs)) br_push(br_rs, len, br_bk, br_ind);
+    br_rs = br_n; br_col = 0; br_lastsp = -1;
+}
+static void br_blank(void) {
+    br_endrow();
+    if (br_nrows && br_rows[br_nrows - 1].len) br_push(br_n, 0, 0, 0);
+}
+static void br_put(unsigned char c) {
+    if (br_full || br_n >= (u32)br_txt_lim) { br_full = 1; return; }
+    if (br_intitle) {
+        int l = slen(br_title);
+        if (c < 32) c = ' ';
+        if (!(c == ' ' && (l == 0 || br_title[l - 1] == ' ')) && l < 62) { br_title[l] = (char)c; br_title[l + 1] = 0; }
+        return;
+    }
+    if (br_pre) {
+        if (c == '\r') return;
+        if (c == '\n') { if (br_n == br_rs) br_push(br_n, 0, br_bk, br_ind); else br_endrow(); return; }
+        if (c == '\t') { for (int k = 0; k < 4; k++) br_put(' '); return; }
+    } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+        if (br_n == br_rs || br_t[br_n - 1] == ' ') return;
+        c = ' ';
+    }
+    if (c < 32 || c > 126) c = '?';
+    br_t[br_n] = (char)c; br_lk[br_n] = (u8)br_cur_link; br_bd[br_n] = (u8)(br_bold > 0);
+    br_n++; br_col++;
+    if (c == ' ' && !br_pre) br_lastsp = (int)br_n - 1;
+    int limit = (br_cols - br_ind) / (br_bk == BK_H1 ? 2 : 1);
+    if (limit < 8) limit = 8;
+    if (br_col > limit) {
+        if (!br_pre && br_lastsp >= (int)br_rs) {
+            br_push(br_rs, br_lastsp - (int)br_rs, br_bk, br_ind);
+            br_rs = (u32)br_lastsp + 1; br_col = (int)(br_n - br_rs); br_lastsp = -1;
+        } else {
+            br_push(br_rs, (int)(br_n - 1 - br_rs), br_bk, br_ind);
+            br_rs = br_n - 1; br_col = 1; br_lastsp = -1;
+        }
+    }
+}
+static void br_text(const char *s) { while (*s) br_put((unsigned char)*s++); }
+static void br_cp(u32 cp) {
+    if (cp < 128) { br_put((unsigned char)cp); return; }
+    switch (cp) {
+    case 0xA0: br_put(' '); break;
+    case 0x2018: case 0x2019: case 0x2032: br_put('\''); break;
+    case 0x201C: case 0x201D: br_put('"'); break;
+    case 0x2013: case 0x2014: br_put('-'); break;
+    case 0x2026: br_text("..."); break;
+    case 0x2022: case 0xB7: br_put('*'); break;
+    case 0xA9: br_text("(c)"); break;
+    case 0xAB: br_text("<<"); break;
+    case 0xDF: br_text("ss"); break;
+    case 0xBB: br_text(">>"); break;
+    default:
+        if (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7) {      /* accented Latin letters -> plain letters */
+            static const char base[] = "AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+            br_put((unsigned char)base[cp - 0xC0]);
+        } else br_put('?');
+    }
+}
+static u32 br_entity(const u8 *d, u32 n, u32 i, u32 *adv) {       /* d[i] == '&'; 0 if it is not an entity */
+    u32 j = i + 1; char nm[10]; int l = 0;
+    while (j < n && d[j] != ';' && l < 9 && d[j] > ' ') nm[l++] = (char)d[j++];
+    if (j >= n || d[j] != ';' || !l) return 0;
+    nm[l] = 0; *adv = j - i + 1;
+    if (nm[0] == '#') {
+        u32 v = 0;
+        if (nm[1] == 'x' || nm[1] == 'X') { for (int k = 2; k < l; k++) { char c = nm[k]; v = v * 16 + (u32)(c <= '9' ? c - '0' : (c | 32) - 'a' + 10); } }
+        else for (int k = 1; k < l; k++) v = v * 10 + (u32)(nm[k] - '0');
+        return v ? v : '?';
+    }
+    static const struct { const char *n; u32 cp; } tab[] = {
+        { "amp", '&' }, { "lt", '<' }, { "gt", '>' }, { "quot", '"' }, { "apos", '\'' }, { "nbsp", 0xA0 }, { "copy", 0xA9 },
+        { "mdash", 0x2014 }, { "ndash", 0x2013 }, { "hellip", 0x2026 }, { "laquo", 0xAB }, { "raquo", 0xBB },
+        { "lsquo", 0x2018 }, { "rsquo", 0x2019 }, { "ldquo", 0x201C }, { "rdquo", 0x201D }, { "bull", 0x2022 }, { "middot", 0xB7 },
+    };
+    for (unsigned k = 0; k < sizeof tab / sizeof tab[0]; k++) if (!kstrcmp(nm, tab[k].n)) return tab[k].cp;
+    return '?';
+}
+static u32 br_utf8(const u8 *d, u32 n, u32 i, u32 *adv) {
+    u8 c = d[i]; int l = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    u32 cp = l == 2 ? (u32)(c & 0x1F) : l == 3 ? (u32)(c & 0x0F) : l == 4 ? (u32)(c & 7) : c;
+    if (l > 1 && i + (u32)l > n) l = 1;
+    for (int k = 1; k < l; k++) { if ((d[i + (u32)k] & 0xC0) != 0x80) { l = 1; break; } cp = cp << 6 | (d[i + (u32)k] & 0x3F); }
+    *adv = (u32)l;
+    return l == 1 ? '?' : cp;
+}
+static int br_attr(const u8 *t, u32 len, const char *key, char *out, int max) {
+#define WS(ch) ((ch) == ' ' || (ch) == '\t' || (ch) == '\n' || (ch) == '\r')
+    u32 i = 0;
+    while (i < len && !WS(t[i]) && t[i] != '/') i++;                       /* tag name */
+    while (i < len) {
+        while (i < len && (WS(t[i]) || t[i] == '/')) i++;
+        u32 ks = i; while (i < len && t[i] != '=' && !WS(t[i]) && t[i] != '/') i++;
+        u32 ke = i;
+        while (i < len && WS(t[i])) i++;
+        u32 vs = i, ve = i; int has = 0;
+        if (i < len && t[i] == '=') {
+            i++; while (i < len && WS(t[i])) i++;
+            if (i < len && (t[i] == '"' || t[i] == '\'')) { u8 q = t[i++]; vs = i; while (i < len && t[i] != q) i++; ve = i; if (i < len) i++; }
+            else { vs = i; while (i < len && !WS(t[i])) i++; ve = i; }
+            has = 1;
+        }
+        int kl = slen(key);
+        if (has && (int)(ke - ks) == kl) {
+            int eq = 1; for (int k = 0; k < kl; k++) if (klower((char)t[ks + (u32)k]) != key[k]) eq = 0;
+            if (eq) { int l = 0; for (u32 k = vs; k < ve && l < max - 1; k++) out[l++] = (char)t[k]; out[l] = 0; return 1; }
+        }
+    }
+    return 0;
+#undef WS
+}
+static void br_tag(const u8 *t, u32 len) {
+    int closing = 0; u32 i = 0;
+    if (len && t[0] == '/') { closing = 1; i = 1; }
+    char nm[12]; int nl = 0;
+    while (i < len && nl < 11 && ((t[i] >= 'a' && t[i] <= 'z') || (t[i] >= 'A' && t[i] <= 'Z') || (t[i] >= '0' && t[i] <= '9'))) nm[nl++] = klower((char)t[i++]);
+    nm[nl] = 0;
+    if (!nl) return;
+#define IS(x) (!kstrcmp(nm, x))
+    if (IS("br")) { if (br_n == br_rs) br_push(br_n, 0, br_bk, br_ind); else br_endrow(); }
+    else if (nl == 2 && nm[0] == 'h' && nm[1] >= '1' && nm[1] <= '6') {
+        br_blank(); br_bk = closing ? BK_NORMAL : nm[1] == '1' ? BK_H1 : nm[1] <= '3' ? BK_H2 : BK_H3; br_bold = closing ? 0 : 1;
+    }
+    else if (IS("ul") || IS("ol")) {
+        if (!closing) { if (br_depth < 4) { br_ol[br_depth] = IS("ol"); br_cnt[br_depth] = 0; br_depth++; br_ind += 2; } br_endrow(); }
+        else { br_endrow(); if (br_depth > 0) { br_depth--; br_ind -= 2; } if (br_depth == 0) br_blank(); }
+    }
+    else if (IS("li")) {
+        if (!closing) {
+            br_endrow();
+            char b[12]; int d = br_depth > 0 ? br_depth - 1 : 0;
+            if (br_depth && br_ol[d]) ksnprintf(b, sizeof b, "%d. ", ++br_cnt[d]); else kstrcpy(b, "* ", sizeof b);
+            br_text(b);
+        }
+    }
+    else if (IS("blockquote")) { br_blank(); br_ind += closing ? -4 : 4; if (br_ind < 0) br_ind = 0; if (br_ind > 24) br_ind = 24; }
+    else if (IS("p") || IS("dl") || IS("form") || IS("center") || IS("table")) br_blank();
+    else if (IS("div") || IS("section") || IS("article") || IS("header") || IS("footer") || IS("nav") || IS("main") || IS("aside") ||
+             IS("address") || IS("figure") || IS("figcaption") || IS("details") || IS("summary") || IS("dt") || IS("dd")) br_endrow();
+    else if (IS("tr")) br_endrow();
+    else if (IS("td") || IS("th")) { if (!closing) { if (br_n > br_rs) br_text(" | "); if (IS("th")) br_bold = 1; } else if (IS("th")) br_bold = 0; }
+    else if (IS("pre")) { br_blank(); br_pre = !closing; br_bk = closing ? BK_NORMAL : BK_PRE; }
+    else if (IS("hr")) { br_blank(); br_push(br_n, 0, BK_HR, 0); }
+    else if (IS("b") || IS("strong")) { br_bold += closing ? -1 : 1; if (br_bold < 0) br_bold = 0; }
+    else if (IS("title")) br_intitle = !closing;
+    else if (IS("a")) {
+        if (closing) br_cur_link = 0;
+        else {
+            char h[200];
+            br_cur_link = 0;
+            if (br_attr(t, len, "href", h, sizeof h) && h[0] && h[0] != '#' && !n_starts(h, "javascript:") && !n_starts(h, "mailto:") && br_nlinks < BR_LINKS - 1) {
+                url_join(br_base, h, br_links[br_nlinks + 1], sizeof br_links[0]);
+                br_cur_link = ++br_nlinks;
+            }
+        }
+    }
+    else if (IS("img")) {
+        char alt[60];
+        if (!br_attr(t, len, "alt", alt, sizeof alt) || !alt[0]) kstrcpy(alt, "image", sizeof alt);
+        br_put('['); br_text(alt); br_put(']');
+    }
+#undef IS
+}
+static void br_html(const u8 *d, u32 n) {
+    u32 i = 0;
+    while (i < n && !br_full) {
+        u8 c = d[i];
+        if (c == '<' && i + 1 < n && (d[i + 1] == '!' || d[i + 1] == '/' || d[i + 1] == '?' || ((d[i + 1] | 32) >= 'a' && (d[i + 1] | 32) <= 'z'))) {
+            if (d[i + 1] == '!' && i + 3 < n && d[i + 2] == '-' && d[i + 3] == '-') {          /* comment */
+                i += 4; while (i + 2 < n && !(d[i] == '-' && d[i + 1] == '-' && d[i + 2] == '>')) i++;
+                i += 3; continue;
+            }
+            u32 j = i + 1; u8 q = 0;
+            while (j < n) { if (q) { if (d[j] == q) q = 0; } else if (d[j] == '"' || d[j] == '\'') q = d[j]; else if (d[j] == '>') break; j++; }
+            if (d[i + 1] != '!' && d[i + 1] != '?') {
+                br_tag(d + i + 1, j > i + 1 ? j - i - 1 : 0);
+                int sc = n_starts((const char *)d + i + 1, "script"), st = n_starts((const char *)d + i + 1, "style");
+                if (sc || st) {                                                              /* skip the code */
+                    const char *end = sc ? "</script" : "</style";
+                    u32 k = j + 1;
+                    while (k < n && !(d[k] == '<' && n_starts((const char *)d + k, end))) k++;
+                    while (k < n && d[k] != '>') k++;
+                    i = k + 1; continue;
+                }
+            }
+            i = j + 1; continue;
+        }
+        if (c == '&') { u32 adv = 0, cp = br_entity(d, n, i, &adv); if (cp) { br_cp(cp); i += adv; continue; } }
+        if (c >= 0x80) { u32 adv = 1, cp = br_utf8(d, n, i, &adv); br_cp(cp); i += adv; continue; }
+        br_put(c); i++;
+    }
+}
+static void br_reset_page(void) {
+    br_n = br_rs = 0; br_nrows = 0; br_col = 0; br_lastsp = -1; br_full = 0; br_bk = BK_NORMAL; br_ind = 0; br_pre = 0; br_bold = 0;
+    br_cur_link = 0; br_intitle = 0; br_depth = 0; br_nlinks = 0; br_title[0] = 0; br_scroll = 0;
+    br_txt_lim = BR_TXT - 64; br_row_lim = BR_ROWS - 4;
+}
+static void br_notice(const char *msg) {          /* a line after the page, even when the page filled the buffers */
+    br_endrow(); br_txt_lim = BR_TXT - 2; br_row_lim = BR_ROWS; br_full = 0;
+    br_blank(); br_text(msg); br_endrow();
+}
+static void br_set_title(void) {
+    if (br_title[0]) ksnprintf(br_wtitle, sizeof br_wtitle, "%s - Browser", br_title); else kstrcpy(br_wtitle, "Browser", sizeof br_wtitle);
+    wins[A_BROWSER].title = br_wtitle;
+}
+static void br_layout(const u8 *d, u32 n, int html, const char *base) {
+    br_reset_page();
+    br_cols = (CW(A_BROWSER) - 16 - 8) / 8;
+    kstrcpy(br_base, base, sizeof br_base);
+    if (html) br_html(d, n);
+    else { br_pre = 1; br_bk = BK_PRE; for (u32 i = 0; i < n && !br_full; i++) br_put(d[i]); }
+    br_endrow(); br_pre = 0; br_bk = BK_NORMAL;
+    if (!br_nrows) { br_push(br_n, 0, 0, 0); }
+    br_set_title();
+}
+static void br_show_html(const char *html, const char *url) {
+    br_layout((const u8 *)html, (u32)slen(html), 1, url);
+    kstrcpy(br_url, url, sizeof br_url); kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
+}
+static void br_show_home(void) {
+    static const char home[] =
+        "<html><title>LeactedOS Browser</title><body><h1>LeactedOS Browser</h1>"
+        "<p>Type an address above and press Enter. Words without a dot are searched for.</p>"
+        "<p><b>Plain http:// sites only.</b> HTTPS needs a TLS stack, which LeactedOS does not have yet, "
+        "so many modern sites will not open.</p><hr><h2>Sites that may work</h2><ul>"
+        "<li><a href=\"http://example.com/\">example.com</a></li>"
+        "<li><a href=\"http://neverssl.com/\">neverssl.com</a> - a site that never uses https</li>"
+        "<li><a href=\"http://info.cern.ch/\">info.cern.ch</a> - the first website</li>"
+        "<li><a href=\"http://frogfind.com/\">frogfind.com</a> - a search engine for simple browsers</li></ul>"
+        "<h2>Keys</h2><pre>Up/Down/PgUp/PgDn  scroll\nBackspace          back\nEnter              go (in the address bar)\nCtrl+C / Esc       stop loading</pre>"
+        "</body></html>";
+    br_show_html(home, "about:home");
+    kstrcpy(br_status, "Welcome", sizeof br_status);
+}
+static void br_show_message(const char *head, const char *msg, const char *url) {
+    char tmp[600];
+    ksnprintf(tmp, sizeof tmp, "<html><title>%s</title><body><h2>%s</h2><p>%s</p><p>%s</p></body></html>", head, head, msg, url);
+    br_show_html(tmp, "about:error");
+    kstrcpy(br_url, url, sizeof br_url); kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
+}
+static int br_is_text_type(const char *ct) {
+    return !ct[0] || n_starts(ct, "text/") || n_starts(ct, "application/xhtml") || n_starts(ct, "application/json") ||
+           n_starts(ct, "application/xml") || n_starts(ct, "application/javascript");
+}
+static void br_show_http(void) {
+    char url[320]; kstrcpy(url, http_url, sizeof url);
+    http_body[http_len] = 0;
+    if (!br_is_text_type(http_ctype)) {
+        char nm[24], msg[100], page[400];
+        dl_name(nm, sizeof nm, url, 0);
+        dl_save(nm, msg, sizeof msg);
+        ksnprintf(page, sizeof page, "<h2>Download</h2><p>This is not a web page (%s).</p><p>%s</p><p>Open it from the File Manager.</p>", http_ctype, msg);
+        br_show_html(page, "about:download");
+        kstrcpy(br_url, url, sizeof br_url); kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
+        kstrcpy(br_status, msg, sizeof br_status);
+        return;
+    }
+    int html = n_starts(http_ctype, "text/html") || n_starts(http_ctype, "application/xhtml");
+    if (!html && !n_starts(http_ctype, "text/plain") && http_ctype[0] == 0) {
+        for (u32 i = 0; i < http_len && i < 512; i++) { if (http_body[i] == '<') { html = 1; break; } if (http_body[i] > ' ') break; }
+    }
+    br_layout(http_body, http_len, html, url);
+    if (http_trunc || br_full) br_notice("[Page cut off - too big]");
+    kstrcpy(br_url, url, sizeof br_url); kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
+    if (http_code >= 400) ksnprintf(br_status, sizeof br_status, "Server says %d  (%u bytes)", http_code, http_len);
+    else ksnprintf(br_status, sizeof br_status, "Done  (%u bytes)", http_len);
+}
+static void br_search_url(char *out, int max, const char *q) {
+    int o = 0; const char *pre = "http://frogfind.com/?q=";
+    while (*pre && o < max - 1) out[o++] = *pre++;
+    for (; *q && o < max - 4; q++) {
+        char c = *q;
+        if (c == ' ') out[o++] = '+';
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') out[o++] = c;
+        else { out[o++] = '%'; out[o++] = "0123456789ABCDEF"[(u8)c >> 4]; out[o++] = "0123456789ABCDEF"[(u8)c & 15]; }
+    }
+    out[o] = 0;
+}
+static void br_go(const char *in, int push) {
+    char url[330];
+    while (*in == ' ') in++;
+    if (!*in) return;
+    if (!kstrcmp(in, "about:home")) { br_show_home(); br_focus = 1; br_sel = 1; return; }
+    if (tjob || http_active()) { kstrcpy(br_status, "The network is busy - wait or press Esc", sizeof br_status); return; }
+    if (!net_have_nic) { br_show_message("No network", "No network card was found. Start QEMU with:  -nic user,model=rtl8139", in); br_focus = 1; return; }
+    int scheme = 0, dot = 0, sp = 0;
+    for (const char *c = in; *c; c++) { if (c[0] == ':' && c[1] == '/' && c[2] == '/') scheme = 1; if (*c == '.' || *c == ':') dot = 1; if (*c == ' ') sp = 1; }
+    if (scheme) kstrcpy(url, in, sizeof url);
+    else if (sp || !dot) br_search_url(url, sizeof url, in);
+    else { kstrcpy(url, "http://", sizeof url); kstrcpy(url + 7, in, (int)sizeof url - 7); }
+    if (push && br_url[0] && br_nh < 12) kstrcpy(br_hist[br_nh++], br_url, sizeof br_hist[0]);
+    else if (push && br_url[0]) { memmove(br_hist[0], br_hist[1], 11 * sizeof br_hist[0]); kstrcpy(br_hist[11], br_url, sizeof br_hist[0]); }
+    kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
+    http_start(url); br_wait = 1; br_focus = 0; br_sel = 0;
+    kstrcpy(br_status, "Starting...", sizeof br_status);
+}
+static void br_back(void) {
+    if (!br_nh) return;
+    char u[320]; kstrcpy(u, br_hist[--br_nh], sizeof u);
+    br_go(u, 0);
+}
+static void br_stop(void) {
+    if (br_wait) { http_cancel(); br_wait = 0; kstrcpy(br_status, "Stopped", sizeof br_status); }
+}
+static void br_check(void) {                    /* called every frame */
+    if (!br_wait || http_active()) return;
+    br_wait = 0;
+    if (http_st == H_DONE) br_show_http();
+    else {
+        char u[320]; kstrcpy(u, http_url, sizeof u);
+        if (!kstrcmp(http_msg, "Stopped")) { kstrcpy(br_status, "Stopped", sizeof br_status); return; }
+        br_show_message("Cannot open this page", http_msg, u);
+        kstrcpy(br_status, http_msg, sizeof br_status);
+    }
+}
+static void br_open(void) {
+    br_nh = 0; br_wait = 0; br_url[0] = 0; br_focus = 1; br_sel = 1;
+    br_show_home();
+}
+static int br_rowh(int r) { return br_rows[r].kind == BK_H1 ? 20 : 10; }
+static int br_viewh(void) { return CH(A_BROWSER) - BR_TB - BR_SB - 2; }
+static int br_maxscroll(void) {
+    int vh = br_viewh(), s = br_nrows, used = 0;
+    while (s > 0 && used + br_rowh(s - 1) <= vh) { used += br_rowh(s - 1); s--; }
+    return s;
+}
+static void br_scrollby(int d) {
+    br_scroll += d;
+    int mx = br_maxscroll();
+    if (br_scroll > mx) br_scroll = mx;
+    if (br_scroll < 0) br_scroll = 0;
+}
+static void br_draw(int x, int y, int w, int h) {
+    /* toolbar */
+    button(x + 4, y + 4, 26, 22, "<", 0);
+    int fx = x + 36, fw = w - 36 - 62;
+    rect(fx, y + 4, fw, 22, C_LIGHT); frame(fx - 1, y + 3, fw + 2, 24, C_DARK);
+    int maxc = (fw - 8) / 8;
+    const char *shown = br_addr;
+    if (br_alen > maxc) shown = br_addr + br_alen - maxc;
+    int ex;
+    if (br_focus && br_sel && br_alen) { rect(fx + 2, y + 7, br_alen * 8 + 4 > fw - 4 ? fw - 4 : br_alen * 8 + 4, 14, RGB(49, 106, 197)); ex = draw_str(fx + 4, y + 11, shown, C_LIGHT); }
+    else { ex = draw_str(fx + 4, y + 11, shown, C_BLACK); if (br_focus && ((ticks / 50) & 1)) rect(ex, y + 9, 2, 12, C_BLACK); }
+    button(x + w - 56, y + 4, 52, 22, br_wait ? "Stop" : "Go", 0);
+    /* page */
+    int vy = y + BR_TB, vh = br_viewh() + 2, vw = w - 14;
+    rect(x, vy, vw, vh, C_LIGHT);
+    int py = vy + 3;
+    for (int r = br_scroll; r < br_nrows && py + br_rowh(r) <= vy + vh + 1; r++) {
+        const struct brow *b = &br_rows[r];
+        int sc = b->kind == BK_H1 ? 2 : 1, px = x + 4 + b->indent * 8;
+        if (b->kind == BK_HR) { rect(x + 8, py + 4, vw - 16, 1, C_DARK); py += 10; continue; }
+        if (b->kind == BK_PRE) rect(x + 2, py - 1, vw - 4, 10, RGB(240, 240, 236));
+        for (int i = 0; i < b->len; i++) {
+            u32 o = b->off + (u32)i; int cx = px + i * 8 * sc;
+            if (cx > x + vw) break;
+            u32 col = br_lk[o] ? RGB(0, 0, 220) : b->kind == BK_H1 ? RGB(0, 40, 130) : b->kind <= BK_H3 && b->kind != BK_NORMAL ? RGB(20, 50, 120) : b->kind == BK_PRE ? RGB(60, 60, 60) : C_BLACK;
+            draw_char_s(cx, py, br_t[o], col, sc);
+            if (br_bd[o] && sc == 1) draw_char_s(cx + 1, py, br_t[o], col, 1);
+            if (br_lk[o]) rect(cx, py + 9 * sc - (sc > 1 ? 2 : 0), 8 * sc, 1, col);
+        }
+        py += br_rowh(r);
+    }
+    /* scrollbar */
+    int sx = x + vw;
+    rect(sx, vy, 14, vh, RGB(220, 220, 214)); frame(sx, vy, 14, vh, C_DARK);
+    int mx = br_maxscroll();
+    if (br_nrows > 0) {
+        int th = mx > 0 ? vh * (vh / 10) / (br_nrows > 1 ? br_nrows : 1) : vh - 4;
+        if (th < 14) th = 14;
+        if (th > vh - 4) th = vh - 4;
+        int ty = vy + 2 + (mx > 0 ? (vh - 4 - th) * br_scroll / mx : 0);
+        bevel(sx + 1, ty, 12, th, 0);
+    }
+    /* status */
+    int sy = y + h - BR_SB;
+    rect(x, sy, w, BR_SB, C_FACE); rect(x, sy, w, 1, C_DARK);
+    char st[100];
+    if (br_wait) ksnprintf(st, sizeof st, "%s  %u KB", http_msg, http_len / 1024); else kstrcpy(st, br_status, sizeof st);
+    draw_str(x + 6, sy + 5, st, C_BLACK);
+    if (tjob) draw_str(x + w - 140, sy + 5, "(terminal busy)", RGB(160, 60, 0));
+}
+static void br_key(int k) {
+    if (k == K_ESC || k == 3) {
+        if (br_wait) { br_stop(); return; }
+        if (br_focus) { br_focus = 0; return; }
+    }
+    if (br_focus) {
+        if (k >= 32 && k < 127) { if (br_sel) { br_alen = 0; br_addr[0] = 0; br_sel = 0; } if (br_alen < 300) { br_addr[br_alen++] = (char)k; br_addr[br_alen] = 0; } }
+        else if (k == '\b') { if (br_sel) { br_alen = 0; br_addr[0] = 0; br_sel = 0; } else if (br_alen) br_addr[--br_alen] = 0; }
+        else if (k == '\n') { char u[320]; kstrcpy(u, br_addr, sizeof u); br_go(u, 1); }
+        else if (k == K_PGUP) br_scrollby(-(br_viewh() / 10 - 1));
+        else if (k == K_PGDN) br_scrollby(br_viewh() / 10 - 1);
+        else if (k == K_UP) br_scrollby(-1);
+        else if (k == K_DOWN) br_scrollby(1);
+        return;
+    }
+    int page = br_viewh() / 10 - 1;
+    if (k == K_UP) br_scrollby(-1);
+    else if (k == K_DOWN) br_scrollby(1);
+    else if (k == K_PGUP) br_scrollby(-page);
+    else if (k == K_PGDN || k == ' ') br_scrollby(page);
+    else if (k == K_HOME) br_scrollby(-100000);
+    else if (k == K_END) br_scrollby(100000);
+    else if (k == '\b') br_back();
+    else if (k == 12 || k == '/' || k == '\n') { br_focus = 1; br_sel = 1; }
+}
+static void br_click(int rx, int ry) {
+    int w = CW(A_BROWSER);
+    if (ry < BR_TB) {
+        if (inrect(rx, ry, 4, 4, 26, 22)) br_back();
+        else if (inrect(rx, ry, w - 56, 4, 52, 22)) { if (br_wait) br_stop(); else { char u[320]; kstrcpy(u, br_addr, sizeof u); br_go(u, 1); } }
+        else if (inrect(rx, ry, 36, 4, w - 36 - 62, 22)) { if (!br_focus) br_sel = 1; br_focus = 1; }
+        return;
+    }
+    br_focus = 0;
+    int vh = br_viewh() + 2, vw = w - 14;
+    if (rx >= vw) {                                              /* scrollbar: click above/below the thumb */
+        if (ry < BR_TB + vh / 2) br_scrollby(-(br_viewh() / 10 - 1)); else br_scrollby(br_viewh() / 10 - 1);
+        return;
+    }
+    int y = BR_TB + 3;
+    for (int r = br_scroll; r < br_nrows && y < BR_TB + vh; r++) {
+        int rh = br_rowh(r);
+        if (ry >= y && ry < y + rh) {
+            const struct brow *b = &br_rows[r];
+            int sc = b->kind == BK_H1 ? 2 : 1, col = (rx - 4 - b->indent * 8) / (8 * sc);
+            if (rx >= 4 + b->indent * 8 && col >= 0 && col < b->len) {
+                int id = br_lk[b->off + (u32)col];
+                if (id) { char u[160]; kstrcpy(u, br_links[id], sizeof u); br_go(u, 1); }
+            }
+            return;
+        }
+        y += rh;
+    }
+}
+static void cmd_proxy(char **av, int ac) {
+    if (ac > 1) {
+        if (!kstrcmp(av[1], "off")) http_proxy_on = 0;
+        else if (!kstrcmp(av[1], "on")) http_proxy_on = 1;
+        else {
+            char *c = av[1]; int l = 0; while (c[l] && c[l] != ':') l++;
+            if (l < 1 || l > 22) { tputs("Usage: proxy [on|off|HOST[:PORT]]\n"); return; }
+            u32 port = 8080;
+            if (c[l] == ':') { port = 0; for (const char *d = c + l + 1; *d >= '0' && *d <= '9'; d++) port = port * 10 + (u32)(*d - '0'); if (!port || port > 65535) { tputs("Bad port.\n"); return; } }
+            memcpy(http_proxy_host, c, (size_t)l); http_proxy_host[l] = 0; http_proxy_port = (u16)port; http_proxy_on = 1;
+        }
+    }
+    tprintf("HTTPS gateway: %s  %s:%u\n", http_proxy_on ? "on" : "off", http_proxy_host, (u32)http_proxy_port);
+    if (http_proxy_on) tputs("https:// goes through it. Run on your PC:\n  python3 tools/leact-gateway.py\n");
+    else tputs("https:// pages cannot be opened while it is off.\n");
+}
+static int net_command(const char *c, char **av, int ac) {
+    if (!kstrcmp(c, "proxy") || !kstrcmp(c, "gateway")) { cmd_proxy(av, ac); return 1; }
+    if (!kstrcmp(c, "ifconfig") || !kstrcmp(c, "ipconfig") || !kstrcmp(c, "net")) cmd_ifconfig();
+    else if (!kstrcmp(c, "dhcp")) cmd_dhcp();
+    else if (!kstrcmp(c, "ping")) cmd_ping(av, ac);
+    else if (!kstrcmp(c, "nslookup") || !kstrcmp(c, "dig")) cmd_nslookup(av, ac);
+    else if (!kstrcmp(c, "wget") || !kstrcmp(c, "download")) cmd_wget(av, ac);
+    else if (!kstrcmp(c, "browse") || !kstrcmp(c, "browser") || !kstrcmp(c, "web")) {
+        open_app(A_BROWSER);
+        if (ac > 1) br_go(av[1], 1);
+    }
+    else return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* Per-app dispatch                                                    */
 /* ------------------------------------------------------------------ */
 static void app_init(int a) {
@@ -2410,6 +3976,7 @@ static void app_init(int a) {
     else if (a == A_SETTINGS) set_msg[0] = 0;
     else if (a == A_TASK) tsel = -1;
     else if (a == A_CALC) calc_reset();
+    else if (a == A_BROWSER) br_open();
     else if (a == A_FILES) { if (fm_drive < 0 || (fm_drive != FM_RAM && !drv[fm_drive].present)) fm_pick_drive(fs_on_disk ? fs_drive : FM_RAM); else fm_refresh(); }
     else if (a == A_INSTALL) { inst_state = 0; install_pick_default(); }
     else if (a >= A_EXT0) { if (xcall(a, EV_INIT, 0, 0, 0, 0)) xapp[a - A_EXT0].want_close = 1; }
@@ -2428,6 +3995,7 @@ static void app_draw(int a, int x, int y, int w, int h) {
     case A_SETTINGS: settings_draw(x, y, w, h); break;
     case A_TASK: task_draw(x, y, w, h); break;
     case A_CALC: calc_draw(x, y, w, h); break;
+    case A_BROWSER: br_draw(x, y, w, h); break;
     case A_OPENWITH: ow_draw(x, y, w, h); break;
     case A_HEX: hex_draw(x, y, w, h); break;
     case A_IMG: img_draw(x, y, w, h); break;
@@ -2446,6 +4014,7 @@ static void app_click(int a, int rx, int ry) {
     case A_SETTINGS: settings_click(rx, ry); break;
     case A_TASK: task_click(rx, ry); break;
     case A_CALC: calc_click(rx, ry); break;
+    case A_BROWSER: br_click(rx, ry); break;
     case A_OPENWITH: ow_click(rx, ry); break;
     case A_HEX: hex_click(rx, ry); break;
     default: if (a >= A_EXT0) xcall(a, EV_CLICK, rx, ry, 0, 1);
@@ -2455,6 +4024,7 @@ static void app_key(int a, int k) {
     if (a == A_TERM) term_key(k);
     else if (a == A_NOTE) note_key(k);
     else if (a == A_CALC) calc_key(k);
+    else if (a == A_BROWSER) br_key(k);
     else if (a == A_FILES) files_key(k);
     else if (a == A_OPENWITH) ow_key(k);
     else if (a == A_HEX) hex_key(k);
@@ -2466,7 +4036,7 @@ static void app_key(int a, int k) {
 /* ------------------------------------------------------------------ */
 #define UBAR_H 24            /* Unity top panel */
 #define LAUNCH_W 52          /* Unity left launcher */
-#define LAUNCH_SLOT 40
+#define LAUNCH_SLOT 36
 #define START_W 84
 #define TB_X0 90
 #define LAUNCH_TOP (UBAR_H + 52)
@@ -2563,8 +4133,8 @@ static void theme_apply(int id) {
     for (int a = 0; a < N_APPS; a++) clamp_win(&wins[a]);
 }
 
-static const char *icon_label[11] = { "Terminal", "Notepad", "Paint", "Files", "Clock", "About", "Install", "Settings", "Tasks", "Calc", "Reboot" };
-#define N_ICONS 11
+static const char *icon_label[12] = { "Terminal", "Notepad", "Paint", "Files", "Clock", "About", "Install", "Settings", "Tasks", "Calc", "Browser", "Reboot" };
+#define N_ICONS 12
 static int icon_x(int i) { return area_x0 + 14 + (i / 4) * 84; }
 static int icon_y(int i) { return area_y0 + 12 + (i % 4) * 82; }
 static int icon_sel = -1;
@@ -2593,7 +4163,10 @@ static void draw_icon(int i, int x, int y) {
         rect(x + 3, y, 26, 32, RGB(120, 128, 142)); rect(x + 5, y + 3, 22, 8, RGB(150, 220, 150));
         for (int k = 0; k < 9; k++) { rect(x + 6 + (k % 3) * 7, y + 14 + (k / 3) * 6, 5, 4, k == 8 ? RGB(60, 130, 245) : RGB(225, 228, 235)); }
         break;
-    case 10: fill_circle(x + 16, y + 16, 15, RGB(210, 60, 30)); fill_circle(x + 16, y + 16, 8, RGB(255, 255, 255)); fill_circle(x + 16, y + 16, 6, RGB(210, 60, 30)); rect(x + 14, y + 3, 4, 14, C_LIGHT); break;
+    case 10:  /* browser: globe */
+        fill_circle(x + 16, y + 16, 15, RGB(40, 110, 220)); fill_circle(x + 11, y + 12, 5, RGB(70, 170, 80)); fill_circle(x + 21, y + 21, 6, RGB(70, 170, 80));
+        fill_circle(x + 22, y + 9, 3, RGB(70, 170, 80)); rect(x + 3, y + 15, 26, 1, RGB(200, 225, 255)); rect(x + 15, y + 2, 1, 28, RGB(200, 225, 255)); break;
+    case 11: fill_circle(x + 16, y + 16, 15, RGB(210, 60, 30)); fill_circle(x + 16, y + 16, 8, RGB(255, 255, 255)); fill_circle(x + 16, y + 16, 6, RGB(210, 60, 30)); rect(x + 14, y + 3, 4, 14, C_LIGHT); break;
     }
 }
 static void draw_desktop(void) {
@@ -2758,7 +4331,7 @@ static void draw_startmenu(void) {
     blit_argb(sm_x + 8, sm_y + 4, logoflag_W, logoflag_H, logoflag);
     draw_str(sm_x + 46, sm_y + 11, th->menu_title, C_LIGHT);
     static const u32 bc[N_PIN] = { RGB(60, 60, 70), RGB(60, 110, 220), RGB(220, 60, 50), RGB(240, 200, 60), RGB(120, 120, 130),
-                                    RGB(40, 100, 220), RGB(80, 160, 80), RGB(140, 146, 160), RGB(60, 170, 70), RGB(90, 100, 120) };
+                                    RGB(40, 100, 220), RGB(80, 160, 80), RGB(140, 146, 160), RGB(60, 170, 70), RGB(90, 100, 120), RGB(40, 110, 220) };
     for (int i = 0; i < SM_N; i++) {
         int iy = sm_y + SM_HEAD + i * SM_ITEM;
         const char *t = i < N_PIN ? app_names[i] : i == N_PIN ? "Restart" : "Shut Down";
@@ -2886,6 +4459,7 @@ static int prev_btn;
 static void os_events(void) {
     xapp_reap();
     input_poll();
+    net_poll(); tjob_tick(); br_check();
     int k;
     while ((k = kq_pop())) {
         int a = top_app();
@@ -2927,11 +4501,13 @@ static void os_init(u32 magic, const u32 *mbi) {
     fs_check();
     fs_load();
     settings_load();
+    net_init();
     splash(80, "Files and settings");
     theme_apply(th_id);
     splash(100, "Desktop");
     sleep_ticks(70);
     open_app(A_TERM);
+    if (fs_on_disk && fs_ver == 1) tputs("Your LeactedFS disk is the old small version.\nType fsupgrade for 64 files of 128 KB.\n");
 }
 
 void kernel_main(u32 magic, const u32 *mbi) {
@@ -2942,7 +4518,7 @@ void kernel_main(u32 magic, const u32 *mbi) {
         os_draw();
         flip();
         next += 3;                                   /* ~33 fps */
-        while ((i32)(ticks - next) < 0) { wait_tick(); input_poll(); }
+        while ((i32)(ticks - next) < 0) { wait_tick(); input_poll(); net_poll(); }
         if ((i32)(ticks - next) > 30) next = ticks;  /* fell behind: resync */
     }
 }

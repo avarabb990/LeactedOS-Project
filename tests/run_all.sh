@@ -8,6 +8,9 @@ python3 tests/gen_images.py >/dev/null
 gcc -m32 -std=gnu11 -O1 -Wall -Wextra -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-builtin -nostdlib -static \
     -Wl,-N -Wl,--no-warn-rwx-segments -o tests/run32 tests/run32.c
 for a in hello snake doodle; do ./tests/run32 sdk/out/$a.lapp tests/out/app_$a.ppm; done
+# 1b. the TCP/IP stack and HTTP client against a fake network (DHCP, DNS, TCP, loss, redirects...)
+gcc -m64 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I. -o tests/net_test tests/net_test.c
+./tests/net_test | tail -1
 # 2. the whole OS (File Manager, apps, windows...) on the PC with the same app sources built natively
 for a in hello snake doodle; do
     gcc -m64 -O1 -g -fsanitize=address,undefined -Dlapp_main=${a}_main -c sdk/apps/$a.c -o tests/out/$a.o

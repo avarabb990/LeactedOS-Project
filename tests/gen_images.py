@@ -2,6 +2,7 @@
 """Generate test disk images + expected files for the host test."""
 import os, struct, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+import sys
 import mkfat
 
 out = os.path.join(os.path.dirname(__file__), "out")
@@ -70,4 +71,18 @@ if os.path.isdir(appdir):
         if fn.endswith(".lapp"):
             apps[fn] = open(os.path.join(appdir, fn), "rb").read()
 open(os.path.join(out, "apps.img"), "wb").write(mkfat.build(16, apps))
+# Leact-get repositories: a good one, and a "v2" copy with one app rebuilt (different CRC) plus bad entries
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+if os.path.isdir(appdir):
+    good = {fn: open(os.path.join(appdir, fn), "rb").read() for fn in sorted(os.listdir(appdir)) if fn.endswith(".lapp")}
+    def idx(rows): return ("LEACT-REPO 1\r\n# test\r\n" + "\r\n".join(rows) + "\r\n").encode()
+    rows = ["hello|pkg/hello.lapp|1.0|Hello demo", "snake|pkg/snake.lapp|1.1|Classic snake", "doodle|pkg/doodle.lapp|1.0|Drawing pad",
+            "broken|pkg/broken.lapp|0.1|Corrupt package", "ghost|pkg/ghost.lapp|0.1|File missing", "bad name!|pkg/x.lapp|1|skipped"]
+    pkgs = dict(good); pkgs["broken.lapp"] = b"NOPE" * 40
+    open(os.path.join(out, "repo.img"), "wb").write(mkfat.build(16, {"leact-repo.txt": idx(rows), "pkg": pkgs}))
+    p2 = dict(pkgs); h = bytearray(good["hello.lapp"]); h[-1] ^= 0xFF; p2["hello.lapp"] = bytes(h)   # same size, corrupt reloc -> still must be rejected
+    sn = bytearray(good["snake.lapp"]); sn[40] = ord("S"); sn[41] = ord("2")                          # name tweak -> header CRC unchanged? (crc covers image only)
+    open(os.path.join(out, "repo_bad.img"), "wb").write(mkfat.build(16, {"leact-repo.txt": idx(rows), "pkg": p2}))
+    open(os.path.join(out, "norepo.img"), "wb").write(mkfat.build(16, {"README.TXT": b"no index here\n"}))
+    open(os.path.join(out, "badindex.img"), "wb").write(mkfat.build(16, {"leact-repo.txt": b"hello|pkg/hello.lapp\n"}))
 print("images written to", out)

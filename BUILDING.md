@@ -50,3 +50,18 @@ one can do anything, so only run apps you trust.
 
 ## License
 MIT, see LICENSE. The 8x8 font in font.h was recovered from the original LeactedOS XP kernel.
+
+## Networking, the HTTPS gateway and app repositories
+Run with `-nic user,model=rtl8139`. Terminal: `ifconfig`, `dhcp`, `ping`, `nslookup`, `wget URL [NAME]`, `browse [URL]`, `proxy`.
+
+**The HTTPS gateway.** LeactedOS has no TLS, so `https://` addresses go through a helper on the PC that runs QEMU:
+`python3 tools/leact-gateway.py` (listens on 127.0.0.1:8080; in QEMU's user network the PC is `10.0.2.2`). The OS asks
+`http://10.0.2.2:8080/https/HOST/PATH`; the PC fetches the real page with certificate checking. GET only, loopback only,
+private/local addresses refused unless `--allow-private`. `proxy off` or `proxy HOST:PORT` changes it inside the OS.
+
+**Repositories.** A repository is a folder with `leact-repo.txt` (`LEACT-REPO 1`, then `name|pkg/name.lapp|version|description`
+lines) and the `.lapp` files. Build one with `python3 tools/mkrepo.py --dir repo/ sdk/out/*.lapp` (or a disk image
+`mkrepo.py repo.img ...`). `leact-get repo URL|PATH|default|auto` chooses it. The default is this project's `repo/` folder.
+
+**Tests.** `sh tests/run_all.sh` also runs `tests/net_test.c`: the real TCP/IP stack against a fake network (DHCP, DNS,
+gateway, a small web server, packet loss, redirects) under AddressSanitizer.
