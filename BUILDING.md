@@ -65,3 +65,5 @@ lines) and the `.lapp` files. Build one with `python3 tools/mkrepo.py --dir repo
 
 **Tests.** `sh tests/run_all.sh` also runs `tests/net_test.c`: the real TCP/IP stack against a fake network (DHCP, DNS,
 gateway, a small web server, packet loss, redirects) under AddressSanitizer.
+
+`tests/css_test.c` and `tests/js_test.c` test the CSS engine and the JavaScript interpreter on their own; `host_test.c` runs pages with scripts, external `.css`/`.js` and timers through the Browser.

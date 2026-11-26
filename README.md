@@ -42,6 +42,7 @@ Every version is a git tag, so you can browse the source of any of them (`git ch
 | v7 | LeactedFS v2 (64 files of 128 KB), many more terminal commands, `leact-get` from a repository disk |
 | v8 | Networking (RTL8139, DHCP, DNS, TCP, HTTP), `ping`/`wget`, and the Browser |
 | v9 | HTTPS through a host gateway, online `leact-get` with this repository's `repo/` folder |
+| v10 | Browser: CSS and JavaScript (`css.h`, `js.h`), external `.css`/`.js` files, DOM, timers |
 
 v7, v8 and v9 were built in one go and share a single source commit (the binaries of each are in `releases/`).
 
@@ -49,3 +50,12 @@ The `leacteos-v*.bin` files in the top folder were uploaded by hand earlier. `le
 
 ## License
 MIT, see [LICENSE](LICENSE).
+
+## Browser: CSS and JavaScript
+The Browser lays pages out with a small CSS engine (`css.h`) and runs scripts with a small JavaScript interpreter (`js.h`).
+
+**CSS:** tag, `.class`, `#id`, compound, descendant, child and comma selectors; `@media` (screen); `!important`, specificity, inline `style=""`, `<link rel=stylesheet>`. Properties: `color`, `background(-color)`, `font-weight`, `font-size` (22px and up is drawn double size), `text-align`, `display`, `visibility`, `text-transform`, `text-decoration`, `margin`/`padding` (as blank rows and indentation), `list-style`, `white-space`.
+
+**JavaScript:** variables, functions, closures, arrow functions, template strings, spread, `for`/`while`/`switch`/`try`, arrays, objects, `Math`, `JSON.stringify`, string and array methods, `setTimeout`/`setInterval`, `localStorage` (per page), `Date`. DOM: `getElementById`, `querySelector(All)`, `innerHTML`, `textContent`, `style`, `classList`, `createElement`/`appendChild`, `onclick` and `addEventListener('click')`, `document.write`, `location.href`. `console.log` and errors print to the Terminal; `alert` shows in the status line.
+
+**Limits:** numbers are fixed point (about 9 decimal digits, no huge values); no `class`, `async`/`await`, regular expressions, destructuring or generators (a page using them gets a script error and the rest still works); layout is text rows, so `float`, `position`, widths and images are ignored; only click events; scripts stop after 8 million steps.

@@ -16,6 +16,11 @@ done
 # 1b. the TCP/IP stack and HTTP client against a fake network (DHCP, DNS, TCP, loss, redirects...)
 gcc -m64 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I. -o tests/net_test tests/net_test.c
 ./tests/net_test | tail -1
+# 1c. the CSS engine and the JavaScript interpreter on their own
+for t in css_test js_test; do
+    gcc -m64 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wno-unused-function -Wno-misleading-indentation -o tests/out/$t tests/$t.c
+    ./tests/out/$t | tail -1
+done
 # 2. the whole OS (File Manager, apps, windows...) on the PC with the same app sources built natively
 for a in hello snake doodle; do
     gcc -m64 -O1 -g -fsanitize=address,undefined -Dlapp_main=${a}_main -c sdk/apps/$a.c -o tests/out/$a.o

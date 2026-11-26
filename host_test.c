@@ -50,6 +50,15 @@ static int br_has(const char *needle) {
     }
     return 0;
 }
+static int br_find(const char *needle, int *col) {          /* row containing the text, or -1 */
+    int nl = (int)strlen(needle);
+    for (int r = 0; r < br_nrows; r++) {
+        int rl = br_rows[r].len; const char *t = br_t + br_rows[r].off;
+        for (int i = 0; i + nl <= rl; i++) if (!memcmp(t + i, needle, (size_t)nl)) { if (col) *col = i; return r; }
+    }
+    return -1;
+}
+static i32 br_fg_of(const char *needle) { int c, r = br_find(needle, &c); assert(r >= 0); return br_fg[br_rows[r].off + (u32)c]; }
 static void cmd(const char *s) { typestr(s); app_key(A_TERM, '\n'); }
 static void click(int x, int y) { on_press(x, y); on_release(); }
 static void frame_out(const char *fn) { ticks += 25; os_draw(); ppm(fn); }
@@ -749,6 +758,159 @@ int main(void) {
     app_key(A_BROWSER, K_UP); assert(br_scroll == 0);
     app_key(A_BROWSER, K_PGDN); assert(br_scroll > 10); app_key(A_BROWSER, K_PGUP); assert(br_scroll == 0 || br_scroll < br_maxscroll()); app_key(A_BROWSER, K_HOME);
     frame_out("t49_browser_long.ppm");
+
+    /* ---- CSS ---- */
+    {
+      static const char css_page[] =
+        "<html><head><title>CSS test</title><style>\n"
+        "body { background: #202030; color: #e0e0e0 }\n"
+        "h1 { color: #ffcc00; text-align: center }\n"
+        ".warn { color: red; background-color: #440000; font-weight: bold }\n"
+        "#intro { margin-left: 32px; color: rgb(0,255,0) }\n"
+        "ul.plain li { list-style: none }\n"
+        ".gone { display: none }\n"
+        "a { color: orange; text-decoration: none }\n"
+        "span.up { text-transform: uppercase }\n"
+        "div.box > p { color: #88f }\n"
+        "@media print { p { color: black } }\n"
+        ".big { font-size: 30px }\n"
+        ".right { text-align: right }\n"
+        "p.gap { margin-top: 20px; margin-bottom: 20px }\n"
+        "</style></head><body>"
+        "<h1>Centered title</h1>"
+        "<p class=warn>Warning text</p>"
+        "<p id=intro>Indented green</p>"
+        "<ul class=plain><li>no bullet</li></ul><ul><li>with bullet</li></ul>"
+        "<p class=gone>You cannot see this</p><div class=gone><p>nor this</p><span>nor this</span></div>"
+        "<p>Link: <a href=\"/x\">styled link</a> and <a href=\"/y\" style=\"color:#0f0;text-decoration:underline\">green link</a></p>"
+        "<p>say <span class=up>shout</span> now</p>"
+        "<div class=box><p>child blue</p></div><div class=box><div><p>deep plain</p></div></div>"
+        "<p class=big>Large text</p><p class=right>Right aligned</p>"
+        "<p style=\"color:#123456\">inline style</p><p style=\"display:none\">inline hidden</p>"
+        "<font color=\"#ff00ff\">old font tag</font> <p align=center>old align</p>"
+        "<p>before</p><p class=gap>gap paragraph</p><p>after</p>"
+        "</body></html>";
+      br_show_html(css_page, "about:csstest");
+      int c;
+      assert(!strcmp(br_title, "CSS test") && br_pagebg == 0x202030);
+      assert(br_fg_of("Centered title") == 0xFFCC00 && br_rows[br_find("Centered title", NULL)].align == 2 && br_rows[br_find("Centered title", NULL)].big == 1);
+      int r = br_find("Warning text", &c);
+      assert(r >= 0 && br_fg[br_rows[r].off + (u32)c] == 0xFF0000 && (br_bd[br_rows[r].off + (u32)c] & 1) && br_rows[r].hasbg && br_rows[r].bg == 0x440000);
+      r = br_find("Indented green", &c); assert(br_fg[br_rows[r].off + (u32)c] == 0x00FF00 && br_rows[r].indent == 4);
+      assert(br_has("no bullet") && !br_has("* no bullet") && br_has("* with bullet"));
+      assert(!br_has("cannot see") && !br_has("nor this") && !br_has("inline hidden"));
+      r = br_find("styled link", &c); assert(br_fg[br_rows[r].off + (u32)c] == 0xFFA500 && br_lk[br_rows[r].off + (u32)c] && (br_bd[br_rows[r].off + (u32)c] & 2));
+      r = br_find("green link", &c); assert(br_fg[br_rows[r].off + (u32)c] == 0x00FF00 && !(br_bd[br_rows[r].off + (u32)c] & 2));
+      assert(br_has("say SHOUT now") && br_fg_of("child blue") == 0x8888FF && br_fg_of("deep plain") == 0xE0E0E0);
+      r = br_find("Large text", NULL); assert(br_rows[r].big == 1);
+      r = br_find("Right aligned", NULL); assert(br_rows[r].align == 3);
+      assert(br_fg_of("inline style") == 0x123456 && br_fg_of("old font tag") == 0xFF00FF);
+      r = br_find("old align", NULL); assert(br_rows[r].align == 2);
+      { int rb = br_find("before", NULL), rg = br_find("gap paragraph", NULL), ra = br_find("after", NULL);   /* blank rows around the gap paragraph */
+        assert(rg - rb >= 2 && ra - rg >= 2); }
+      assert(br_nlinks == 2);
+      frame_out("t50_css.ppm");
+      /* the page without any CSS looks exactly as before: plain links are blue, headings dark blue */
+      br_show_html("<html><body><h1>Plain</h1><p>text <a href=\"/a\">link</a></p></body></html>", "about:plain");
+      assert(br_pagebg == CSS_NONE && br_fg_of("link") == 0x0000DC && br_rows[br_find("Plain", NULL)].big == 1);
+      /* sheets from an earlier page do not leak into the next one */
+      assert(css_nsel == 0);
+      /* hostile CSS and deep nesting must not crash */
+      { static char big[200000]; int o = 0; o += sprintf(big + o, "<style>");
+        for (int i = 0; i < 3000; i++) o += sprintf(big + o, ".a%d b%d{color:#%06x}", i, i, i * 77);
+        o += sprintf(big + o, "</style>");
+        for (int i = 0; i < 300; i++) o += sprintf(big + o, "<div class=a%d id=i%d style='color:red;;:;background:'>", i, i);
+        o += sprintf(big + o, "deep text");
+        br_show_html(big, "about:deep"); assert(br_has("deep text") && br_sd <= CSS_MAXDEPTH);
+      }
+    }
+
+    /* ---- JavaScript + DOM in the browser ---- */
+    {
+      static const char js_page[] =
+        "<html><head><title>JS test</title>"
+        "<link rel=\"stylesheet\" href=\"/site.css\">"
+        "<style>.hl{color:#ff0000;font-weight:bold} #hid{display:none}</style>"
+        "<script src=\"/lib.js\"></script></head><body>"
+        "<h2 id=\"head\">Counter</h2>"
+        "<p id=\"out\">count: 0</p>"
+        "<button id=\"btn\" onclick=\"inc()\">Add one</button> "
+        "<button id=\"red\" onclick=\"document.getElementById('out').className='hl'\">Make red</button>"
+        "<div id=\"hid\">secret box</div>"
+        "<button onclick=\"document.getElementById('hid').style.display='block'\">Reveal</button>"
+        "<ul id=\"list\"><li>one</li></ul>"
+        "<button id=\"add\" onclick=\"addItem()\">Add item</button>"
+        "<p id=\"ticker\">tick 0</p>"
+        "<p id=\"sync\">before</p>"
+        "<script>document.write('<p>written at load</p>');</script>"
+        "<p id=\"ext\">ext none</p>"
+        "<script>"
+        "var n = 0;"
+        "function inc() { n++; document.getElementById('out').textContent = 'count: ' + n; }"
+        "function addItem() { var li = document.createElement('li'); li.textContent = 'item ' + (document.getElementsByTagName('li').length + 1); document.getElementById('list').appendChild(li); }"
+        "var t = 0; setInterval(function () { t++; document.getElementById('ticker').innerHTML = 'tick ' + t; }, 500);"
+        "document.getElementById('sync').innerHTML = '<b>after</b> script ' + (2 + 3) * 4 + ' ' + libdouble(21);"
+        "document.getElementById('ext').textContent = 'ext ' + EXTVAL;"
+        "var data = [3, 1, 2].sort().map(function (x) { return x * x; }).join('-'); console.log('data ' + data);"
+        "</script>"
+        "<p id=\"bad\">after bad script</p><script>this is not valid js(</script><script>nosuchfunction();</script>"
+        "</body></html>";
+      fake_add_file("/jspage.html", (const u8 *)js_page, (int)strlen(js_page));
+      fake_add_file("/site.css", (const u8 *)"body{background:#101830;color:#ddeeff} h2{color:#ffcc00}", 56);
+      fake_add_file("/lib.js", (const u8 *)"function libdouble(x) { return x * 2; } var EXTVAL = 'loaded';", 62);
+      open_app(A_BROWSER); tclear();
+      br_go("http://local.test/jspage.html", 1); net_idle(6000);
+      assert(!br_wait && br_js_on);
+      assert(br_pagebg == 0x101830 && br_fg_of("Counter") == 0xFFCC00);                 /* external CSS */
+      assert(br_has("ext loaded") && br_has("after script 20 42"));                     /* external JS, innerHTML, arithmetic */
+      assert(br_has("written at load") && br_has("after bad script"));                  /* document.write; errors do not stop the page */
+      assert(!br_has("secret box") && !br_has("not valid"));
+      assert(term_has("data 1-4-9"));                                                   /* console.log goes to the terminal */
+      assert(!strncmp(br_status, "Script error:", 13));
+      frame_out("t51_js_before.ppm");
+      /* click the counter button three times */
+      for (int k = 0; k < 3; k++) {
+          int c, r = br_find("Add one", &c); assert(r >= 0);
+          int y = BR_TB + 3; for (int q = br_scroll; q < r; q++) y += br_rowh(q);
+          app_click(A_BROWSER, br_rowx(&br_rows[r], CW(A_BROWSER) - 14) + c * 8 + 3, y + 3);
+      }
+      assert(br_has("count: 3"));
+      { int c, r = br_find("Make red", &c); int y = BR_TB + 3; for (int q = br_scroll; q < r; q++) y += br_rowh(q);
+        app_click(A_BROWSER, br_rowx(&br_rows[r], CW(A_BROWSER) - 14) + c * 8 + 3, y + 3); }
+      assert(br_fg_of("count: 3") == 0xFF0000);                                          /* class changed by script, rule from <style> */
+      { int c, r = br_find("Reveal", &c); int y = BR_TB + 3; for (int q = br_scroll; q < r; q++) y += br_rowh(q);
+        app_click(A_BROWSER, br_rowx(&br_rows[r], CW(A_BROWSER) - 14) + c * 8 + 3, y + 3); }
+      assert(br_has("secret box"));                                                      /* style.display changed */
+      { int c, r = br_find("Add item", &c); int y = BR_TB + 3; for (int q = br_scroll; q < r; q++) y += br_rowh(q);
+        app_click(A_BROWSER, br_rowx(&br_rows[r], CW(A_BROWSER) - 14) + c * 8 + 3, y + 3); }
+      assert(br_has("item 2"));                                                          /* createElement + appendChild */
+      /* timers */
+      ticks += 120; br_check(); assert(br_has("tick 2") || br_has("tick 1"));
+      { int before = 0; (void)before; ticks += 100; br_check(); ticks += 100; br_check(); }
+      assert(!br_has("tick 0"));
+      frame_out("t52_js_after.ppm");
+      /* an endless loop is stopped by the step limit, the OS stays alive */
+      br_show_html("<html><body><p id=\"x\">alive</p></body></html>", "about:plain");
+      assert(!br_js_on);
+      { static const char loop[] = "<html><body><p>start</p><script>while (true) { }</script><p>after loop</p><script>var a = []; for (var i = 0; i < 100000; i++) a.push('x' + i); document.write('<p>big</p>');</script></body></html>";
+        fake_add_file("/loop.html", (const u8 *)loop, (int)strlen(loop));
+        br_go("http://local.test/loop.html", 1); net_idle(6000); assert(br_has("start") && br_has("after loop") && !strncmp(br_status, "Script error:", 13)); }
+      /* scripts in a page that redirects with location */
+      { static const char nav[] = "<html><body><p>going</p><script>location.href = '/final';</script></body></html>";
+        fake_add_file("/nav.html", (const u8 *)nav, (int)strlen(nav));
+        br_go("http://local.test/nav.html", 1); net_idle(6000); assert(!strcmp(br_url, "http://local.test/final") && br_has("final page")); }
+      /* an external script that cannot be loaded */
+      { static const char miss[] = "<html><body><script src=\"/nothere.js\"></script><p>page ok</p></body></html>";
+        fake_add_file("/miss.html", (const u8 *)miss, (int)strlen(miss));
+        br_go("http://local.test/miss.html", 1); net_idle(6000); assert(br_has("page ok") && !br_wait); }
+      /* Esc while the scripts are loading still shows the page */
+      br_go("http://local.test/jspage.html", 1); for (int i = 0; i < 4000 && br_wait != 2; i++) { net_steps(1); br_check(); }
+      if (br_wait == 2) { app_key(A_BROWSER, K_ESC); assert(!br_wait && br_has("Counter")); } else net_idle(3000);
+      /* the page without scripts is unaffected, and JS state does not leak */
+      br_go("http://local.test/page", 1); net_idle(3000); assert(!js_timers_active() || br_js_on); assert(br_has("Big Heading") && !br_has("hidden") && br_has("nono") == 0);
+      close_app(A_BROWSER);
+    }
+
     /* closing the window mid-load cancels the request */
     br_go("http://local.test/big", 1); net_steps(3); assert(br_wait); close_app(A_BROWSER); assert(!br_wait && !http_active()); net_steps(300);
     for (int i = 0; i < NT; i++) assert(!tcps[i].used);

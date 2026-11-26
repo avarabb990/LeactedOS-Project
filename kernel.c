@@ -402,6 +402,8 @@ static int nic_recv(u8 *b, int max);
 static u32 net_ms(void);
 static u32 net_rand(void);
 #include "net.h"
+#include "css.h"
+#include "js.h"
 
 static void pci_write(int bus, int dev, int fn, int off, u32 v) {
     outl(0xCF8, 0x80000000u | (bus << 16) | (dev << 11) | (fn << 8) | (off & 0xFC));
@@ -3472,8 +3474,13 @@ static void tjob_tick(void) {
 #define BR_TB 30                    /* toolbar height */
 #define BR_SB 18                    /* status bar height */
 enum { BK_NORMAL, BK_H1, BK_H2, BK_H3, BK_PRE, BK_HR };
-struct brow { u32 off; u16 len; u8 kind, indent; };
-static char br_t[BR_TXT]; static u8 br_lk[BR_TXT], br_bd[BR_TXT];
+struct brow { u32 off; u16 len; u8 kind, indent, align, big, hasbg; i32 bg; };   /* align: 0 left 2 centre 3 right */
+static char br_t[BR_TXT]; static u8 br_lk[BR_TXT], br_bd[BR_TXT];   /* br_bd bits: 1 bold, 2 link without underline, 4 underline */
+static i32 br_fg[BR_TXT];                                            /* text colour, CSS_NONE = default */
+/* CSS state of the element being laid out */
+static struct cel br_stk[CSS_MAXDEPTH]; static int br_sd;
+static i32 br_fgc = CSS_NONE, br_bgc = CSS_NONE, br_pagebg = CSS_NONE;
+static int br_big, br_align, br_cind, br_hide, br_xform, br_deco, br_nolist, br_sbold, br_pretag;
 static struct brow br_rows[BR_ROWS];
 static int br_nrows, br_col, br_lastsp, br_cols = 70, br_full, br_txt_lim = BR_TXT - 64, br_row_lim = BR_ROWS - 4;
 static u32 br_n, br_rs;
@@ -3483,15 +3490,19 @@ static char br_title[64], br_base[320], br_url[320], br_addr[320], br_status[80]
 static char br_hist[12][320];
 static int br_nh, br_alen, br_focus = 1, br_scroll, br_sel = 1;     /* br_sel: the address bar text is selected */
 
+static int br_eind(void) { int v = br_ind + br_cind; return v > 60 ? 60 : v; }
 static void br_push(u32 off, int len, int kind, int ind) {
     if (br_nrows >= br_row_lim) { br_full = 1; return; }
-    br_rows[br_nrows].off = off; br_rows[br_nrows].len = (u16)len; br_rows[br_nrows].kind = (u8)kind; br_rows[br_nrows].indent = (u8)ind;
+    struct brow *r = &br_rows[br_nrows];
+    r->off = off; r->len = (u16)len; r->kind = (u8)kind; r->indent = (u8)ind;
+    r->align = (u8)(len ? br_align : 0); r->big = (u8)(len ? br_big : 0);
+    r->hasbg = (u8)(br_bgc != CSS_NONE && kind != BK_HR); r->bg = br_bgc;
     br_nrows++;
 }
 static void br_endrow(void) {
     int len = (int)(br_n - br_rs);
     if (!br_pre) while (len > 0 && br_t[br_rs + (u32)len - 1] == ' ') len--;
-    if (len > 0 || (br_pre && br_n > br_rs)) br_push(br_rs, len, br_bk, br_ind);
+    if (len > 0 || (br_pre && br_n > br_rs)) br_push(br_rs, len, br_bk, br_eind());
     br_rs = br_n; br_col = 0; br_lastsp = -1;
 }
 static void br_blank(void) {
@@ -3500,6 +3511,7 @@ static void br_blank(void) {
 }
 static void br_put(unsigned char c) {
     if (br_full || br_n >= (u32)br_txt_lim) { br_full = 1; return; }
+    if (br_hide && !br_intitle) return;
     if (br_intitle) {
         int l = slen(br_title);
         if (c < 32) c = ' ';
@@ -3508,24 +3520,27 @@ static void br_put(unsigned char c) {
     }
     if (br_pre) {
         if (c == '\r') return;
-        if (c == '\n') { if (br_n == br_rs) br_push(br_n, 0, br_bk, br_ind); else br_endrow(); return; }
+        if (c == '\n') { if (br_n == br_rs) br_push(br_n, 0, br_bk, br_eind()); else br_endrow(); return; }
         if (c == '\t') { for (int k = 0; k < 4; k++) br_put(' '); return; }
     } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
         if (br_n == br_rs || br_t[br_n - 1] == ' ') return;
         c = ' ';
     }
     if (c < 32 || c > 126) c = '?';
-    br_t[br_n] = (char)c; br_lk[br_n] = (u8)br_cur_link; br_bd[br_n] = (u8)(br_bold > 0);
+    if (br_xform == 1 && c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+    else if (br_xform == 2 && c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+    br_t[br_n] = (char)c; br_lk[br_n] = (u8)br_cur_link; br_fg[br_n] = br_fgc;
+    br_bd[br_n] = (u8)((br_bold > 0 || br_sbold ? 1 : 0) | (br_cur_link ? (br_deco == 1 ? 2 : 0) : (br_deco == 2 ? 4 : 0)));
     br_n++; br_col++;
     if (c == ' ' && !br_pre) br_lastsp = (int)br_n - 1;
-    int limit = (br_cols - br_ind) / (br_bk == BK_H1 ? 2 : 1);
+    int limit = (br_cols - br_eind()) / (br_big ? 2 : 1);
     if (limit < 8) limit = 8;
     if (br_col > limit) {
         if (!br_pre && br_lastsp >= (int)br_rs) {
-            br_push(br_rs, br_lastsp - (int)br_rs, br_bk, br_ind);
+            br_push(br_rs, br_lastsp - (int)br_rs, br_bk, br_eind());
             br_rs = (u32)br_lastsp + 1; br_col = (int)(br_n - br_rs); br_lastsp = -1;
         } else {
-            br_push(br_rs, (int)(br_n - 1 - br_rs), br_bk, br_ind);
+            br_push(br_rs, (int)(br_n - 1 - br_rs), br_bk, br_eind());
             br_rs = br_n - 1; br_col = 1; br_lastsp = -1;
         }
     }
@@ -3603,15 +3618,87 @@ static int br_attr(const u8 *t, u32 len, const char *key, char *out, int max) {
     return 0;
 #undef WS
 }
-static void br_tag(const u8 *t, u32 len) {
-    int closing = 0; u32 i = 0;
-    if (len && t[0] == '/') { closing = 1; i = 1; }
-    char nm[12]; int nl = 0;
-    while (i < len && nl < 11 && ((t[i] >= 'a' && t[i] <= 'z') || (t[i] >= 'A' && t[i] <= 'Z') || (t[i] >= '0' && t[i] <= '9'))) nm[nl++] = klower((char)t[i++]);
-    nm[nl] = 0;
-    if (!nl) return;
+
+/* ------------- page model: elements, scripts and the JavaScript hooks ------------- */
+#define BR_ELS 1500
+#define BR_BLK 48
+#define BR_RES 10
+#define BR_NEW 64
+#define BR_RESBUF 196608
+#define BR_CREATED 100000                                     /* element numbers from here on are created by document.createElement */
+struct brel {
+    char tag[10], id[20], cls[40], jstyle[80];
+    u32 ostart, oend, ibeg, iend;                             /* open tag [ostart, oend], content [ibeg, iend) in the page source */
+    short parent; u16 enext;                                  /* parent element, index of the first element after this subtree */
+    u32 jsclick, jcls, ov, ovapp, value;                      /* js heap strings: onclick code, class override, new content, appended content, input value */
+    u8 ovmode, has_fn; struct jv fn;
+};
+static struct brel br_el[BR_ELS]; static int br_nel;
+struct brblk { u8 kind; u32 at, off, len; int res; };            /* kind: 0 inline CSS, 1 external CSS, 2 inline JS, 3 external JS */
+static struct brblk br_blk[BR_BLK]; static int br_nblk;
+struct brres { char url[200]; u32 off, len; u8 state; };     /* state: 0 waiting, 1 loaded, 2 failed */
+static struct brres br_res[BR_RES]; static int br_nres;
+static u8 br_resbuf[BR_RESBUF]; static u32 br_resused;
+static u8 br_page[HTTP_MAX + 1]; static u32 br_page_n; static int br_page_html;
+static u32 br_swrite[BR_BLK], br_late;                       /* document.write output per script, and written after loading */
+static char br_wbuf[8192]; static int br_wn;
+struct brnew { char tag[12], id[20], jstyle[80]; u32 html, jcls; };
+static struct brnew br_new[BR_NEW]; static int br_nnew;
+static int br_ecount, br_cur_ei = -1, br_pending_ov = -1, br_noelem;
+static int br_js_on, br_js_dirty, br_loadq_n; static struct jv br_loadq[8];
+static char br_page_url[330]; static int br_swrite_after_load, br_res_cur, br_trunc, br_click_prevent;
+static char br_jserr[160], br_jstitle[80], br_done_status[80], br_alert[100];
+static int kmemcmp(const void *a, const void *b, size_t n) { const u8 *p = a, *q = b; for (; n; n--, p++, q++) if (*p != *q) return *p - *q; return 0; }
+static void br_js_click(int ei);
+static int br_viewh(void);
+static void br_go(const char *in, int push);
+static char br_nav[330];                                      /* location.href was set: go there after the script finished */
+static void br_frag(const char *html, int n);
+static int br_is_void(const char *nm);
+static int br_is_block(const char *nm) {
+    static const char *const names[] = { "div", "p", "ul", "ol", "li", "pre", "blockquote", "section", "article", "header", "footer", "nav", "main",
+        "aside", "form", "table", "tr", "td", "th", "dl", "dt", "dd", "address", "figure", "figcaption", "details", "summary", "center",
+        "body", "html", "fieldset", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "br" };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) if (!kstrcmp(nm, names[i])) return 1;
+    return 0;
+}
+static int br_is_void(const char *nm) {
+    static const char *const names[] = { "br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "param", "source", "track", "wbr" };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) if (!kstrcmp(nm, names[i])) return 1;
+    return 0;
+}
+/* copy the CSS of the element on top of the stack into the layout state */
+static void br_apply_state(void) {
+    static const struct cstyle none = { CSS_NONE, CSS_NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const struct cstyle *s = br_sd > 0 ? &br_stk[br_sd - 1].st : &none;
+    br_fgc = s->fg; br_big = s->big; br_align = s->align; br_cind = s->cind; br_hide = s->hidden; br_xform = s->xform;
+    br_deco = s->deco; br_nolist = s->nolist; br_sbold = s->bold; br_pre = br_pretag || s->pre;
+    br_bgc = CSS_NONE;
+    for (int i = br_sd - 1; i >= 0; i--) if (br_stk[i].st.bg != CSS_NONE) { br_bgc = br_stk[i].st.bg; break; }
+}
+static void br_tn(const char *nm, char *out) {            /* tag name as stored in the CSS stack (9 characters at most) */
+    int i = 0; for (; nm[i] && i < 9; i++) out[i] = nm[i];
+    out[i] = 0;
+}
+/* the structural effects of a tag (rows, lists, links...) - the part that does not depend on CSS */
+static void br_unent(char *dst, const char *src, int max) {      /* &quot; &amp; &lt; &gt; &#39; in attribute text */
+    int o = 0;
+    for (int i = 0; src[i] && o < max - 1; i++) {
+        if (src[i] == '&') {
+            if (n_starts(src + i, "&quot;")) { dst[o++] = '"'; i += 5; continue; }
+            if (n_starts(src + i, "&amp;")) { dst[o++] = '&'; i += 4; continue; }
+            if (n_starts(src + i, "&lt;")) { dst[o++] = '<'; i += 3; continue; }
+            if (n_starts(src + i, "&gt;")) { dst[o++] = '>'; i += 3; continue; }
+            if (n_starts(src + i, "&#39;") || n_starts(src + i, "&apos;")) { dst[o++] = '\''; i += src[i + 2] == '3' ? 4 : 5; continue; }
+        }
+        dst[o++] = src[i];
+    }
+    dst[o] = 0;
+}
+static void br_pop_trailing(void) { while (br_n > br_rs && br_t[br_n - 1] == ' ') br_n--; }
+static void br_legacy(const char *nm, int nl, int closing, const u8 *t, u32 len) {
 #define IS(x) (!kstrcmp(nm, x))
-    if (IS("br")) { if (br_n == br_rs) br_push(br_n, 0, br_bk, br_ind); else br_endrow(); }
+    if (IS("br")) { if (br_n == br_rs) br_push(br_n, 0, br_bk, br_eind()); else br_endrow(); }
     else if (nl == 2 && nm[0] == 'h' && nm[1] >= '1' && nm[1] <= '6') {
         br_blank(); br_bk = closing ? BK_NORMAL : nm[1] == '1' ? BK_H1 : nm[1] <= '3' ? BK_H2 : BK_H3; br_bold = closing ? 0 : 1;
     }
@@ -3623,7 +3710,8 @@ static void br_tag(const u8 *t, u32 len) {
         if (!closing) {
             br_endrow();
             char b[12]; int d = br_depth > 0 ? br_depth - 1 : 0;
-            if (br_depth && br_ol[d]) ksnprintf(b, sizeof b, "%d. ", ++br_cnt[d]); else kstrcpy(b, "* ", sizeof b);
+            if (br_nolist) b[0] = 0;
+            else if (br_depth && br_ol[d]) ksnprintf(b, sizeof b, "%d. ", ++br_cnt[d]); else kstrcpy(b, "* ", sizeof b);
             br_text(b);
         }
     }
@@ -3633,7 +3721,7 @@ static void br_tag(const u8 *t, u32 len) {
              IS("address") || IS("figure") || IS("figcaption") || IS("details") || IS("summary") || IS("dt") || IS("dd")) br_endrow();
     else if (IS("tr")) br_endrow();
     else if (IS("td") || IS("th")) { if (!closing) { if (br_n > br_rs) br_text(" | "); if (IS("th")) br_bold = 1; } else if (IS("th")) br_bold = 0; }
-    else if (IS("pre")) { br_blank(); br_pre = !closing; br_bk = closing ? BK_NORMAL : BK_PRE; }
+    else if (IS("pre")) { br_blank(); br_pretag = !closing; br_bk = closing ? BK_NORMAL : BK_PRE; }
     else if (IS("hr")) { br_blank(); br_push(br_n, 0, BK_HR, 0); }
     else if (IS("b") || IS("strong")) { br_bold += closing ? -1 : 1; if (br_bold < 0) br_bold = 0; }
     else if (IS("title")) br_intitle = !closing;
@@ -3642,11 +3730,26 @@ static void br_tag(const u8 *t, u32 len) {
         else {
             char h[200];
             br_cur_link = 0;
-            if (br_attr(t, len, "href", h, sizeof h) && h[0] && h[0] != '#' && !n_starts(h, "javascript:") && !n_starts(h, "mailto:") && br_nlinks < BR_LINKS - 1) {
-                url_join(br_base, h, br_links[br_nlinks + 1], sizeof br_links[0]);
-                br_cur_link = ++br_nlinks;
+            if (br_attr(t, len, "href", h, sizeof h) && h[0] && h[0] != '#' && !n_starts(h, "mailto:") && br_nlinks < BR_LINKS - 1) {
+                if (n_starts(h, "javascript:")) {
+                    if (br_js_on) { kstrcpy(br_links[br_nlinks + 1], "js!", 4); br_unent(br_links[br_nlinks + 1] + 3, h + 11, (int)sizeof br_links[0] - 3); br_cur_link = ++br_nlinks; }
+                } else {
+                    url_join(br_base, h, br_links[br_nlinks + 1], sizeof br_links[0]);
+                    br_cur_link = ++br_nlinks;
+                }
             }
         }
+    }
+    else if (IS("button")) { if (!closing) { br_put('['); br_put(' '); } else { br_pop_trailing(); br_put(' '); br_put(']'); } }
+    else if (IS("input")) {
+        char ty[16] = "text", val[60] = "";
+        br_attr(t, len, "type", ty, sizeof ty); br_attr(t, len, "value", val, sizeof val);
+        if (br_cur_ei >= 0 && br_cur_ei < br_nel && br_el[br_cur_ei].value) kstrcpy(val, js_heap + br_el[br_cur_ei].value, sizeof val);
+        for (char *p = ty; *p; p++) *p = klower(*p);
+        if (!kstrcmp(ty, "hidden")) { }
+        else if (!kstrcmp(ty, "button") || !kstrcmp(ty, "submit") || !kstrcmp(ty, "reset")) { br_put('['); br_put(' '); br_text(val[0] ? val : !kstrcmp(ty, "reset") ? "Reset" : "Submit"); br_put(' '); br_put(']'); }
+        else if (!kstrcmp(ty, "checkbox") || !kstrcmp(ty, "radio")) { char ck[4]; int on = br_attr(t, len, "checked", ck, sizeof ck); br_text(!kstrcmp(ty, "radio") ? (on ? "(o)" : "( )") : (on ? "[x]" : "[ ]")); }
+        else { br_put('['); if (val[0]) br_text(val); else for (int k = 0; k < 12; k++) br_put('_'); br_put(']'); }
     }
     else if (IS("img")) {
         char alt[60];
@@ -3654,6 +3757,100 @@ static void br_tag(const u8 *t, u32 len) {
         br_put('['); br_text(alt); br_put(']');
     }
 #undef IS
+}
+/* old-style attributes become inline CSS: bgcolor, text, color (font), align */
+static void br_legacy_css(const char *nm, const u8 *t, u32 len, char *out, int max) {
+    char v[40]; int o = 0; out[0] = 0;
+    static const struct { const char *tag, *attr, *prop; } map[] = {
+        { "body", "bgcolor", "background-color" }, { "body", "text", "color" }, { "font", "color", "color" },
+        { "table", "bgcolor", "background-color" }, { "tr", "bgcolor", "background-color" },
+        { "td", "bgcolor", "background-color" }, { "th", "bgcolor", "background-color" },
+    };
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++) {
+        if (kstrcmp(nm, map[i].tag) || !br_attr(t, len, map[i].attr, v, sizeof v) || !v[0]) continue;
+        int hex = slen(v) == 6; for (int k = 0; hex && k < 6; k++) if (css_hex((unsigned char)v[k]) < 0) hex = 0;
+        o += ksnprintf(out + o, max - o, "%s:%s%s;", map[i].prop, hex ? "#" : "", v);
+    }
+    if (br_attr(t, len, "align", v, sizeof v) && (!kstrcmp(v, "center") || !kstrcmp(v, "right") || !kstrcmp(v, "left")) && !br_is_void(nm))
+        o += ksnprintf(out + o, max - o, "text-align:%s;", v);
+}
+static struct brel *br_el_of(int ei) { return ei >= 0 && ei < br_nel ? &br_el[ei] : NULL; }
+static void br_tag(const u8 *t, u32 len) {
+    int closing = 0; u32 i = 0;
+    if (len && t[0] == '/') { closing = 1; i = 1; }
+    char nm[12]; int nl = 0;
+    while (i < len && nl < 11 && ((t[i] >= 'a' && t[i] <= 'z') || (t[i] >= 'A' && t[i] <= 'Z') || (t[i] >= '0' && t[i] <= '9'))) nm[nl++] = klower((char)t[i++]);
+    nm[nl] = 0;
+    if (!nl) return;
+    char tn[10]; br_tn(nm, tn);
+    int blockish = br_is_block(nm);
+    int ei = closing ? -1 : br_cur_ei;
+    struct brel *E = br_el_of(ei);
+    if (closing) {
+        int idx = -1;
+        for (int k = br_sd - 1; k >= 0; k--) if (!kstrcmp(br_stk[k].tag, tn)) { idx = k; break; }
+        if (idx < 0) { if (!br_hide || br_intitle) br_legacy(nm, nl, 1, t, len); return; }
+        const struct cstyle st = br_stk[idx].st;
+        struct brel *PE = br_el_of(br_stk[idx].ei);
+        if (PE && PE->ovapp && !br_hide) br_frag(js_heap + PE->ovapp, js_len(js_heap + PE->ovapp));      /* things added with appendChild */
+        if (!br_hide || br_intitle) {
+            int skip = st.disp == 2 && blockish && kstrcmp(nm, "li") && kstrcmp(nm, "td") && kstrcmp(nm, "th");
+            if (!skip) br_legacy(nm, nl, 1, t, len);
+            if (st.vbot && blockish) br_blank();
+            if (st.disp == 1 && !blockish) br_endrow();
+        }
+        for (int k = br_sd - 1; k >= idx; k--) if (br_stk[k].jslink) br_cur_link = 0;
+        br_sd = idx; br_apply_state();
+        return;
+    }
+    if (br_is_void(nm)) {                                           /* no style stack, but img/br/hr/input still need their effects */
+        if (!br_hide) {
+            int own = 0;
+            if (E && (E->jsclick || E->has_fn) && !br_cur_link && br_nlinks < BR_LINKS - 1) { ksnprintf(br_links[br_nlinks + 1], sizeof br_links[0], "js:%d", ei); br_cur_link = ++br_nlinks; own = 1; }
+            br_legacy(nm, nl, 0, t, len);
+            if (own) br_cur_link = 0;
+        }
+        return;
+    }
+    /* open tags that close an earlier open tag of their kind */
+    if (br_sd > 0) {
+        const char *top = br_stk[br_sd - 1].tag;
+        int same = !kstrcmp(top, tn) && (!kstrcmp(nm, "p") || !kstrcmp(nm, "li") || !kstrcmp(nm, "dt") || !kstrcmp(nm, "dd") || !kstrcmp(nm, "option"));
+        int cell = (!kstrcmp(top, "td") || !kstrcmp(top, "th")) && (!kstrcmp(nm, "td") || !kstrcmp(nm, "th") || !kstrcmp(nm, "tr"));
+        if (same || cell) { br_sd--; if (cell && !kstrcmp(nm, "tr") && br_sd > 0 && !kstrcmp(br_stk[br_sd - 1].tag, "tr")) br_sd--; br_apply_state(); }
+        else if (!kstrcmp(nm, "tr") && !kstrcmp(top, "tr")) { br_sd--; br_apply_state(); }
+    }
+    /* the style of this element */
+    char id[24] = "", cls[60] = "", sty[200] = "", inl[300];
+    br_attr(t, len, "id", id, sizeof id); br_attr(t, len, "class", cls, sizeof cls); br_attr(t, len, "style", sty, sizeof sty);
+    if (E && E->jcls) kstrcpy(cls, js_heap + E->jcls, sizeof cls);
+    br_legacy_css(nm, t, len, inl, sizeof inl);
+    int il = slen(inl); kstrcpy(inl + il, sty, (int)sizeof inl - il); il = slen(inl);
+    if (E && E->jstyle[0]) { if (il && inl[il - 1] != ';') inl[il++] = ';'; kstrcpy(inl + il, E->jstyle, (int)sizeof inl - il); il = slen(inl); }
+    struct cstyle st;
+    if (br_sd < CSS_MAXDEPTH) {
+        struct cel *e = &br_stk[br_sd];
+        css_el_init(e, nm, nl, id, slen(id), cls, slen(cls));
+        e->ei = (short)ei;
+        css_compute(&st, br_sd > 0 ? &br_stk[br_sd - 1].st : NULL, br_stk, br_sd, inl, il);
+        if (!kstrcmp(nm, "body") || !kstrcmp(nm, "html")) { if (st.bg != CSS_NONE) br_pagebg = st.bg; st.bg = CSS_NONE; }
+        e->st = st;
+    } else memset(&st, 0, sizeof st), st.fg = st.bg = CSS_NONE;
+    if (!st.hidden || kstrcmp(nm, "title") == 0) {
+        int plain = st.disp == 2 && blockish && kstrcmp(nm, "li") && kstrcmp(nm, "td") && kstrcmp(nm, "th");
+        if (st.vtop && blockish) br_blank();
+        if (st.disp == 1 && !blockish) br_endrow();
+        br_nolist = st.nolist;                                   /* a list item takes its own list-style */
+        if (!plain) br_legacy(nm, nl, 0, t, len);
+        if (E && (E->jsclick || E->has_fn) && br_sd < CSS_MAXDEPTH && kstrcmp(nm, "a") && !br_cur_link && br_nlinks < BR_LINKS - 1) {
+            ksnprintf(br_links[br_nlinks + 1], sizeof br_links[0], "js:%d", ei); br_cur_link = ++br_nlinks; br_stk[br_sd].jslink = 1;
+        } else if (E && (E->jsclick || E->has_fn) && !kstrcmp(nm, "a") && br_cur_link && br_sd < CSS_MAXDEPTH) {
+            ksnprintf(br_links[br_cur_link], sizeof br_links[0], "js:%d", ei);                /* an onclick on a link: the handler runs first */
+        }
+        if (E && E->ovmode && br_sd < CSS_MAXDEPTH) br_pending_ov = ei;
+    } else if (!kstrcmp(nm, "a")) br_cur_link = 0;
+    if (br_sd < CSS_MAXDEPTH) br_sd++;
+    br_apply_state();
 }
 static void br_html(const u8 *d, u32 n) {
     u32 i = 0;
@@ -3667,14 +3864,33 @@ static void br_html(const u8 *d, u32 n) {
             u32 j = i + 1; u8 q = 0;
             while (j < n) { if (q) { if (d[j] == q) q = 0; } else if (d[j] == '"' || d[j] == '\'') q = d[j]; else if (d[j] == '>') break; j++; }
             if (d[i + 1] != '!' && d[i + 1] != '?') {
+                int closing = d[i + 1] == '/';
+                br_cur_ei = (!closing && !br_noelem) ? br_ecount : -1;
+                int my_ei = br_cur_ei;
+                if (!closing && !br_noelem) br_ecount++;
+                br_pending_ov = -1;
                 br_tag(d + i + 1, j > i + 1 ? j - i - 1 : 0);
+                br_cur_ei = -1;
                 int sc = n_starts((const char *)d + i + 1, "script"), st = n_starts((const char *)d + i + 1, "style");
                 if (sc || st) {                                                              /* skip the code */
                     const char *end = sc ? "</script" : "</style";
                     u32 k = j + 1;
                     while (k < n && !(d[k] == '<' && n_starts((const char *)d + k, end))) k++;
                     while (k < n && d[k] != '>') k++;
+                    if (sc && !br_noelem) {                                                  /* what document.write put here */
+                        int idx = 0, found = -1;
+                        for (int b = 0; b < br_nblk; b++) if (br_blk[b].kind >= 2) { if (br_blk[b].at == i) { found = b; break; } idx++; }
+                        (void)idx;
+                        if (found >= 0 && br_swrite[found]) br_frag(js_heap + br_swrite[found], js_len(js_heap + br_swrite[found]));
+                    }
                     i = k + 1; continue;
+                }
+                if (br_pending_ov >= 0 && my_ei >= 0) {                                      /* content replaced by a script */
+                    struct brel *E = &br_el[my_ei];
+                    br_pending_ov = -1;
+                    br_frag(js_heap + E->ov, js_len(js_heap + E->ov));
+                    br_ecount = E->enext;                                                    /* the skipped elements still count */
+                    i = E->iend > j + 1 ? E->iend : j + 1; continue;
                 }
             }
             i = j + 1; continue;
@@ -3684,9 +3900,16 @@ static void br_html(const u8 *d, u32 n) {
         br_put(c); i++;
     }
 }
+/* lay out a piece of HTML that did not come from the page source (document.write, innerHTML, appendChild) */
+static void br_frag(const char *html, int n) {
+    int saved = br_noelem; br_noelem = 1;
+    br_html((const u8 *)html, (u32)n);
+    br_noelem = saved;
+}
 static void br_reset_page(void) {
     br_n = br_rs = 0; br_nrows = 0; br_col = 0; br_lastsp = -1; br_full = 0; br_bk = BK_NORMAL; br_ind = 0; br_pre = 0; br_bold = 0;
     br_cur_link = 0; br_intitle = 0; br_depth = 0; br_nlinks = 0; br_title[0] = 0; br_scroll = 0;
+    br_sd = 0; br_pagebg = CSS_NONE; br_pretag = 0; br_apply_state();
     br_txt_lim = BR_TXT - 64; br_row_lim = BR_ROWS - 4;
 }
 static void br_notice(const char *msg) {          /* a line after the page, even when the page filled the buffers */
@@ -3697,24 +3920,605 @@ static void br_set_title(void) {
     if (br_title[0]) ksnprintf(br_wtitle, sizeof br_wtitle, "%s - Browser", br_title); else kstrcpy(br_wtitle, "Browser", sizeof br_wtitle);
     wins[A_BROWSER].title = br_wtitle;
 }
+/* ---------------------------- scanning the page --------------------------- */
+static int br_is_letter(u8 c) { return (c | 32) >= 'a' && (c | 32) <= 'z'; }
+/* one pass over the source: element table, <style>/<script> blocks and external files to fetch (same tokenizing as br_html) */
+static void br_scan(void) {
+    const u8 *d = br_page; u32 n = br_page_n, i = 0; int stk[64], sp = 0;
+    br_nel = 0; br_nblk = 0; br_nres = 0; br_ecount = 0;
+    while (i < n) {
+        if (d[i] != '<') { i++; continue; }
+        if (!(i + 1 < n && (d[i + 1] == '!' || d[i + 1] == '/' || d[i + 1] == '?' || br_is_letter(d[i + 1])))) { i++; continue; }
+        if (d[i + 1] == '!' && i + 3 < n && d[i + 2] == '-' && d[i + 3] == '-') {
+            i += 4; while (i + 2 < n && !(d[i] == '-' && d[i + 1] == '-' && d[i + 2] == '>')) i++;
+            i += 3; continue;
+        }
+        u32 j = i + 1; u8 q = 0;
+        while (j < n) { if (q) { if (d[j] == q) q = 0; } else if (d[j] == '"' || d[j] == '\'') q = d[j]; else if (d[j] == '>') break; j++; }
+        if (d[i + 1] == '!' || d[i + 1] == '?') { i = j + 1; continue; }
+        int closing = d[i + 1] == '/';
+        char nm[12]; int nl = 0; u32 k = i + 1 + (u32)closing;
+        while (k < n && nl < 11 && ((d[k] >= 'a' && d[k] <= 'z') || (d[k] >= 'A' && d[k] <= 'Z') || (d[k] >= '0' && d[k] <= '9'))) nm[nl++] = klower((char)d[k++]);
+        nm[nl] = 0;
+        if (closing) {
+            char tn[10]; br_tn(nm, tn);
+            for (int m = sp - 1; m >= 0; m--) if (!kstrcmp(br_el[stk[m]].tag, tn)) {
+                for (int p = sp - 1; p >= m; p--) { br_el[stk[p]].iend = i; br_el[stk[p]].enext = (u16)br_ecount; }
+                sp = m; break;
+            }
+            i = j + 1; continue;
+        }
+        const u8 *tg = d + i + 1; u32 tl = j > i + 1 ? j - i - 1 : 0;
+        int ei = br_ecount++;
+        struct brel *E = ei < BR_ELS ? &br_el[ei] : NULL;
+        if (E) {
+            memset(E, 0, sizeof *E);
+            br_tn(nm, E->tag); br_attr(tg, tl, "id", E->id, sizeof E->id); br_attr(tg, tl, "class", E->cls, sizeof E->cls);
+            E->ostart = i; E->oend = j; E->ibeg = E->iend = j + 1; E->parent = (short)(sp ? stk[sp - 1] : -1); E->enext = (u16)(ei + 1);
+            char code[400];
+            if (br_attr(tg, tl, "onclick", code, sizeof code)) { char dec[400]; br_unent(dec, code, sizeof dec); E->jsclick = js_newstr(dec, slen(dec)); }
+            br_nel = ei + 1;
+        }
+        int sc = n_starts((const char *)tg, "script"), st = n_starts((const char *)tg, "style");
+        if (sc || st) {
+            const char *end = sc ? "</script" : "</style";
+            u32 body = j + 1, e = body;
+            while (e < n && !(d[e] == '<' && n_starts((const char *)d + e, end))) e++;
+            u32 after = e; while (after < n && d[after] != '>') after++;
+            if (E) { E->iend = e; E->enext = (u16)br_ecount; }
+            char ty[40] = "", src[200] = "", media[40] = "";
+            br_attr(tg, tl, "type", ty, sizeof ty); br_attr(tg, tl, "src", src, sizeof src); br_attr(tg, tl, "media", media, sizeof media);
+            if (br_nblk < BR_BLK) {
+                struct brblk *b = &br_blk[br_nblk];
+                b->at = i; b->off = body; b->len = e - body; b->res = -1;
+                if (st) {
+                    if (!(media[0] && n_starts(media, "print") && !n_starts(media, "print and screen"))) { b->kind = 0; br_nblk++; }
+                } else {
+                    int ok = !ty[0] || n_starts(ty, "text/javascript") || n_starts(ty, "application/javascript") || n_starts(ty, "text/ecmascript");
+                    if (ok && src[0] && br_nres < BR_RES) {
+                        url_join(br_page_url, src, br_res[br_nres].url, sizeof br_res[0].url); br_res[br_nres].state = 0; b->kind = 3; b->res = br_nres++; br_nblk++;
+                    } else if (ok && !src[0]) { b->kind = 2; br_nblk++; }
+                }
+            }
+            i = after + 1; continue;
+        }
+        if (!kstrcmp(nm, "link") && br_nblk < BR_BLK && br_nres < BR_RES) {
+            char rel[40] = "", href[200] = "";
+            br_attr(tg, tl, "rel", rel, sizeof rel); br_attr(tg, tl, "href", href, sizeof href);
+            for (char *p = rel; *p; p++) *p = klower(*p);
+            if (href[0] && kstrcmp(rel, "") && (n_starts(rel, "stylesheet") || slen(rel) > 10)) {
+                int is_css = 0; for (int m = 0; rel[m]; m++) if (!kmemcmp(rel + m, "stylesheet", 10)) is_css = 1;
+                if (is_css) {
+                    struct brblk *b = &br_blk[br_nblk++]; b->at = i; b->off = 0; b->len = 0; b->kind = 1; b->res = br_nres;
+                    url_join(br_page_url, href, br_res[br_nres].url, sizeof br_res[0].url); br_res[br_nres].state = 0; br_nres++;
+                }
+            }
+        }
+        int selfclose = j > i + 1 && d[j - 1] == '/';
+        if (E && !br_is_void(nm) && !selfclose && sp < 64) stk[sp++] = ei;
+        i = j + 1;
+    }
+    for (int m = 0; m < sp; m++) { br_el[stk[m]].iend = n; br_el[stk[m]].enext = (u16)br_ecount; }
+}
+
+/* ------------------------------- the DOM for JavaScript ------------------------------- */
+static int br_find_id(const char *id) {
+    if (!id[0]) return -1;
+    for (int k = 0; k < br_nel; k++) if (!kstrcmp(br_el[k].id, id)) return k;
+    return -1;
+}
+static void br_jv_str(struct jv *out, const char *s, int n) { *out = js_mk(JT_STR, js_newstr(s, n)); }
+static void br_escape_html(char *dst, int max, const char *src) {
+    int o = 0;
+    for (int i = 0; src[i] && o < max - 6; i++) {
+        char c = src[i];
+        if (c == '&') { memcpy(dst + o, "&amp;", 5); o += 5; } else if (c == '<') { memcpy(dst + o, "&lt;", 4); o += 4; }
+        else if (c == '>') { memcpy(dst + o, "&gt;", 4); o += 4; } else dst[o++] = c;
+    }
+    dst[o] = 0;
+}
+static void br_strip_tags(char *dst, int max, const char *src, int n) {
+    int o = 0, intag = 0;
+    for (int i = 0; i < n && o < max - 1; i++) {
+        if (src[i] == '<') { intag = 1; continue; }
+        if (src[i] == '>' && intag) { intag = 0; continue; }
+        if (!intag) dst[o++] = src[i];
+    }
+    dst[o] = 0;
+    char tmp[2048]; br_unent(tmp, dst, sizeof tmp); kstrcpy(dst, tmp, max);
+}
+static char br_cssbuf[2200];
+static const char *br_el_html(int idx, int *n) {                       /* inner HTML of an element (original text, or what a script put there) */
+    static char buf[6000]; int o = 0;
+    if (idx >= BR_CREATED) { struct brnew *w = &br_new[idx - BR_CREATED]; *n = w->html ? slen(js_heap + w->html) : 0; return js_heap + w->html; }
+    struct brel *E = &br_el[idx];
+    if (E->ovmode) { const char *p = js_heap + E->ov; o = slen(p); if (o > 5000) o = 5000; memcpy(buf, p, (size_t)o); }
+    else { o = (int)(E->iend - E->ibeg); if (o > 5000) o = 5000; memcpy(buf, br_page + E->ibeg, (size_t)o); }
+    if (E->ovapp) { const char *p = js_heap + E->ovapp; int l = slen(p); if (o + l > 5900) l = 5900 - o; memcpy(buf + o, p, (size_t)l); o += l; }
+    buf[o] = 0; *n = o; return buf;
+}
+static void br_attr_of(int idx, const char *key, char *out, int max) {
+    out[0] = 0;
+    if (idx >= BR_CREATED) return;
+    struct brel *E = &br_el[idx];
+    br_attr(br_page + E->ostart + 1, E->oend - E->ostart - 1, key, out, max);
+}
+static char *br_jstyle_of(int idx, int *cap) {
+    if (idx >= BR_CREATED) { *cap = sizeof br_new[0].jstyle; return br_new[idx - BR_CREATED].jstyle; }
+    *cap = sizeof br_el[0].jstyle; return br_el[idx].jstyle;
+}
+/* set one property in a "prop:value;" list, replacing an old value; the oldest entries make room when it is full */
+static void br_jstyle_set(char *list, int cap, const char *prop, const char *val) {
+    char out[96]; int o = 0, pl = slen(prop);
+    for (const char *p = list; *p;) {
+        const char *e = p; while (*e && *e != ';') e++;
+        int l = (int)(e - p);
+        if (!(l > pl && !kmemcmp(p, prop, (size_t)pl) && p[pl] == ':') && o + l + 1 < (int)sizeof out) { memcpy(out + o, p, (size_t)l); o += l; out[o++] = ';'; }
+        p = *e ? e + 1 : e;
+    }
+    out[o] = 0;
+    if (val[0]) {
+        char add[96]; int al = ksnprintf(add, sizeof add, "%s:%s;", prop, val);
+        while (o + al >= cap && o > 0) { char *semi = out; while (*semi && *semi != ';') semi++; if (!*semi) { o = 0; break; } semi++; memmove(out, semi, (size_t)(o - (int)(semi - out)) + 1); o -= (int)(semi - out); }
+        if (o + al < cap && al < (int)sizeof add) { memcpy(out + o, add, (size_t)al); o += al; out[o] = 0; }
+    }
+    kstrcpy(list, out, cap);
+}
+static void br_camel_to_css(char *dst, int max, const char *src) {
+    int o = 0;
+    for (int i = 0; src[i] && o < max - 2; i++) {
+        if (src[i] >= 'A' && src[i] <= 'Z') { dst[o++] = '-'; dst[o++] = (char)(src[i] + 32); } else dst[o++] = src[i];
+    }
+    dst[o] = 0;
+}
+static void br_class_edit(int idx, const char *cls, int mode, int *has) {      /* mode 0 add, 1 remove, 2 toggle, 3 test */
+    char cur[200], out[200]; int o = 0, found = 0;
+    if (idx >= BR_CREATED) { struct brnew *w = &br_new[idx - BR_CREATED]; kstrcpy(cur, w->jcls ? js_heap + w->jcls : "", sizeof cur); }
+    else if (br_el[idx].jcls) kstrcpy(cur, js_heap + br_el[idx].jcls, sizeof cur);
+    else br_attr_of(idx, "class", cur, sizeof cur);
+    int cl = slen(cls);
+    for (const char *p = cur; *p;) {
+        while (*p == ' ') p++;
+        const char *e = p; while (*e && *e != ' ') e++;
+        int l = (int)(e - p); if (!l) break;
+        if (l == cl && !kmemcmp(p, cls, (size_t)l)) { found = 1; if (mode == 1 || mode == 2) { p = e; continue; } }
+        if (o + l + 1 < (int)sizeof out) { memcpy(out + o, p, (size_t)l); o += l; out[o++] = ' '; }
+        p = e;
+    }
+    if (!found && (mode == 0 || mode == 2) && o + cl + 1 < (int)sizeof out) { memcpy(out + o, cls, (size_t)cl); o += cl; out[o++] = ' '; }
+    while (o && out[o - 1] == ' ') o--;
+    out[o] = 0; *has = found;
+    if (mode == 3) return;
+    u32 v = js_newstr(out, o); if (!v) v = 0;
+    if (idx >= BR_CREATED) br_new[idx - BR_CREATED].jcls = v; else br_el[idx].jcls = v;
+    br_js_dirty = 1;
+}
+static const char *br_tag_of(int idx) { return idx >= BR_CREATED ? br_new[idx - BR_CREATED].tag : br_el[idx].tag; }
+/* HTML text of an element created with createElement, for appendChild */
+static void br_serialize(int idx, char *out, int max) {
+    if (idx >= BR_CREATED) {
+        struct brnew *w = &br_new[idx - BR_CREATED];
+        if (!kstrcmp(w->tag, "#text")) { kstrcpy(out, w->html ? js_heap + w->html : "", max); return; }
+        ksnprintf(out, max, "<%s%s%s%s%s%s%s>%s</%s>", w->tag, w->id[0] ? " id=\"" : "", w->id, w->id[0] ? "\"" : "", w->jcls ? " class=\"" : "", w->jcls ? js_heap + w->jcls : "",
+                  w->jcls ? "\"" : "", w->html ? js_heap + w->html : "", w->tag);
+        if (w->jstyle[0]) { char t[400]; ksnprintf(t, sizeof t, "<%s style=\"%s\"%s%s%s>%s</%s>", w->tag, w->jstyle, w->jcls ? " class=\"" : "", w->jcls ? js_heap + w->jcls : "", w->jcls ? "\"" : "", w->html ? js_heap + w->html : "", w->tag); kstrcpy(out, t, max); }
+    } else { int n; const char *h = br_el_html(idx, &n); ksnprintf(out, max, "<%s>%s</%s>", br_el[idx].tag, h, br_el[idx].tag); }
+}
+static void br_append_html(int idx, const char *html) {
+    int l = slen(html);
+    if (idx >= BR_CREATED) {
+        struct brnew *w = &br_new[idx - BR_CREATED]; int ol = w->html ? slen(js_heap + w->html) : 0;
+        char *tmp = (char *)&br_cssbuf; if (ol + l >= (int)sizeof br_cssbuf) return;
+        if (ol) memcpy(tmp, js_heap + w->html, (size_t)ol);
+        memcpy(tmp + ol, html, (size_t)l); w->html = js_newstr(tmp, ol + l);
+    } else {
+        struct brel *E = &br_el[idx]; int ol = E->ovapp ? slen(js_heap + E->ovapp) : 0;
+        if (ol + l >= (int)sizeof br_cssbuf) return;
+        char *tmp = (char *)&br_cssbuf; if (ol) memcpy(tmp, js_heap + E->ovapp, (size_t)ol);
+        memcpy(tmp + ol, html, (size_t)l); E->ovapp = js_newstr(tmp, ol + l);
+    }
+    br_js_dirty = 1;
+}
+static void br_set_content(int idx, const char *html) {
+    if (idx >= BR_CREATED) { br_new[idx - BR_CREATED].html = js_newstr(html, slen(html)); return; }
+    br_el[idx].ov = js_newstr(html, slen(html)); br_el[idx].ovmode = 1; br_el[idx].ovapp = 0; br_js_dirty = 1;
+}
+static struct jv br_elem(int idx) { return idx < 0 ? js_mk(JT_NULL, 0) : js_mk(JT_ELEM, idx); }
+/* simple selectors: "#id", ".class", "tag", "tag.class" and chains of them; comma lists */
+static int br_match_sel(int ei, const char *sel, int sl) {
+    struct cel stack[CSS_MAXDEPTH]; int chain[CSS_MAXDEPTH], nc = 0;
+    for (int k = ei; k >= 0 && nc < CSS_MAXDEPTH; k = br_el[k].parent) chain[nc++] = k;
+    for (int k = 0; k < nc; k++) {
+        struct brel *E = &br_el[chain[nc - 1 - k]]; char cls[60];
+        br_attr(br_page + E->ostart + 1, E->oend - E->ostart - 1, "class", cls, sizeof cls);
+        if (E->jcls) kstrcpy(cls, js_heap + E->jcls, sizeof cls);
+        css_el_init(&stack[k], E->tag, slen(E->tag), E->id, slen(E->id), cls, slen(cls));
+    }
+    int i = 0;
+    while (i <= sl) {
+        int st = i; while (i < sl && sel[i] != ',') i++;
+        struct csssel r;
+        if (css_parse_selector(sel + st, i - st, &r) && css_sel_match(&r, stack, nc - 1)) return 1;
+        i++;
+    }
+    return 0;
+}
+static int br_in_subtree(int root, int k) { return root < 0 || (k > root && k < (int)br_el[root].enext); }
+static struct jv br_query_all(int root, const char *sel, int first) {
+    struct jv arr = first ? js_undef : js_new_arr(8);
+    int sl = slen(sel);
+    for (int k = 0; k < br_nel; k++) {
+        if (!br_in_subtree(root, k) || !br_match_sel(k, sel, sl)) continue;
+        if (first) return br_elem(k);
+        js_arr_push(arr, br_elem(k));
+    }
+    return first ? js_mk(JT_NULL, 0) : arr;
+}
+static struct jv br_by_class_or_tag(int root, const char *name, int by_class) {
+    struct jv arr = js_new_arr(8);
+    for (int k = 0; k < br_nel; k++) {
+        if (!br_in_subtree(root, k)) continue;
+        int ok;
+        if (by_class) { int has; br_class_edit(k, name, 3, &has); ok = has; }
+        else { ok = !kstrcmp(name, "*"); char tn[10]; br_tn(name, tn); for (char *p = tn; *p; p++) *p = klower(*p); if (!kstrcmp(tn, br_el[k].tag)) ok = 1; }
+        if (ok) js_arr_push(arr, br_elem(k));
+    }
+    return arr;
+}
+static void br_nav_to(const char *u) { kstrcpy(br_nav, u, sizeof br_nav); }
+static int br_js_get(struct jv o, const char *p, struct jv *out) {
+    int idx = (int)o.n; char tmp[400];
+    if (o.t == JT_ELEM) {
+        if (idx < 0 || (idx < BR_CREATED && idx >= br_nel) || (idx >= BR_CREATED && idx - BR_CREATED >= br_nnew)) return 0;
+        int created = idx >= BR_CREATED;
+        if (!kstrcmp(p, "id")) { br_jv_str(out, created ? br_new[idx - BR_CREATED].id : br_el[idx].id, -1 + 1 + slen(created ? br_new[idx - BR_CREATED].id : br_el[idx].id)); return 1; }
+        if (!kstrcmp(p, "tagName") || !kstrcmp(p, "nodeName")) { char t[12]; kstrcpy(t, br_tag_of(idx), sizeof t); for (char *c = t; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32); br_jv_str(out, t, slen(t)); return 1; }
+        if (!kstrcmp(p, "innerHTML")) { int n; const char *h = br_el_html(idx, &n); br_jv_str(out, h, n); return 1; }
+        if (!kstrcmp(p, "textContent") || !kstrcmp(p, "innerText")) { int n; const char *h = br_el_html(idx, &n); static char tb[2048]; br_strip_tags(tb, sizeof tb, h, n); br_jv_str(out, tb, slen(tb)); return 1; }
+        if (!kstrcmp(p, "className")) {
+            if (created) { struct brnew *w = &br_new[idx - BR_CREATED]; br_jv_str(out, w->jcls ? js_heap + w->jcls : "", w->jcls ? slen(js_heap + w->jcls) : 0); }
+            else if (br_el[idx].jcls) br_jv_str(out, js_heap + br_el[idx].jcls, slen(js_heap + br_el[idx].jcls));
+            else { br_attr_of(idx, "class", tmp, sizeof tmp); br_jv_str(out, tmp, slen(tmp)); }
+            return 1;
+        }
+        if (!kstrcmp(p, "value")) {
+            if (!created && br_el[idx].value) { br_jv_str(out, js_heap + br_el[idx].value, slen(js_heap + br_el[idx].value)); return 1; }
+            br_attr_of(idx, "value", tmp, sizeof tmp); br_jv_str(out, tmp, slen(tmp)); return 1;
+        }
+        if (!kstrcmp(p, "style")) { *out = js_mk(JT_STYLE, idx); return 1; }
+        if (!kstrcmp(p, "classList")) { *out = js_mk(JT_STYLE, ((js_s64)1 << 24) | idx); return 1; }
+        if (!kstrcmp(p, "onclick")) { *out = !created && br_el[idx].has_fn ? br_el[idx].fn : js_mk(JT_NULL, 0); return 1; }
+        if (!kstrcmp(p, "parentNode") || !kstrcmp(p, "parentElement")) { *out = br_elem(created ? -1 : br_el[idx].parent); return 1; }
+        if (!kstrcmp(p, "checked")) { br_attr_of(idx, "checked", tmp, sizeof tmp); char t2[8]; *out = js_bool(!created && br_attr(br_page + br_el[idx].ostart + 1, br_el[idx].oend - br_el[idx].ostart - 1, "checked", t2, sizeof t2)); return 1; }
+        if (!kstrcmp(p, "children") || !kstrcmp(p, "childNodes")) {
+            struct jv arr = js_new_arr(8);
+            if (!created) for (int k = idx + 1; k < (int)br_el[idx].enext && k < br_nel; k = (int)br_el[k].enext) js_arr_push(arr, br_elem(k));
+            *out = arr; return 1;
+        }
+        if (!created && (!kstrcmp(p, "href") || !kstrcmp(p, "src") || !kstrcmp(p, "title") || !kstrcmp(p, "type") || !kstrcmp(p, "name") || !kstrcmp(p, "placeholder") || !kstrcmp(p, "alt"))) {
+            br_attr_of(idx, p, tmp, sizeof tmp); br_jv_str(out, tmp, slen(tmp)); return 1;
+        }
+        if (!kstrcmp(p, "offsetWidth") || !kstrcmp(p, "clientWidth") || !kstrcmp(p, "offsetHeight") || !kstrcmp(p, "clientHeight")) { *out = js_num_i(0); return 1; }
+        return 0;
+    }
+    if (o.t == JT_STYLE) {
+        int kind = (int)(o.n >> 24), id2 = (int)(o.n & 0xFFFFFF);
+        if (kind) { if (!kstrcmp(p, "length")) { *out = js_num_i(0); return 1; } return 0; }
+        int cap; char *list = br_jstyle_of(id2, &cap); char prop[48]; br_camel_to_css(prop, sizeof prop, p);
+        int pl = slen(prop);
+        for (const char *q = list; *q;) { const char *e = q; while (*e && *e != ';') e++; if ((int)(e - q) > pl && !kmemcmp(q, prop, (size_t)pl) && q[pl] == ':') { br_jv_str(out, q + pl + 1, (int)(e - q) - pl - 1); return 1; } q = *e ? e + 1 : e; }
+        br_jv_str(out, "", 0); return 1;
+    }
+    if (o.t == JT_DOC) {
+        if (!kstrcmp(p, "title")) { br_jv_str(out, br_title, slen(br_title)); return 1; }
+        if (!kstrcmp(p, "body")) { for (int k = 0; k < br_nel; k++) if (!kstrcmp(br_el[k].tag, "body")) { *out = br_elem(k); return 1; } *out = js_mk(JT_NULL, 0); return 1; }
+        if (!kstrcmp(p, "documentElement")) { for (int k = 0; k < br_nel; k++) if (!kstrcmp(br_el[k].tag, "html")) { *out = br_elem(k); return 1; } *out = js_mk(JT_NULL, 0); return 1; }
+        if (!kstrcmp(p, "head")) { for (int k = 0; k < br_nel; k++) if (!kstrcmp(br_el[k].tag, "head")) { *out = br_elem(k); return 1; } *out = js_mk(JT_NULL, 0); return 1; }
+        if (!kstrcmp(p, "readyState")) { br_jv_str(out, "complete", 8); return 1; }
+        if (!kstrcmp(p, "cookie") || !kstrcmp(p, "referrer")) { br_jv_str(out, "", 0); return 1; }
+        if (!kstrcmp(p, "URL") || !kstrcmp(p, "documentURI")) { br_jv_str(out, br_page_url, slen(br_page_url)); return 1; }
+        if (!kstrcmp(p, "location")) { *out = js_mk(JT_LOC, 0); return 1; }
+        return 0;
+    }
+    if (o.t == JT_WIN) {
+        if (!kstrcmp(p, "innerWidth") || !kstrcmp(p, "outerWidth")) { *out = js_num_i(CW(A_BROWSER) - 14); return 1; }
+        if (!kstrcmp(p, "innerHeight") || !kstrcmp(p, "outerHeight")) { *out = js_num_i(br_viewh()); return 1; }
+        if (!kstrcmp(p, "location")) { *out = js_mk(JT_LOC, 0); return 1; }
+        if (!kstrcmp(p, "document")) { *out = js_mk(JT_DOC, 0); return 1; }
+        return 0;
+    }
+    if (o.t == JT_LOC) {
+        const char *u = br_page_url; int https = n_starts(u, "https://"); const char *h = u + (https ? 8 : n_starts(u, "http://") ? 7 : 0);
+        int hl = 0; while (h[hl] && h[hl] != '/' && h[hl] != '?' && h[hl] != '#') hl++;
+        const char *pa = h + hl; int pl = 0; while (pa[pl] && pa[pl] != '?' && pa[pl] != '#') pl++;
+        const char *se = pa + pl; int sl = 0; while (se[sl] && se[sl] != '#') sl++;
+        if (!kstrcmp(p, "href")) { br_jv_str(out, u, slen(u)); return 1; }
+        if (!kstrcmp(p, "host") || !kstrcmp(p, "hostname")) { int l = hl; if (!kstrcmp(p, "hostname")) for (int k = 0; k < hl; k++) if (h[k] == ':') { l = k; break; } br_jv_str(out, h, l); return 1; }
+        if (!kstrcmp(p, "pathname")) { if (pl) br_jv_str(out, pa, pl); else br_jv_str(out, "/", 1); return 1; }
+        if (!kstrcmp(p, "search")) { br_jv_str(out, se, sl); return 1; }
+        if (!kstrcmp(p, "protocol")) { br_jv_str(out, https ? "https:" : "http:", https ? 6 : 5); return 1; }
+        if (!kstrcmp(p, "origin")) { ksnprintf(tmp, sizeof tmp, "%s//%.*s", https ? "https:" : "http:", hl, h); br_jv_str(out, tmp, slen(tmp)); return 1; }
+        return 0;
+    }
+    return 0;
+}
+static int br_js_set(struct jv o, const char *p, struct jv v) {
+    int idx = (int)o.n; char tmp[1200];
+    if (o.t == JT_ELEM) {
+        if (idx < 0 || (idx < BR_CREATED && idx >= br_nel) || (idx >= BR_CREATED && idx - BR_CREATED >= br_nnew)) return 0;
+        int created = idx >= BR_CREATED;
+        struct jv sv = (v.t == JT_STR) ? v : js_tostr(v);
+        if (!kstrcmp(p, "innerHTML")) { br_set_content(idx, js_cs(sv)); return 1; }
+        if (!kstrcmp(p, "textContent") || !kstrcmp(p, "innerText")) { br_escape_html(tmp, sizeof tmp, js_cs(sv)); br_set_content(idx, tmp); return 1; }
+        if (!kstrcmp(p, "className")) { u32 s = js_newstr(js_cs(sv), slen(js_cs(sv))); if (created) br_new[idx - BR_CREATED].jcls = s; else br_el[idx].jcls = s; br_js_dirty = 1; return 1; }
+        if (!kstrcmp(p, "value")) { if (!created) br_el[idx].value = js_newstr(js_cs(sv), slen(js_cs(sv))); br_js_dirty = 1; return 1; }
+        if (!kstrcmp(p, "id")) { kstrcpy(created ? br_new[idx - BR_CREATED].id : br_el[idx].id, js_cs(sv), 20); return 1; }
+        if (!kstrcmp(p, "onclick")) { if (!created) { if (js_is_fn(v)) { br_el[idx].fn = v; br_el[idx].has_fn = 1; } else br_el[idx].has_fn = 0; br_js_dirty = 1; } return 1; }
+        if (!kstrcmp(p, "style")) { int cap; char *l = br_jstyle_of(idx, &cap); kstrcpy(l, js_cs(sv), cap); br_js_dirty = 1; return 1; }
+        if (!kstrcmp(p, "hidden")) { int cap; char *l = br_jstyle_of(idx, &cap); br_jstyle_set(l, cap, "display", js_truthy(v) ? "none" : ""); br_js_dirty = 1; return 1; }
+        return 1;                                           /* other properties are accepted and ignored */
+    }
+    if (o.t == JT_STYLE) {
+        int kind = (int)(o.n >> 24), id2 = (int)(o.n & 0xFFFFFF);
+        if (kind) return 1;
+        int cap; char *list = br_jstyle_of(id2, &cap); struct jv sv = (v.t == JT_STR) ? v : js_tostr(v);
+        if (!kstrcmp(p, "cssText")) { kstrcpy(list, js_cs(sv), cap); br_js_dirty = 1; return 1; }
+        char prop[48]; br_camel_to_css(prop, sizeof prop, p);
+        br_jstyle_set(list, cap, prop, js_cs(sv)); br_js_dirty = 1; return 1;
+    }
+    if (o.t == JT_DOC) {
+        if (!kstrcmp(p, "title")) { struct jv sv = js_tostr(v); kstrcpy(br_title, js_cs(sv), sizeof br_title); kstrcpy(br_jstitle, js_cs(sv), sizeof br_jstitle); br_js_dirty = 1; return 1; }
+        return 1;
+    }
+    if (o.t == JT_WIN) {
+        if (!kstrcmp(p, "onload")) { if (js_is_fn(v) && br_loadq_n < 8) br_loadq[br_loadq_n++] = v; return 1; }
+        if (!kstrcmp(p, "location")) { struct jv sv = js_tostr(v); char u[330]; url_join(br_page_url, js_cs(sv), u, sizeof u); br_nav_to(u); return 1; }
+        return 0;
+    }
+    if (o.t == JT_LOC) {
+        if (!kstrcmp(p, "href") || !kstrcmp(p, "pathname") || !kstrcmp(p, "search")) { struct jv sv = js_tostr(v); char u[330]; url_join(br_page_url, js_cs(sv), u, sizeof u); br_nav_to(u); }
+        return 1;
+    }
+    return 0;
+}
+static int br_js_call(struct jv o, const char *m, struct jv *a, int n, struct jv *res) {
+    char tmp[1200]; *res = js_undef;
+    if (o.t == JT_DOC) {
+        if (!kstrcmp(m, "getElementById") && n) { struct jv sv = js_tostr(a[0]); *res = br_elem(br_find_id(js_cs(sv))); return 1; }
+        if (!kstrcmp(m, "querySelector") && n) { struct jv sv = js_tostr(a[0]); *res = br_query_all(-1, js_cs(sv), 1); return 1; }
+        if (!kstrcmp(m, "querySelectorAll") && n) { struct jv sv = js_tostr(a[0]); *res = br_query_all(-1, js_cs(sv), 0); return 1; }
+        if (!kstrcmp(m, "getElementsByClassName") && n) { struct jv sv = js_tostr(a[0]); *res = br_by_class_or_tag(-1, js_cs(sv), 1); return 1; }
+        if (!kstrcmp(m, "getElementsByTagName") && n) { struct jv sv = js_tostr(a[0]); *res = br_by_class_or_tag(-1, js_cs(sv), 0); return 1; }
+        if (!kstrcmp(m, "createElement") || !kstrcmp(m, "createTextNode")) {
+            if (br_nnew >= BR_NEW) { js_throw_err("RangeError", "too many created elements"); return 1; }
+            struct brnew *w = &br_new[br_nnew]; memset(w, 0, sizeof *w);
+            struct jv sv = n ? js_tostr(a[0]) : js_s("div");
+            if (m[6] == 'T') { kstrcpy(w->tag, "#text", sizeof w->tag); br_escape_html(tmp, sizeof tmp, js_cs(sv)); w->html = js_newstr(tmp, slen(tmp)); }
+            else { kstrcpy(w->tag, js_cs(sv), sizeof w->tag); for (char *c = w->tag; *c; c++) *c = klower(*c); }
+            *res = js_mk(JT_ELEM, BR_CREATED + br_nnew++); return 1;
+        }
+        if (!kstrcmp(m, "write") || !kstrcmp(m, "writeln")) {
+            for (int i = 0; i < n; i++) { struct jv sv = js_tostr(a[i]); int l = slen(js_cs(sv)); if (br_wn + l + 2 < (int)sizeof br_wbuf) { memcpy(br_wbuf + br_wn, js_cs(sv), (size_t)l); br_wn += l; } }
+            if (m[5] == 'l' && br_wn + 1 < (int)sizeof br_wbuf) br_wbuf[br_wn++] = '\n';
+            if (br_swrite_after_load) { br_late = js_newstr(br_wbuf, br_wn); br_js_dirty = 1; }
+            return 1;
+        }
+        if (!kstrcmp(m, "addEventListener") && n > 1) {
+            struct jv t = js_tostr(a[0]);
+            if ((!kstrcmp(js_cs(t), "DOMContentLoaded") || !kstrcmp(js_cs(t), "load")) && js_is_fn(a[1]) && br_loadq_n < 8) br_loadq[br_loadq_n++] = a[1];
+            return 1;
+        }
+        if (!kstrcmp(m, "removeEventListener") || !kstrcmp(m, "hasFocus")) return 1;
+        return 0;
+    }
+    if (o.t == JT_WIN) {
+        if (!kstrcmp(m, "addEventListener") && n > 1) {
+            struct jv t = js_tostr(a[0]);
+            if ((!kstrcmp(js_cs(t), "DOMContentLoaded") || !kstrcmp(js_cs(t), "load")) && js_is_fn(a[1]) && br_loadq_n < 8) br_loadq[br_loadq_n++] = a[1];
+            return 1;
+        }
+        if (!kstrcmp(m, "removeEventListener") || !kstrcmp(m, "scrollTo") || !kstrcmp(m, "focus") || !kstrcmp(m, "blur") || !kstrcmp(m, "close")) return 1;
+        if (!kstrcmp(m, "open") && n) { struct jv sv = js_tostr(a[0]); char u[330]; url_join(br_page_url, js_cs(sv), u, sizeof u); br_nav_to(u); return 1; }
+        return 0;
+    }
+    if (o.t == JT_LOC) {
+        if (!kstrcmp(m, "reload")) { br_nav_to(br_page_url); return 1; }
+        if ((!kstrcmp(m, "assign") || !kstrcmp(m, "replace")) && n) { struct jv sv = js_tostr(a[0]); char u[330]; url_join(br_page_url, js_cs(sv), u, sizeof u); br_nav_to(u); return 1; }
+        return 0;
+    }
+    if (o.t == JT_STYLE && (o.n >> 24) == 1) {                      /* element.classList */
+        int idx = (int)(o.n & 0xFFFFFF), has = 0;
+        if (n < 1) return 1;
+        struct jv sv = js_tostr(a[0]);
+        if (!kstrcmp(m, "add")) { br_class_edit(idx, js_cs(sv), 0, &has); return 1; }
+        if (!kstrcmp(m, "remove")) { br_class_edit(idx, js_cs(sv), 1, &has); return 1; }
+        if (!kstrcmp(m, "toggle")) { br_class_edit(idx, js_cs(sv), 2, &has); *res = js_bool(!has); return 1; }
+        if (!kstrcmp(m, "contains")) { br_class_edit(idx, js_cs(sv), 3, &has); *res = js_bool(has); return 1; }
+        return 0;
+    }
+    if (o.t == JT_ELEM) {
+        int idx = (int)o.n; int created = idx >= BR_CREATED;
+        if (idx < 0 || (!created && idx >= br_nel) || (created && idx - BR_CREATED >= br_nnew)) return 0;
+        if (!kstrcmp(m, "getAttribute") && n) { struct jv sv = js_tostr(a[0]); br_attr_of(idx, js_cs(sv), tmp, sizeof tmp); if (!tmp[0] && !kstrcmp(js_cs(sv), "class") && !created && br_el[idx].jcls) kstrcpy(tmp, js_heap + br_el[idx].jcls, sizeof tmp); *res = tmp[0] ? js_str(tmp) : js_mk(JT_NULL, 0); return 1; }
+        if (!kstrcmp(m, "hasAttribute") && n) { struct jv sv = js_tostr(a[0]); br_attr_of(idx, js_cs(sv), tmp, sizeof tmp); *res = js_bool(tmp[0] != 0); return 1; }
+        if (!kstrcmp(m, "setAttribute") && n > 1) {
+            struct jv k = js_tostr(a[0]), v = js_tostr(a[1]);
+            br_js_set(o, !kstrcmp(js_cs(k), "class") ? "className" : js_cs(k), v); return 1;
+        }
+        if (!kstrcmp(m, "removeAttribute")) return 1;
+        if (!kstrcmp(m, "addEventListener") && n > 1) {
+            struct jv t = js_tostr(a[0]);
+            if (!kstrcmp(js_cs(t), "click") && js_is_fn(a[1]) && !created) { br_el[idx].fn = a[1]; br_el[idx].has_fn = 1; br_js_dirty = 1; }
+            return 1;
+        }
+        if (!kstrcmp(m, "removeEventListener")) return 1;
+        if (!kstrcmp(m, "appendChild") || !kstrcmp(m, "append") || !kstrcmp(m, "prepend") || !kstrcmp(m, "insertBefore")) {
+            for (int i = 0; i < (kstrcmp(m, "insertBefore") ? n : (n ? 1 : 0)); i++) {
+                if (a[i].t == JT_ELEM) { br_serialize((int)a[i].n, tmp, sizeof tmp); br_append_html(idx, tmp); }
+                else if (a[i].t == JT_STR) { char e[1200]; br_escape_html(e, sizeof e, js_cs(a[i])); br_append_html(idx, e); }
+            }
+            if (n) *res = a[0];
+            return 1;
+        }
+        if (!kstrcmp(m, "remove") || !kstrcmp(m, "removeChild")) {
+            int tgt = !kstrcmp(m, "remove") ? idx : (n && a[0].t == JT_ELEM ? (int)a[0].n : -1);
+            if (tgt >= 0 && tgt < BR_CREATED) { int cap; char *l = br_jstyle_of(tgt, &cap); br_jstyle_set(l, cap, "display", "none"); br_js_dirty = 1; }
+            if (n && !kstrcmp(m, "removeChild")) *res = a[0];
+            return 1;
+        }
+        if (!kstrcmp(m, "click")) { if (!created) br_js_click(idx); return 1; }
+        if (!kstrcmp(m, "focus") || !kstrcmp(m, "blur") || !kstrcmp(m, "scrollIntoView") || !kstrcmp(m, "select")) return 1;
+        if (!kstrcmp(m, "querySelector") && n && !created) { struct jv sv = js_tostr(a[0]); *res = br_query_all(idx, js_cs(sv), 1); return 1; }
+        if (!kstrcmp(m, "querySelectorAll") && n && !created) { struct jv sv = js_tostr(a[0]); *res = br_query_all(idx, js_cs(sv), 0); return 1; }
+        if (!kstrcmp(m, "getElementsByClassName") && n && !created) { struct jv sv = js_tostr(a[0]); *res = br_by_class_or_tag(idx, js_cs(sv), 1); return 1; }
+        if (!kstrcmp(m, "getElementsByTagName") && n && !created) { struct jv sv = js_tostr(a[0]); *res = br_by_class_or_tag(idx, js_cs(sv), 0); return 1; }
+        return 0;
+    }
+    return 0;
+}
+static void br_clamp_scroll(void);
+/* put the style sheets of the page (inline blocks and loaded files) in document order */
+static void br_apply_sheets(void) {
+    css_reset();
+    for (int b = 0; b < br_nblk; b++) {
+        if (br_blk[b].kind == 0) css_add_sheet((const char *)br_page + br_blk[b].off, (int)br_blk[b].len);
+        else if (br_blk[b].kind == 1 && br_blk[b].res >= 0 && br_res[br_blk[b].res].state == 1)
+            css_add_sheet((const char *)br_resbuf + br_res[br_blk[b].res].off, (int)br_res[br_blk[b].res].len);
+    }
+}
 static void br_layout(const u8 *d, u32 n, int html, const char *base) {
     br_reset_page();
+    if (html) br_apply_sheets(); else css_reset();
     br_cols = (CW(A_BROWSER) - 16 - 8) / 8;
     kstrcpy(br_base, base, sizeof br_base);
-    if (html) br_html(d, n);
-    else { br_pre = 1; br_bk = BK_PRE; for (u32 i = 0; i < n && !br_full; i++) br_put(d[i]); }
-    br_endrow(); br_pre = 0; br_bk = BK_NORMAL;
+    br_ecount = 0; br_cur_ei = -1; br_pending_ov = -1; br_noelem = 0;
+    if (html) {
+        br_html(d, n);
+        if (br_late && !br_full) { br_endrow(); br_frag(js_heap + br_late, js_len(js_heap + br_late)); }
+    } else { br_pretag = 1; br_pre = 1; br_bk = BK_PRE; for (u32 i = 0; i < n && !br_full; i++) br_put(d[i]); }
+    br_endrow(); br_pretag = 0; br_pre = 0; br_bk = BK_NORMAL;
     if (!br_nrows) { br_push(br_n, 0, 0, 0); }
+    if (br_trunc || br_full) br_notice("[Page cut off - too big]");
+    if (br_jstitle[0]) kstrcpy(br_title, br_jstitle, sizeof br_title);
     br_set_title();
 }
+/* ---- running the page's JavaScript ---- */
+static void br_jserror(void) {
+    kstrcpy(br_jserr, js_errmsg, sizeof br_jserr);
+    tputs("[js] "); tputs(js_errmsg); tputs("\n");
+}
+static void br_h_console(const char *s) { tputs(s); tputs("\n"); }
+static void br_h_alert(const char *s) { kstrcpy(br_alert, s, sizeof br_alert); tputs("[alert] "); tputs(s); tputs("\n"); ksnprintf(br_status, sizeof br_status, "Alert: %s", s); }
+static u32 br_h_now(void) { return ticks * 10u; }
+static u32 br_h_rnd(void) { return net_rand(); }
+static int br_h_date(int *f) {
+    struct rtc t; rtc_read(&t);
+    static const int tb[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    int y = t.y; if (t.mo < 3) y--;
+    f[0] = t.y; f[1] = t.mo; f[2] = t.d; f[3] = t.h; f[4] = t.m; f[5] = t.s;
+    f[6] = (y + y / 4 - y / 100 + y / 400 + tb[(t.mo >= 1 && t.mo <= 12 ? t.mo : 1) - 1] + t.d) % 7;
+    return 1;
+}
+static struct jshost br_host = { br_js_get, br_js_set, br_js_call, br_h_console, br_h_alert, br_h_now, br_h_rnd, br_h_date };
+static void br_relayout(void) {
+    int sc = br_scroll; br_js_dirty = 0;
+    char keep[80]; kstrcpy(keep, br_status, sizeof keep);
+    br_layout(br_page, br_page_n, 1, br_page_url);
+    br_scroll = sc; br_clamp_scroll();
+    kstrcpy(br_status, keep, sizeof br_status);
+}
+/* after any script ran: follow location changes, redraw if the page changed */
+static void br_js_after(void) {
+    if (br_nav[0]) { char u[330]; kstrcpy(u, br_nav, sizeof u); br_nav[0] = 0; br_js_on = 0; br_go(u, 1); return; }
+    if (br_js_dirty) br_relayout();
+}
+static void br_js_click(int ei) {
+    br_click_prevent = 0;
+    if (!br_js_on || ei < 0 || ei >= br_nel) return;
+    struct brel *E = &br_el[ei]; struct jv self = br_elem(ei);
+    if (E->jsclick) {
+        if (js_run_handler_code(js_heap + E->jsclick, js_len(js_heap + E->jsclick), self)) br_jserror();
+        if (js_prevent) br_click_prevent = 1;
+        br_js_dirty = 1;
+    }
+    if (E->has_fn) {
+        struct jv ev = js_new_obj(); js_obj_set(ev, js_intern_c("target"), self); js_obj_set(ev, js_intern_c("type"), js_s("click"));
+        struct jv args[1]; args[0] = ev;
+        if (js_call_handler(E->fn, self, args, 1)) br_jserror();
+        if (js_prevent) br_click_prevent = 1;
+        br_js_dirty = 1;
+    }
+}
+static void br_js_link(int ei) {
+    br_js_click(ei);
+    if (!br_click_prevent && ei >= 0 && ei < br_nel && !kstrcmp(br_el[ei].tag, "a") && !br_nav[0]) {
+        char h[200]; br_attr_of(ei, "href", h, sizeof h);
+        if (h[0] && h[0] != '#' && !n_starts(h, "javascript:")) { char u[330]; url_join(br_page_url, h, u, sizeof u); br_nav_to(u); }
+    }
+    br_js_after();
+}
+static void br_js_code_link(const char *code) {
+    if (!br_js_on) return;
+    if (js_run_handler_code(code, slen(code), js_mk(JT_WIN, 0))) br_jserror();
+    br_js_dirty = 1; br_js_after();
+}
+/* all resources are in: run the scripts, then show the page */
+static void br_page_finish(void) {
+    br_jserr[0] = 0; br_nav[0] = 0; br_js_dirty = 0;
+    if (br_js_on) {
+        br_wn = 0; br_swrite_after_load = 0;
+        for (int b = 0; b < br_nblk && !br_nav[0]; b++) {
+            struct brblk *B = &br_blk[b];
+            if (B->kind < 2) continue;
+            const char *src; int len;
+            if (B->kind == 2) { src = (const char *)br_page + B->off; len = (int)B->len; }
+            else if (B->res >= 0 && br_res[B->res].state == 1) { src = (const char *)br_resbuf + br_res[B->res].off; len = (int)br_res[B->res].len; }
+            else { kstrcpy(br_jserr, "could not load a script", sizeof br_jserr); continue; }
+            int w0 = br_wn;
+            if (js_run(src, len)) br_jserror();
+            if (br_wn > w0) br_swrite[b] = js_newstr(br_wbuf + w0, br_wn - w0);
+        }
+        br_swrite_after_load = 1; br_wn = 0;
+        if (!br_nav[0]) for (int i = 0; i < br_loadq_n; i++) if (js_call_handler(br_loadq[i], js_mk(JT_WIN, 0), NULL, 0)) br_jserror();
+    }
+    if (br_nav[0]) { char u[330]; kstrcpy(u, br_nav, sizeof u); br_nav[0] = 0; br_js_on = 0; br_layout(br_page, br_page_n, 1, br_page_url); br_go(u, 1); return; }
+    br_layout(br_page, br_page_n, 1, br_page_url);
+    br_js_dirty = 0;
+    kstrcpy(br_status, br_done_status, sizeof br_status);
+    if (br_jserr[0]) ksnprintf(br_status, sizeof br_status, "Script error: %s", br_jserr);
+}
+static void br_res_next(void) {
+    for (int i = 0; i < br_nres; i++) if (br_res[i].state == 0) {
+        br_res_cur = i; http_start(br_res[i].url); br_wait = 2;
+        ksnprintf(br_status, sizeof br_status, "Loading %s", br_res[i].url);
+        return;
+    }
+    br_wait = 0; br_page_finish();
+}
+/* start showing an HTML page: scan it, fetch its style sheets and scripts, then lay it out */
+static void br_load_page(const u8 *d, u32 n, const char *url, int use_js) {
+    if (n > HTTP_MAX) n = HTTP_MAX;
+    if (d != br_page) memcpy(br_page, d, n);
+    br_page[n] = 0; br_page_n = n; br_page_html = 1;
+    kstrcpy(br_page_url, url, sizeof br_page_url);
+    memset(br_swrite, 0, sizeof br_swrite); br_late = 0; br_resused = 0; br_nnew = 0; br_loadq_n = 0; br_jstitle[0] = 0;
+    br_wn = 0; br_swrite_after_load = 0;
+    br_js_on = use_js;
+    if (use_js) js_init(&br_host);
+    br_scan();
+    if (!use_js) { int k = 0; for (int b = 0; b < br_nblk; b++) if (br_blk[b].kind < 2) { if (br_blk[b].kind == 1) { br_blk[b].res = -1; } br_blk[k++] = br_blk[b]; } br_nblk = k; br_nres = 0; for (int b = 0; b < br_nblk; b++) if (br_blk[b].kind == 1) br_blk[b].kind = 9; }
+    br_res_next();
+}
 static void br_show_html(const char *html, const char *url) {
-    br_layout((const u8 *)html, (u32)slen(html), 1, url);
+    br_trunc = 0; br_done_status[0] = 0;
+    br_load_page((const u8 *)html, (u32)slen(html), url, 0);
     kstrcpy(br_url, url, sizeof br_url); kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
 }
 static void br_show_home(void) {
     static const char home[] =
         "<html><title>LeactedOS Browser</title><body><h1>LeactedOS Browser</h1>"
         "<p>Type an address above and press Enter. Words without a dot are searched for.</p>"
+        "<p>Pages can use <b>CSS</b> (colours, sizes, alignment, hiding) and simple <b>JavaScript</b> (buttons, timers, DOM changes). No classes, regex or async yet.</p>"
         "<p><b>Plain http:// sites only.</b> HTTPS needs a TLS stack, which LeactedOS does not have yet, "
         "so many modern sites will not open.</p><hr><h2>Sites that may work</h2><ul>"
         "<li><a href=\"http://example.com/\">example.com</a></li>"
@@ -3753,11 +4557,12 @@ static void br_show_http(void) {
     if (!html && !n_starts(http_ctype, "text/plain") && http_ctype[0] == 0) {
         for (u32 i = 0; i < http_len && i < 512; i++) { if (http_body[i] == '<') { html = 1; break; } if (http_body[i] > ' ') break; }
     }
-    br_layout(http_body, http_len, html, url);
-    if (http_trunc || br_full) br_notice("[Page cut off - too big]");
+    br_trunc = http_trunc;
+    if (http_code >= 400) ksnprintf(br_done_status, sizeof br_done_status, "Server says %d  (%u bytes)", http_code, http_len);
+    else ksnprintf(br_done_status, sizeof br_done_status, "Done  (%u bytes)", http_len);
     kstrcpy(br_url, url, sizeof br_url); kstrcpy(br_addr, url, sizeof br_addr); br_alen = slen(br_addr);
-    if (http_code >= 400) ksnprintf(br_status, sizeof br_status, "Server says %d  (%u bytes)", http_code, http_len);
-    else ksnprintf(br_status, sizeof br_status, "Done  (%u bytes)", http_len);
+    if (html) br_load_page(http_body, http_len, url, 1);
+    else { br_js_on = 0; br_nel = 0; br_nblk = 0; br_nres = 0; br_layout(http_body, http_len, 0, url); kstrcpy(br_status, br_done_status, sizeof br_status); }
 }
 static void br_search_url(char *out, int max, const char *q) {
     int o = 0; const char *pre = "http://frogfind.com/?q=";
@@ -3794,10 +4599,29 @@ static void br_back(void) {
     br_go(u, 0);
 }
 static void br_stop(void) {
+    if (br_wait == 2) {
+        http_cancel(); br_wait = 0;
+        for (int i = 0; i < br_nres; i++) if (br_res[i].state == 0) br_res[i].state = 2;
+        br_page_finish(); kstrcpy(br_status, "Stopped (some files were not loaded)", sizeof br_status);
+        return;
+    }
     if (br_wait) { http_cancel(); br_wait = 0; kstrcpy(br_status, "Stopped", sizeof br_status); }
 }
 static void br_check(void) {                    /* called every frame */
-    if (!br_wait || http_active()) return;
+    if (br_wait == 2) {
+        if (http_active()) return;
+        struct brres *r = &br_res[br_res_cur];
+        if (http_st == H_DONE && http_code < 400 && br_resused + http_len <= BR_RESBUF) {
+            memcpy(br_resbuf + br_resused, http_body, http_len); r->off = br_resused; r->len = http_len; r->state = 1; br_resused += http_len;
+        } else r->state = 2;
+        br_wait = 0; br_res_next();
+        return;
+    }
+    if (!br_wait) {
+        if (br_js_on && js_timers_active() && js_poll()) br_js_after();
+        return;
+    }
+    if (http_active()) return;
     br_wait = 0;
     if (http_st == H_DONE) br_show_http();
     else {
@@ -3811,7 +4635,13 @@ static void br_open(void) {
     br_nh = 0; br_wait = 0; br_url[0] = 0; br_focus = 1; br_sel = 1;
     br_show_home();
 }
-static int br_rowh(int r) { return br_rows[r].kind == BK_H1 ? 20 : 10; }
+static int br_rowh(int r) { return br_rows[r].big ? 20 : 10; }
+static int br_rowx(const struct brow *b, int vw) {              /* left edge of the text of a row (alignment and indentation) */
+    int sc = b->big ? 2 : 1, left = 4 + b->indent * 8, w = b->len * 8 * sc, avail = vw - 8 - b->indent * 8;
+    if (b->align == 2 && w < avail) return left + (avail - w) / 2;
+    if (b->align == 3 && w < avail) return left + (avail - w);
+    return left;
+}
 static int br_viewh(void) { return CH(A_BROWSER) - BR_TB - BR_SB - 2; }
 static int br_maxscroll(void) {
     int vh = br_viewh(), s = br_nrows, used = 0;
@@ -3824,6 +4654,7 @@ static void br_scrollby(int d) {
     if (br_scroll > mx) br_scroll = mx;
     if (br_scroll < 0) br_scroll = 0;
 }
+static void br_clamp_scroll(void) { br_scrollby(0); }
 static void br_draw(int x, int y, int w, int h) {
     /* toolbar */
     button(x + 4, y + 4, 26, 22, "<", 0);
@@ -3838,20 +4669,23 @@ static void br_draw(int x, int y, int w, int h) {
     button(x + w - 56, y + 4, 52, 22, br_wait ? "Stop" : "Go", 0);
     /* page */
     int vy = y + BR_TB, vh = br_viewh() + 2, vw = w - 14;
-    rect(x, vy, vw, vh, C_LIGHT);
+    int dark = br_pagebg != CSS_NONE && (((br_pagebg >> 16) & 255) * 3 + ((br_pagebg >> 8) & 255) * 6 + (br_pagebg & 255)) < 1100;
+    u32 defcol = dark ? RGB(235, 235, 235) : C_BLACK;
+    rect(x, vy, vw, vh, br_pagebg != CSS_NONE ? (u32)br_pagebg : C_LIGHT);
     int py = vy + 3;
     for (int r = br_scroll; r < br_nrows && py + br_rowh(r) <= vy + vh + 1; r++) {
         const struct brow *b = &br_rows[r];
-        int sc = b->kind == BK_H1 ? 2 : 1, px = x + 4 + b->indent * 8;
+        int sc = b->big ? 2 : 1, px = x + br_rowx(b, vw);
         if (b->kind == BK_HR) { rect(x + 8, py + 4, vw - 16, 1, C_DARK); py += 10; continue; }
-        if (b->kind == BK_PRE) rect(x + 2, py - 1, vw - 4, 10, RGB(240, 240, 236));
+        if (b->hasbg) rect(x + 1, py - 1, vw - 2, br_rowh(r), (u32)b->bg);
+        else if (b->kind == BK_PRE && !dark) rect(x + 2, py - 1, vw - 4, 10, RGB(240, 240, 236));
         for (int i = 0; i < b->len; i++) {
             u32 o = b->off + (u32)i; int cx = px + i * 8 * sc;
             if (cx > x + vw) break;
-            u32 col = br_lk[o] ? RGB(0, 0, 220) : b->kind == BK_H1 ? RGB(0, 40, 130) : b->kind <= BK_H3 && b->kind != BK_NORMAL ? RGB(20, 50, 120) : b->kind == BK_PRE ? RGB(60, 60, 60) : C_BLACK;
+            u32 col = br_fg[o] != CSS_NONE ? (u32)br_fg[o] : br_lk[o] ? RGB(0, 0, 220) : dark ? defcol : b->kind == BK_H1 ? RGB(0, 40, 130) : b->kind <= BK_H3 && b->kind != BK_NORMAL ? RGB(20, 50, 120) : b->kind == BK_PRE ? RGB(60, 60, 60) : C_BLACK;
             draw_char_s(cx, py, br_t[o], col, sc);
-            if (br_bd[o] && sc == 1) draw_char_s(cx + 1, py, br_t[o], col, 1);
-            if (br_lk[o]) rect(cx, py + 9 * sc - (sc > 1 ? 2 : 0), 8 * sc, 1, col);
+            if ((br_bd[o] & 1) && sc == 1) draw_char_s(cx + 1, py, br_t[o], col, 1);
+            if ((br_lk[o] && !(br_bd[o] & 2)) || (br_bd[o] & 4)) rect(cx, py + 9 * sc - (sc > 1 ? 2 : 0), 8 * sc, 1, col);
         }
         py += br_rowh(r);
     }
@@ -3918,10 +4752,15 @@ static void br_click(int rx, int ry) {
         int rh = br_rowh(r);
         if (ry >= y && ry < y + rh) {
             const struct brow *b = &br_rows[r];
-            int sc = b->kind == BK_H1 ? 2 : 1, col = (rx - 4 - b->indent * 8) / (8 * sc);
-            if (rx >= 4 + b->indent * 8 && col >= 0 && col < b->len) {
+            int sc = b->big ? 2 : 1, rowx = br_rowx(b, vw), col = (rx - rowx) / (8 * sc);
+            if (rx >= rowx && col >= 0 && col < b->len) {
                 int id = br_lk[b->off + (u32)col];
-                if (id) { char u[160]; kstrcpy(u, br_links[id], sizeof u); br_go(u, 1); }
+                if (id) {
+                    char u[160]; kstrcpy(u, br_links[id], sizeof u);
+                    if (u[0] == 'j' && u[1] == 's' && u[2] == ':') { int e = 0; for (const char *q = u + 3; *q >= '0' && *q <= '9'; q++) e = e * 10 + (*q - '0'); br_js_link(e); }
+                    else if (u[0] == 'j' && u[1] == 's' && u[2] == '!') br_js_code_link(u + 3);
+                    else br_go(u, 1);
+                }
             }
             return;
         }

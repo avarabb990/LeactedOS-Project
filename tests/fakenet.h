@@ -103,7 +103,8 @@ static void build_page(const char *path) {
 #define ADD(...) (page_n += sprintf(p + page_n, __VA_ARGS__))
     int fi = -1; for (int k = 0; k < fake_nfiles; k++) if (!strcmp(fake_files[k].path, path)) fi = k;
     if (fi >= 0) {
-        ADD("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n", fake_files[fi].n);
+        { int pl = (int)strlen(path); const char *ct = pl > 5 && !strcmp(path + pl - 5, ".html") ? "text/html" : pl > 4 && !strcmp(path + pl - 4, ".css") ? "text/css" : pl > 3 && !strcmp(path + pl - 3, ".js") ? "application/javascript" : "application/octet-stream";
+          ADD("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n", ct, fake_files[fi].n); }
         memcpy(page + page_n, fake_files[fi].d, (size_t)fake_files[fi].n); page_n += fake_files[fi].n;
     } else if (!strcmp(path, "/")) {
         const char *body = "<html><title>Hi</title><body>Hello from the fake server</body></html>";
