@@ -1,9 +1,9 @@
 # LeactedOS-Project
 LeactedOS a Hobby OS made from scatch starting from a unuseable OS to a useable OS 
 
-## Run it
+## Run it make sure to run it in the releases folder
 ```
-qemu-system-i386 -kernel releases/leacteos-v9.bin -m 128 -vga std -nic user,model=rtl8139
+qemu-system-i386 -cdrom leacteos-v13.iso -boot d -m 256 -nic user,model=rtl8139 -drive file=disk.img,format=raw,if=ide
 ```
 Add `-drive file=disk.img,format=raw,if=ide` (up to four drives, shown as C: to F:) to give the File Manager something to browse. `-nic user,model=rtl8139` gives the OS a network card (the Realtek RTL8139 is the only one supported) for the Browser, `wget`, `ping` and `leact-get`.
 
