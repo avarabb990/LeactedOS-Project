@@ -939,6 +939,22 @@ int main(void) {
       close_app(A_BROWSER);
     }
 
+    /* ---- LeactedCmd: full-screen command line without the desktop ---- */
+    {
+      set_cmd_mode(1);
+      assert(cmd_mode && tc_n == 78 && tr_n == 46 && wins[A_TERM].open);
+      os_draw(); frame_out("t53_leactedcmd.ppm");
+      open_app(A_PAINT); assert(!wins[A_PAINT].open);                          /* apps need the desktop */
+      for (const char *p = "echo hi there"; *p; p++) kq_push(*p);
+      kq_push('\n'); os_events(); os_draw();
+      assert(!strncmp(tg[trow - 1], "hi there", 8) || !strncmp(tg[trow], "hi there", 8));
+      cmd("exit"); assert(cmd_mode && wins[A_TERM].open);                        /* exit does not leave the machine without a screen */
+      cmd("desktop"); assert(!cmd_mode && tc_n == 56 && tr_n == 29 && wins[A_TERM].open);
+      open_app(A_PAINT); assert(wins[A_PAINT].open); close_app(A_PAINT);
+      cmd("cmdmode"); assert(cmd_mode); cmd("desktop"); assert(!cmd_mode);
+      os_draw();
+    }
+
     /* closing the window mid-load cancels the request */
     br_go("http://local.test/big", 1); net_steps(3); assert(br_wait); close_app(A_BROWSER); assert(!br_wait && !http_active()); net_steps(300);
     for (int i = 0; i < NT; i++) assert(!tcps[i].used);

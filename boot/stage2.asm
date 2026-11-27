@@ -1,4 +1,4 @@
-; LeactedOS boot loader, stage 2 (4096 bytes at disk sector 8, loaded at 0x7E00).
+; Leact-Loader 1.2 - LeactedOS boot loader, stage 2 (4096 bytes at disk sector 8, loaded at 0x7E00).
 ; Reads the kernel image from the disk to 1 MB, clears its BSS, builds a small
 ; multiboot info block and starts the kernel in 32-bit protected mode exactly
 ; like a multiboot loader would (EAX = 0x2BADB002, EBX = info block).
@@ -16,6 +16,7 @@ k_entry  dd 0                 ; +16 entry point (_start)
 k_bssend dd 0                 ; +20 end of the kernel's BSS
 k_end    dd 0                 ; +24 1 MB + secs*512: BSS is cleared from here
 
+TIMEOUT equ 5                 ; seconds before the highlighted entry starts by itself
 MBI     equ 0x600
 BUFSEG  equ 0x1000            ; 64 sectors are read to 0x10000 at a time
 
@@ -29,13 +30,16 @@ start:
     cld
     mov [drive], dl
     sti
-    mov si, m_boot
-    call puts
     cmp dword [k_secs], 0
     jne .have
+    mov ax, 3
+    int 0x10
+    mov si, m_title
+    call puts
     mov si, m_nokern
     jmp fatal
 .have:
+    call menu
     call a20
     call getmem
     call memcheck
@@ -43,6 +47,226 @@ start:
     call bssclr
     call mkmbi
     jmp enter
+
+; ---------------------------------------------------------------- boot menu (text mode, 80x25)
+; cell address in DI for row DH, column DL
+setpos:
+    push ax
+    push cx
+    push dx
+    mov al, dh
+    mov ah, 0
+    mov cx, 80
+    mul cx
+    pop dx
+    mov cl, dl
+    mov ch, 0
+    add ax, cx
+    shl ax, 1
+    mov di, ax
+    pop cx
+    pop ax
+    ret
+str_at:                       ; SI = text, DH/DL = row/col, BL = attribute (ES = 0xB800)
+    call setpos
+.l: lodsb
+    test al, al
+    jz .d
+    mov ah, bl
+    stosw
+    jmp .l
+.d: ret
+fill_at:                      ; CX cells of character AL, attribute BL at DH/DL
+    call setpos
+    mov ah, bl
+    rep stosw
+    ret
+drawsel:                      ; the two entries, the selected one is shown inverted
+    xor bp, bp
+.e: mov bl, 0x07
+    movzx ax, byte [sel]
+    cmp bp, ax
+    jne .a
+    mov bl, 0x70
+.a: mov dh, 5
+    mov ax, bp
+    add dh, al
+    mov dl, 11
+    mov cx, 58
+    mov al, ' '
+    call fill_at
+    mov dh, 5
+    mov ax, bp
+    add dh, al
+    mov dl, 13
+    mov si, m_entry0
+    test bp, bp
+    jz .s
+    mov si, m_entry1
+.s: call str_at
+    inc bp
+    cmp bp, 2
+    jb .e
+    ret
+drawcount:
+    mov dh, 15
+    mov dl, 2
+    mov si, m_count
+    mov bl, 0x07
+    jmp str_at
+gettick:                      ; AX = low word of the BIOS tick counter (18.2 per second)
+    mov ah, 0
+    int 0x1A
+    mov ax, dx
+    ret
+menu:
+    mov ax, 3                 ; 80x25 text mode, clears the screen
+    int 0x10
+    mov ah, 1                 ; hide the cursor
+    mov cx, 0x2000
+    int 0x10
+    mov ax, 0xB800
+    mov es, ax
+    mov dh, 1                 ; title bar
+    mov dl, 0
+    mov cx, 80
+    mov al, ' '
+    mov bl, 0x1F
+    call fill_at
+    mov dh, 1
+    mov dl, 32
+    mov si, m_title
+    call str_at
+    mov dh, 3                 ; box
+    mov dl, 10
+    mov al, 0xC9
+    mov bl, 0x07
+    call box_row
+    mov dh, 10
+    mov al, 0xC8
+    call box_row
+    mov dh, 4
+.r: mov dl, 10
+    mov cx, 1
+    mov al, 0xBA
+    call fill_at
+    mov dl, 69
+    mov cx, 1
+    call fill_at
+    inc dh
+    cmp dh, 10
+    jb .r
+    mov dh, 12
+    mov dl, 2
+    mov si, m_help1
+    mov bl, 0x07
+    call str_at
+    mov dh, 13
+    mov dl, 2
+    mov si, m_help2
+    call str_at
+    mov byte [sel], 0
+    call drawsel
+    mov byte [timeout], 1
+    call gettick
+    mov [t0], ax
+    mov byte [cnt_d], '0' + TIMEOUT
+    call drawcount
+.wait:
+    cmp byte [timeout], 0
+    je .poll
+    call gettick
+    sub ax, [t0]
+    xor dx, dx
+    mov cx, 18
+    div cx
+    cmp ax, TIMEOUT
+    jae .go
+    mov cx, TIMEOUT
+    sub cx, ax
+    add cl, '0'
+    cmp cl, [cnt_d]
+    je .poll
+    mov [cnt_d], cl
+    call drawcount
+.poll:
+    mov ah, 1
+    int 0x16
+    jz .wait
+    mov ah, 0
+    int 0x16
+    cmp byte [timeout], 0     ; any key stops the countdown
+    je .key
+    mov byte [timeout], 0
+    push ax
+    mov dh, 15
+    mov dl, 0
+    mov cx, 80
+    mov al, ' '
+    mov bl, 0x07
+    call fill_at
+    pop ax
+.key:
+    cmp ah, 0x48
+    je .up
+    cmp ah, 0x50
+    je .down
+    cmp al, 13
+    je .go
+    cmp al, '1'
+    je .one
+    cmp al, '2'
+    je .two
+    jmp .wait
+.up:
+    mov byte [sel], 0
+    jmp .redraw
+.down:
+    mov byte [sel], 1
+    jmp .redraw
+.one:
+    mov byte [sel], 0
+    jmp .go
+.two:
+    mov byte [sel], 1
+    jmp .go
+.redraw:
+    call drawsel
+    jmp .wait
+.go:
+    call drawsel
+    xor ax, ax
+    mov es, ax
+    mov ax, 3                 ; clear, then tell what is starting
+    int 0x10
+    mov si, m_title
+    call puts
+    mov si, m_crlf
+    call puts
+    mov si, m_start0
+    cmp byte [sel], 0
+    je .p
+    mov si, m_start1
+.p: call puts
+    ret
+box_row:                      ; top/bottom border of the box on row DH (corner char in AL)
+    mov dl, 10
+    mov cx, 1
+    mov bl, 0x07
+    push ax
+    call fill_at
+    mov dl, 11
+    mov cx, 58
+    mov al, 0xCD
+    call fill_at
+    mov dl, 69
+    mov cx, 1
+    pop ax
+    cmp al, 0xC9
+    mov al, 0xBB
+    je .c
+    mov al, 0xBC
+.c: jmp fill_at
 
 ; ---------------------------------------------------------------- text
 putc:
@@ -241,7 +465,8 @@ mkmbi:
     mov cx, 100
     xor al, al
     rep stosb
-    mov dword [MBI + 0], 0x201        ; flags: memory sizes + boot loader name
+    mov dword [MBI + 0], 0x205        ; flags: memory sizes + kernel command line + boot loader name
+    mov dword [MBI + 16], MBI + 0xA0  ; command line: "desktop" or "cmd"
     mov dword [MBI + 4], 639
     mov eax, [memup]
     mov [MBI + 8], eax
@@ -252,6 +477,15 @@ mkmbi:
     stosb
     test al, al
     jnz .c
+    mov si, m_cl0
+    cmp byte [sel], 0
+    je .q
+    mov si, m_cl1
+.q: mov di, MBI + 0xA0
+.d: lodsb
+    stosb
+    test al, al
+    jnz .d
     ret
 
 ; ---------------------------------------------------------------- go
@@ -294,7 +528,22 @@ memup   dd 0
 remain  dd 0
 chunk   dd 0
 dest    dd 0
-m_boot   db "LeactedOS boot loader", 13, 10, "Loading ", 0
+sel      db 0
+timeout  db 0
+t0       dw 0
+m_title  db "Leact-Loader 1.2", 0
+m_crlf   db 13, 10, 0
+m_entry0 db "LeactedOS desktop (Normal)", 0
+m_entry1 db "LeactedCmd (command line)", 0
+m_help1  db "Use the ", 0x18, " and ", 0x19, " keys to select which entry is highlighted.", 0
+m_help2  db "Press enter to boot the selected OS.", 0
+m_count  db "The highlighted entry will be started automatically in "
+cnt_d    db "5"
+         db " seconds. ", 0
+m_start0 db "Starting LeactedOS desktop...", 13, 10, "Loading ", 0
+m_start1 db "Starting LeactedCmd...", 13, 10, "Loading ", 0
+m_cl0    db "desktop", 0
+m_cl1    db "cmd", 0
 m_nokern db "No kernel on this disk. Run the Installer from a running LeactedOS.", 0
 m_a20    db "Cannot enable the A20 line.", 0
 m_read   db "Disk read error.", 0

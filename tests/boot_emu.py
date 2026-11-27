@@ -3,6 +3,7 @@
 x86 emulator that covers exactly the instructions the loader uses, with BIOS services (INT 10h/13h/15h) faked.
 It checks that the kernel arrives at 1 MB intact, the BSS is cleared, the multiboot block is right, A20/unreal mode
 are handled, and that execution ends with EAX=0x2BADB002, EBX=mbi at the kernel's entry point.
+The boot menu (Leact-Loader 1.2) is driven with scripted key presses; the screen is captured from video memory.
 usage: boot_emu.py disk.img [variant]      variant: 0 normal, 1 A20 off + E801 in AX/BX, 2 BIOS resets segment limits, 3 only INT 15h/88h"""
 import sys, struct
 
@@ -18,6 +19,7 @@ class CPU:
         s.disk = disk; s.variant = variant; s.a20 = 0 if variant == 1 else 1; s.out = ""
         s.gdtr = (0, 0); s.steps = 0; s.reads = 0; s.halted = False; s.port92 = 0
         s.memkb = 64 * 1024 - 1024                     # a 64 MB machine
+        s.keys = []; s.polls = 0; s.tick = 1000; s.screens = []
     # --- memory
     def phys(s, a):
         if not s.pe and not s.a20: a &= 0xFFFFF
@@ -113,7 +115,20 @@ class CPU:
         if s.variant == 2: s.seg[0]['limit'] = 0xFFFF; s.seg[3]['limit'] = 0xFFFF      # BIOS code that leaves unreal mode
         if n == 0x10:
             if ah == 0x0E: s.out += chr(al)
+            elif ah == 0x00:
+                s.screens.append(bytes(s.mem[0xB8000:0xB8000 + 4000]))            # remember what was on screen
+                for i in range(0, 4000, 2): s.mem[0xB8000 + i] = 0x20; s.mem[0xB8001 + i] = 0x07
             return
+        if n == 0x16:
+            if ah == 0x01:
+                s.polls += 1
+                ready = bool(s.keys) and s.polls >= s.keys[0][0]
+                s.fl['Z'] = 0 if ready else 1; return
+            if ah == 0x00:
+                k = s.keys.pop(0); s.r[0] = (s.r[0] & ~0xFFFF) | (k[1] << 8) | k[2]; return
+            return
+        if n == 0x1A:
+            s.tick += 1; s.r[2] = (s.r[2] & ~0xFFFF) | (s.tick & 0xFFFF); s.r[1] = (s.r[1] & ~0xFFFF) | (s.tick >> 16); return
         if n == 0x13:
             if ah == 0x00: cf(0); return
             if ah == 0x42:
@@ -168,6 +183,23 @@ class CPU:
             return
         if o in (0x06, 0x0E, 0x16, 0x1E):  s.push(s.seg[{0x06: 0, 0x0E: 1, 0x16: 2, 0x1E: 3}[o]]['sel'], osz); return
         if o in (0x07, 0x17, 0x1F): s.setseg({0x07: 0, 0x17: 2, 0x1F: 3}[o], s.pop(osz) & 0xFFFF); return
+        if 0x40 <= o <= 0x4F:
+            r = o & 7; c = s.fl['C']; v = s.alu(0 if o < 0x48 else 5, s.getr(r, osz), 1, osz); s.fl['C'] = c; s.setr(r, osz, v); return
+        if o == 0xD1:
+            reg, rm = s.modrm(asz); v = s.rdop(rm, osz)
+            if reg == 4: v = (v << 1) & ((1 << (8 * osz)) - 1)
+            elif reg == 5: v >>= 1
+            else: raise Fault("d1 /%d" % reg)
+            s.wrop(rm, osz, v); s.fl['Z'] = int(v == 0); return
+        if o == 0xF7:
+            reg, rm = s.modrm(asz); v = s.rdop(rm, osz)
+            if reg == 4:
+                r = s.getr(0, osz) * v; s.setr(0, osz, r); s.setr(2, osz, r >> (8 * osz)); return
+            if reg == 6:
+                n = (s.getr(2, osz) << (8 * osz)) | s.getr(0, osz)
+                if v == 0 or n // v >= (1 << (8 * osz)): raise Fault("divide error")
+                s.setr(0, osz, n // v); s.setr(2, osz, n % v); return
+            raise Fault("f7 /%d" % reg)
         if 0x50 <= o <= 0x57: s.push(s.getr(o - 0x50, osz), osz); return
         if 0x58 <= o <= 0x5F: s.setr(o - 0x58, osz, s.pop(osz)); return
         if 0x70 <= o <= 0x7F:
@@ -277,8 +309,8 @@ class CPU:
             return
         raise Fault("out %x" % p)
 
-def boot(disk, variant=0, verbose=False):
-    c = CPU(disk, variant)
+def boot(disk, variant=0, keys=None):
+    c = CPU(disk, variant); c.keys = list(keys or [])
     c.mem[0x7C00:0x7C00 + 512] = disk[:512]
     c.r[2] = 0x80; c.ip = 0x7C00; c.seg[1]['base'] = 0
     mark_entry = None
@@ -293,9 +325,13 @@ def boot(disk, variant=0, verbose=False):
             return c, "FAULT: %s (out=%r)" % (e, c.out)
     return c, "no end"
 
-def check(path, variant):
+def screen_text(buf, row): return bytes(buf[row * 160:row * 160 + 160:2]).decode('cp437')
+def screen_attr(buf, row, col): return buf[row * 160 + col * 2 + 1]
+UP, DOWN, ENTER = (0x48, 0), (0x50, 0), (0x1C, 13)
+
+def check(path, variant, keys=None, want="desktop"):
     disk = open(path, 'rb').read()
-    c, res = boot(disk, variant)
+    c, res = boot(disk, variant, keys)
     assert res == "entered", res
     f = struct.unpack_from('<5I', disk, 8 * 512 + 8)
     lba, secs, entry, bssend, kend = f
@@ -304,16 +340,38 @@ def check(path, variant):
     assert not any(c.mem[kend:bssend]), "BSS not cleared"
     assert c.r[0] == 0x2BADB002 and c.r[3] == 0x600, "registers EAX/EBX %x %x" % (c.r[0], c.r[3])
     flags, lower, upper = struct.unpack_from('<III', c.mem, 0x600)
-    assert flags == 0x201 and lower == 639 and upper == c.memkb, (hex(flags), lower, upper, c.memkb)
+    assert flags == 0x205 and lower == 639 and upper == c.memkb, (hex(flags), lower, upper, c.memkb)
     nameptr = struct.unpack_from('<I', c.mem, 0x600 + 64)[0]
     assert bytes(c.mem[nameptr:nameptr + 10]) == b"LeactedOS\0"
+    clp = struct.unpack_from('<I', c.mem, 0x600 + 16)[0]
+    cl = bytes(c.mem[clp:clp + 16]).split(b'\0')[0].decode()
+    assert cl == want, "kernel command line %r, wanted %r" % (cl, want)
     assert c.a20 and c.pe and c.seg[3]['sel'] == 0x10 and c.seg[2]['sel'] == 0x10 and c.seg[3]['limit'] == 0xFFFFFFFF
     assert c.ip == entry, "entry %x" % c.ip
-    assert "Loading" in c.out and c.out.count('.') == (secs + 63) // 64, c.out
-    return c
+    assert "Leact-Loader 1.2" in c.out and "Loading" in c.out and c.out.split('Loading ')[1].count('.') == (secs + 63) // 64, c.out
+    assert ("Starting LeactedCmd" in c.out) == (want == "cmd") and ("Starting LeactedOS desktop" in c.out) == (want == "desktop")
+    # the menu screen as it was when the choice was made
+    m = c.screens[-1]
+    assert "Leact-Loader 1.2" in screen_text(m, 1) and screen_attr(m, 1, 32) == 0x1F
+    assert screen_text(m, 3)[10] == '\u2554' and screen_text(m, 10)[69] == '\u255d' and screen_text(m, 6)[10] == '\u2551'
+    assert "LeactedOS desktop (Normal)" in screen_text(m, 5) and "LeactedCmd (command line)" in screen_text(m, 6)
+    hi = 5 if want == "desktop" else 6
+    assert screen_attr(m, hi, 20) == 0x70 and screen_attr(m, 11 - hi, 20) == 0x07, "highlight on the wrong entry"
+    assert "keys to select which entry is highlighted" in screen_text(m, 12) and "Press enter to boot the selected OS." in screen_text(m, 13)
+    return c, m
 
 if __name__ == "__main__":
     path = sys.argv[1]
     for v in ([int(sys.argv[2])] if len(sys.argv) > 2 else [0, 1, 2, 3]):
-        c = check(path, v)
+        c, m = check(path, v)                                                    # nobody touches the keyboard: times out into the desktop
+        assert "automatically in 1 seconds" in screen_text(m, 15) or "automatically in" in screen_text(m, 15)
         print("boot variant %d: ok (%d instructions, %d disk reads)" % (v, c.steps, c.reads))
+    c, m = check(path, 0, [(3, *DOWN), (6, *ENTER)], "cmd"); assert screen_text(m, 15).strip() == "", "countdown line must be gone after a key"
+    c, m = check(path, 0, [(3, *DOWN), (4, *UP), (5, *ENTER)], "desktop")
+    c, m = check(path, 0, [(3, 0, ord('2'))], "cmd")
+    c, m = check(path, 2, [(3, *DOWN), (5, *ENTER)], "cmd")
+    c, m = check(path, 1, [(2, *ENTER)], "desktop")
+    c, m = check(path, 0, [(3, 0, ord('x')), (5, *DOWN), (7, *ENTER)], "cmd")
+    print("boot menu: ok (timeout, arrows, enter, number keys)")
+    if len(sys.argv) > 3:
+        open(sys.argv[3], "wb").write(m)

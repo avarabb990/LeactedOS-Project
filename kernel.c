@@ -1234,7 +1234,10 @@ static void z_remove(int a) {
 static void raise_app(int a) { z_remove(a); zo[nz++] = a; wins[a].min = 0; }
 
 static void app_init(int a);
+static int cmd_mode;                    /* LeactedCmd: full-screen command line, no desktop */
+static void tputs(const char *s);
 static void open_app(int a) {
+    if (cmd_mode && a != A_TERM) { tputs("That needs the desktop. Type: desktop\n"); return; }
     if (!wins[a].open) { wins[a].open = 1; app_init(a); }
     raise_app(a);
 }
@@ -1357,12 +1360,14 @@ static void xapp_tick(void) {
 /* ------------------------------------------------------------------ */
 /* Terminal                                                            */
 /* ------------------------------------------------------------------ */
-#define TC 56
-#define TR 29                    /* visible rows */
+#define TCMAX 78                 /* widest console: LeactedCmd, full screen */
+static int tc_n = 56, tr_n = 29;   /* columns / visible rows (desktop Terminal 56x29, LeactedCmd 78x46) */
+#define TC tc_n
+#define TR tr_n
 #define TB 300                   /* rows kept (scrollback) */
 #define ILMAX 96
 #define NHIST 32
-static char tg[TB][TC + 1];
+static char tg[TB][TCMAX + 1];
 static int tcol, trow, tscroll;
 static char iline[ILMAX + 1]; static int ilen;
 static char hist[NHIST][ILMAX + 1]; static int nhist, hpos;
@@ -1371,7 +1376,7 @@ static int is_root;
 static void tclear(void) { memset(tg, 0, sizeof tg); tcol = 0; trow = 0; tscroll = 0; }
 static void tnl(void) {
     tcol = 0; trow++; tscroll = 0;
-    if (trow >= TB) { memmove(tg[0], tg[1], (TB - 1) * (TC + 1)); memset(tg[TB - 1], 0, TC + 1); trow = TB - 1; }
+    if (trow >= TB) { memmove(tg[0], tg[1], (TB - 1) * (TCMAX + 1)); memset(tg[TB - 1], 0, TCMAX + 1); trow = TB - 1; }
 }
 static void tputc(char c) {
     if (c == '\n') { tnl(); return; }
@@ -2199,6 +2204,15 @@ static void cmd_leactget(char **av, int ac) {
     if (st == 2) tprintf("%s is already installed and up to date.\n", lg_apps[i].name);
     else tprintf("%s %s. Start it with: run %s\n", st ? "Updated" : "Installed", lg_apps[i].name, lg_apps[i].name);
 }
+static void tclear(void);
+static int start_open;
+static void set_cmd_mode(int on) {
+    cmd_mode = on; tc_n = on ? TCMAX : 56; tr_n = on ? 46 : 29;
+    tclear(); ilen = 0; iline[0] = 0;
+    if (on) { for (int a = 0; a < N_APPS; a++) if (a != A_TERM && wins[a].open) close_app(a); start_open = 0; }
+    if (!on) open_app(A_TERM);
+    if (on) { tputs("LeactedCmd 1.2 - command line\nType help for commands, desktop to start the desktop.\n"); wins[A_TERM].open = 1; }
+}
 static void cmd_help(void) {
     tputs("Files (paths like D:\\docs\\a.txt, quotes for spaces)\n");
     tputs(" ls [P] cd [P] pwd tree [P]   look around\n");
@@ -2208,6 +2222,9 @@ static void cmd_help(void) {
     tputs(" mv OLD NEW    rename     touch NAME   new file\n");
     tputs(" echo T > F    write (>> appends)  rm F (super)\n");
     tputs(" edit F        open in Notepad\n");
+    tputs("Modes\n");
+    tputs(" desktop   start the desktop (from LeactedCmd)\n");
+    tputs(" cmdmode   full-screen command line (LeactedCmd)\n");
     tputs("Apps\n");
     tputs(" run P  apps  appinfo P  open APP  calc A op B\n");
     tputs(" leact-get list | install NAME | remove NAME\n");
@@ -2359,7 +2376,13 @@ static void run_cmd(char *line) {
     else if (!kstrcmp(c, "super")) { is_root = !is_root; tputs(is_root ? "Super mode ON\n" : "Super mode OFF\n"); }
     else if (!kstrcmp(c, "reboot")) { tputs("Rebooting...\n"); reboot_now(); }
     else if (!kstrcmp(c, "shutdown") || !kstrcmp(c, "halt")) power_off();
-    else if (!kstrcmp(c, "exit")) close_app(A_TERM);
+    else if (!kstrcmp(c, "desktop") || !kstrcmp(c, "startx")) {
+        if (!cmd_mode) tputs("You are already on the desktop.\n"); else set_cmd_mode(0);
+    }
+    else if (!kstrcmp(c, "cmdmode")) {
+        if (cmd_mode) tputs("You are already in LeactedCmd.\n"); else set_cmd_mode(1);
+    }
+    else if (!kstrcmp(c, "exit")) { if (cmd_mode) tputs("Type desktop to start the desktop, reboot or shutdown.\n"); else close_app(A_TERM); }
     else tprintf("Unknown: %s\n", av[0]);
 }
 
@@ -5412,6 +5435,7 @@ static void os_draw(void) {
     frame_count++;
     if (ticks - fps_t >= 100) { fps = (frame_count - fps_f) * 100 / (ticks - fps_t); fps_f = frame_count; fps_t = ticks; }
     clip_reset();
+    if (cmd_mode) { term_draw(0, 0, W, H); return; }
     xapp_tick();
     draw_desktop();
     for (int i = 0; i < nz; i++) if (!wins[zo[i]].min) draw_window(zo[i]);
@@ -5428,9 +5452,11 @@ static void os_events(void) {
     net_poll(); tjob_tick(); br_check(); inst_tick();
     int k;
     while ((k = kq_pop())) {
+        if (cmd_mode) { term_key(k); continue; }
         int a = top_app();
         if (a >= 0) app_key(a, k);
     }
+    if (cmd_mode) { prev_btn = mbtn & 1; return; }
     int left = mbtn & 1;
     if (left && !prev_btn) on_press(mx, my);
     else if (left) on_move_held(mx, my);
@@ -5451,6 +5477,10 @@ static void splash(int pct, const char *msg) {
 }
 static void os_init(u32 magic, const u32 *mbi) {
     boot_via_multiboot = magic == 0x2BADB002;
+    if (boot_via_multiboot && mbi && (mbi[0] & 4) && mbi[4]) {              /* kernel command line from the boot menu: "cmd" = LeactedCmd */
+        const char *cl = (const char *)(unsigned long)mbi[4];
+        for (const char *p = cl; *p; p++) if ((p == cl || p[-1] == ' ') && !kmemcmp(p, "cmd", 3) && (p[3] == 0 || p[3] == ' ')) cmd_mode = 1;
+    }
     if (boot_via_multiboot && mbi && (mbi[0] & 0x200) && mbi[16]) boot_from_disk = !kmemcmp((const char *)(unsigned long)mbi[16], "LeactedOS", 10);
     if (boot_via_multiboot && mbi && (mbi[0] & 1)) mem_kb = 1024 + mbi[2];
 #ifdef HOST
@@ -5472,7 +5502,8 @@ static void os_init(u32 magic, const u32 *mbi) {
     splash(80, "Files and settings");
     theme_apply(th_id);
     splash(100, "Desktop");
-    sleep_ticks(70);
+    sleep_ticks(cmd_mode ? 20 : 70);
+    if (cmd_mode) { set_cmd_mode(1); return; }
     open_app(A_TERM);
     if (fs_on_disk && fs_ver == 1) tputs("Your LeactedFS disk is the old small version.\nType fsupgrade for 64 files of 128 KB.\n");
 }

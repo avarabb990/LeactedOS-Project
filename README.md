@@ -44,6 +44,7 @@ Every version is a git tag, so you can browse the source of any of them (`git ch
 | v9 | HTTPS through a host gateway, online `leact-get` with this repository's `repo/` folder |
 | v10 | Browser: CSS and JavaScript (`css.h`, `js.h`), external `.css`/`.js` files, DOM, timers |
 | v11 | Real installer: writes a boot loader and the system to a disk, which then boots on its own (no `-kernel`) |
+| v12 | Leact-Loader 1.2 boot menu: LeactedOS desktop (Normal) or LeactedCmd (full-screen command line) |
 
 v7, v8 and v9 were built in one go and share a single source commit (the binaries of each are in `releases/`).
 
@@ -73,3 +74,7 @@ Open **Installer**, pick the drive, click *Install Now* twice. It formats Leacte
 qemu-system-i386 -drive file=disk.img,format=raw,if=ide -m 256 -nic user,model=rtl8139
 ```
 Disk layout: sector 0 boot sector + partition table, 1 LeactedFS super block, 3-7 directory, 8-15 boot loader stage 2, 16- the system image, then file data. The loader (`boot/stage1.asm`, `boot/stage2.asm`) needs a BIOS with LBA disk reads and about 20 MB of RAM; it enables A20, loads the image to 1 MB and starts it like a multiboot loader. `python3 tools/mkboot.py` rebuilds `boot_bin.h` from the sources (needs `nasm`; the generated header is checked in). `tests/boot_emu.py` boots an installed disk image on a small x86 emulator as part of `tests/run_all.sh`.
+
+## Leact-Loader 1.2 (boot menu)
+A disk made by the Installer starts with a GRUB-style menu: **LeactedOS desktop (Normal)** or **LeactedCmd (command line)**. Use the up/down keys (or 1 / 2) and Enter; if you press nothing the highlighted entry starts after 5 seconds. LeactedCmd is a full-screen console without the desktop: the same commands as the Terminal, 78x46 characters. Type `desktop` to start the desktop from it, and `cmdmode` in the desktop Terminal to go the other way. The menu choice reaches the kernel as the multiboot command line (`desktop` or `cmd`), so `qemu-system-i386 -kernel leacteos-v12.bin -append cmd ...` starts LeactedCmd without any disk.
+Disks installed with an older version keep the old loader (no menu): run the Installer again to update it.
