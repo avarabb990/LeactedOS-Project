@@ -1,7 +1,7 @@
 CC=gcc
 CFLAGS=-m32 -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-builtin -mno-sse -mno-mmx -nostdlib
 all: leacteos.bin
-kernel.o: kernel.c font.h sintab.h logo.h net.h sdk/leact.h sdk/lapp_load.h
+kernel.o: kernel.c font.h sintab.h logo.h net.h css.h js.h boot_bin.h sdk/leact.h sdk/lapp_load.h
 	$(CC) $(CFLAGS) -c kernel.c -o $@
 boot.o: boot.S
 	$(CC) -m32 -Wa,--noexecstack -c boot.S -o $@

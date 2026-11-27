@@ -109,10 +109,38 @@ int main(void) {
     assert(!fs_on_disk);
     assert(inst_sel == 0);
     int cx = CX(A_INSTALL) + CW(A_INSTALL) / 2, cy = CY(A_INSTALL) + 164 + 5;
-    click(cx, cy); assert(inst_state == 1);
+    click(cx, cy); assert(inst_state == IS_CONFIRM);
     frame_out("t2_install_confirm.ppm");
-    click(cx, cy); assert(inst_state == 2 && fs_on_disk && fs_drive == 0 && drv[0].type == DT_LEACTED);
+    sys_capture(); assert(sys_ok && sys_n == 654321);
+    click(cx, cy); assert(inst_state == IS_RUN && !fs_on_disk);
+    { int ticks_n = 0; while (inst_state == IS_RUN && inst_step < ST_FILES) { inst_tick(); ticks_n++; if (ticks_n == 5) frame_out("t2b_install_running.ppm"); assert(ticks_n < 1000); } }
+    assert(inst_progress() > 40 && inst_progress() < 100);
+    { int ticks_n = 0; while (inst_state == IS_RUN) { inst_tick(); assert(++ticks_n < 2000); } }
+    assert(inst_state == IS_OK && fs_on_disk && fs_drive == 0 && drv[0].type == DT_LEACTED);
     frame_out("t3_install_ok.ppm");
+    /* what is on the disk: boot sector, loader, system image, partition table */
+    { const u8 *dk = fakedisk[0];
+      assert(!memcmp(dk, boot_stage1, 446) && dk[510] == 0x55 && dk[511] == 0xAA && dk[0x1BE] == 0x80 && dk[0x1BE + 4] == 0xDA);
+      assert(!memcmp(dk + 8 * 512 + 4, "LST2", 4));
+      u32 f[5]; memcpy(f, dk + 8 * 512 + 8, 20);
+      assert(f[0] == 16 && f[1] == (654321 + 511) / 512 && f[2] == 0x100010 && f[3] == 0x1146880 && f[4] == 0x100000 + f[1] * 512);
+      assert(!memcmp(dk + 8 * 512 + 28, boot_stage2 + 28, 4096 - 28));
+      assert(!memcmp(dk + 16 * 512, sys_img, 654321));
+      for (int i = 654321; i < (int)f[1] * 512; i++) assert(dk[16 * 512 + i] == 0);
+      assert(!memcmp(dk + 512, "LEACTEDFS\x02", 10)); }
+    /* a stage 2 that is not there makes stage 1 refuse; the bootloader sources and the header agree */
+    assert(boot_stage2[4] == 'L' && boot_stage2[7] == '2' && sizeof boot_stage1 == 446 && sizeof boot_stage2 == 4096);
+    { FILE *df = fopen("tests/out/installed_disk.img", "wb"); if (df) { fwrite(fakedisk[0], 512, 2200, df); fclose(df); } }   /* for tests/boot_emu.py */
+    /* a disk that is too small is refused */
+    { u32 keep = drv[0].sectors; drv[0].sectors = 16000; inst_sel = 0; inst_state = IS_IDLE; click(cx, cy);
+      assert(inst_state == IS_FAIL && !strcmp(inst_err, "Drive too small.")); drv[0].sectors = keep; inst_state = IS_OK; }
+    /* a write error half way is reported, nothing stays mounted, and the next try works */
+    { host_fail_after = 12; inst_sel = 0; inst_state = IS_IDLE; click(cx, cy); click(cx, cy);
+      for (int g = 0; g < 5000 && inst_state == IS_RUN; g++) inst_tick();
+      assert(inst_state == IS_FAIL && !fs_on_disk && inst_err[0]); frame_out("t3b_install_failed.ppm");
+      host_fail_after = -1; inst_state = IS_IDLE; click(cx, cy); click(cx, cy);
+      for (int g = 0; g < 5000 && inst_state == IS_RUN; g++) inst_tick();
+      assert(inst_state == IS_OK && fs_on_disk); }
     /* simulate reboot: reload from the fake disk */
     memset(fsdir, 0, sizeof fsdir); memset(fsdata, 0, sizeof fsdata); fs_on_disk = 0;
     assert(fs_check()); fs_load();

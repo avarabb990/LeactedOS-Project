@@ -13,6 +13,14 @@
 .global _start
 _start:
     cli
+    lgdt gdt_desc            /* our own flat segments, so we do not depend on the loader's */
+    ljmp $0x08, $1f
+1:  mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    mov %ax, %ss
     mov $stack_top, %esp
     cld
     push %ebx            /* multiboot info */
@@ -32,6 +40,16 @@ irq0_stub:
 .global idt_ignore
 idt_ignore:
     iret
+
+.section .rodata
+.align 8
+gdt:
+    .quad 0
+    .quad 0x00CF9A000000FFFF
+    .quad 0x00CF92000000FFFF
+gdt_desc:
+    .word gdt_desc - gdt - 1
+    .long gdt
 
 .section .bss
 .align 16

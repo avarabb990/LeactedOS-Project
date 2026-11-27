@@ -1090,24 +1090,41 @@ static int fs_write_super(int d, u32 sectors) {
     memcpy(sec + 0x10, v, sizeof v);
     return ata_write(d, 1, 1, sec);
 }
-/* format drive d as LeactedFS (v2) and copy the files that are in RAM onto it */
-static int fs_install(int d) {
-    if (d < 0 || d >= N_DRIVES || !drv[d].present || drv[d].sectors < FS2_MIN_SECTORS) return 0;
-    u8 sec[512];
+#include "boot_bin.h"
+/* The running system copies its own image at start-up (before any variable changes), so the Installer can write a
+ * bootable disk: boot sector + stage 2 + this kernel. Layout of an installed disk (see boot/stage2.asm):
+ *   LBA 0 boot sector + partition table, 1 LeactedFS super block, 3..7 directory, 8..15 stage 2, 16.. kernel image. */
+#define SYS_LBA FS2_BOOT_LBA
+#define S2_LBA 8
+static u8 sys_img[FS2_BOOT_SECS * 512];
+static u32 sys_n, sys_entry, sys_bssend; static int sys_ok, boot_from_disk;
+#ifndef HOST
+extern char __image_start[], __image_end[], __bss_end[];
+extern void _start(void);
+#endif
+static void sys_capture(void) {
+#ifdef HOST
+    sys_n = 654321; for (u32 i = 0; i < sys_n; i++) sys_img[i] = (u8)(i * 31 + (i >> 8));
+    sys_entry = 0x100010; sys_bssend = 0x1146880; sys_ok = 1;
+#else
+    u32 n = (u32)(__image_end - __image_start);
+    if (n > sizeof sys_img) return;
+    memcpy(sys_img, __image_start, n);
+    sys_n = n; sys_entry = (u32)(unsigned long)_start; sys_bssend = (u32)(unsigned long)__bss_end; sys_ok = 1;
+#endif
+}
+static void sys_boot_sector(u8 *sec, u32 disk_sectors) {          /* boot code + one partition (LeactedFS) + 55AA */
     memset(sec, 0, 512);
-    /* partition entry: type 0xDA, from sector 16 to the end of the disk */
-    sec[0x1BE] = 0x00; sec[0x1BE + 4] = 0xDA;
-    u32 start = FS2_BOOT_LBA, len = drv[d].sectors - FS2_BOOT_LBA;
+    memcpy(sec, boot_stage1, sizeof boot_stage1);
+    u32 start = FS2_BOOT_LBA, len = disk_sectors - FS2_BOOT_LBA;
+    sec[0x1BE] = 0x80; sec[0x1BE + 4] = 0xDA;
     memcpy(sec + 0x1BE + 8, &start, 4); memcpy(sec + 0x1BE + 12, &len, 4);
     sec[510] = 0x55; sec[511] = 0xAA;
-    fat_cache_drive = -1;
-    if (!ata_write(d, 0, 1, sec)) return 0;
-    if (!fs_write_super(d, drv[d].sectors)) return 0;
-    fs_on_disk = 1; fs_drive = d; fs_ver = 2; fs_max_files = FS_MAX; fs_slot_limit = FS_SLOT;
-    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && !fs_flush_file(i)) { fs_on_disk = 0; fs_drive = -1; return 0; }
-    if (!fs_flush_dir()) { fs_on_disk = 0; fs_drive = -1; return 0; }
-    drive_probe(d);
-    return 1;
+}
+static void sys_stage2(u8 *out) {                                  /* stage 2 with the image's size and entry patched in */
+    memcpy(out, boot_stage2, 4096);
+    u32 secs = (sys_n + 511) / 512, v[5] = { SYS_LBA, secs, sys_entry, sys_bssend, 0x100000u + secs * 512u };
+    memcpy(out + 8, v, sizeof v);
 }
 /* Move a mounted v1 volume to the v2 layout. Files are written first, the
  * superblock last, so a power cut leaves the old volume intact.
@@ -2989,7 +3006,7 @@ static void files_key(int k) {
 /* ------------------------------------------------------------------ */
 /* About / Installer                                                   */
 /* ------------------------------------------------------------------ */
-static int inst_state;      /* 0 idle, 1 confirm, 2 ok, 3 fail */
+static int inst_state;      /* IS_IDLE, IS_CONFIRM, IS_OK, IS_FAIL, IS_RUN */
 static void about_draw(int x, int y, int w, int h) {
     blit_argb(x + (w - logo96_W) / 2, y + 4, logo96_W, logo96_H, logo96);
     draw_str_c(x + w / 2, y + 106, "XP Edition 3.0", RGB(0, 70, 190));
@@ -3016,10 +3033,110 @@ static void install_pick_default(void) {
     for (int d = 0; d < N_DRIVES; d++) if (drv[d].present && drv[d].type == DT_LEACTED) { inst_sel = d; return; }
     for (int d = 0; d < N_DRIVES; d++) if (drv[d].present) { inst_sel = d; return; }
 }
+/* The install runs one small piece per frame (inst_tick) so the window can show progress. */
+enum { IS_IDLE, IS_CONFIRM, IS_OK, IS_FAIL, IS_RUN };
+enum { ST_PREP, ST_LOADER, ST_SYSTEM, ST_FILES, ST_VERIFY, ST_DONE };
+static const char *const inst_steps[5] = { "Preparing the disk", "Writing the boot loader", "Copying the system", "Copying your files", "Checking the installed system" };
+static int inst_step, inst_pos, inst_drive;
+static const char *inst_err = "";
+static u8 inst_tmp[64 * 512];
+static u32 inst_ksecs(void) { return (sys_n + 511) / 512; }
+static void inst_fail(const char *why) {
+    inst_err = why; inst_state = IS_FAIL;
+    if (inst_step >= ST_LOADER) { fs_on_disk = 0; fs_drive = -1; }
+}
+static int inst_progress(void) {                                   /* 0..100 */
+    u32 ks = inst_ksecs(), kc = (ks + 63) / 64 + 1; int nf = fs_count();
+    u32 total = 2 + kc + (u32)nf + 1 + kc, done = 0;
+    if (inst_step > ST_PREP) done += 1;
+    if (inst_step > ST_LOADER) done += 1;
+    if (inst_step == ST_SYSTEM) done += (u32)inst_pos; else if (inst_step > ST_SYSTEM) done += kc;
+    if (inst_step == ST_FILES) done += (u32)inst_pos; else if (inst_step > ST_FILES) done += (u32)nf;
+    if (inst_step > ST_FILES) done += 1;
+    if (inst_step == ST_VERIFY) done += (u32)inst_pos; else if (inst_step > ST_VERIFY) done += kc;
+    return total ? (int)(done * 100 / total) : 100;
+}
+static void inst_tick(void) {
+    if (inst_state != IS_RUN) return;
+    int d = inst_drive;
+    u8 sec[512];
+    switch (inst_step) {
+    case ST_PREP:
+        fat_cache_drive = -1;
+        sys_boot_sector(sec, drv[d].sectors);
+        if (!sys_ok) { sec[0] = 0; memset(sec, 0, 446); }
+        if (!ata_write(d, 0, 1, sec)) { inst_fail("Cannot write the boot sector."); return; }
+        if (!fs_write_super(d, drv[d].sectors)) { inst_fail("Cannot write the file system."); return; }
+        fs_on_disk = 1; fs_drive = d; fs_ver = 2; fs_max_files = FS_MAX; fs_slot_limit = FS_SLOT;
+        inst_step = ST_LOADER; inst_pos = 0; return;
+    case ST_LOADER:
+        if (sys_ok) {
+            static u8 s2[4096]; sys_stage2(s2);
+            if (!ata_write(d, S2_LBA, 8, s2)) { inst_fail("Cannot write the boot loader."); return; }
+        }
+        inst_step = ST_SYSTEM; inst_pos = 0; return;
+    case ST_SYSTEM: {
+        u32 ks = inst_ksecs(), first = (u32)inst_pos * 64;
+        if (!sys_ok || first >= ks) { inst_step = ST_FILES; inst_pos = 0; return; }
+        u32 n = ks - first > 64 ? 64 : ks - first;
+        if (!ata_write(d, SYS_LBA + first, (int)n, sys_img + first * 512)) { inst_fail("Cannot write the system."); return; }
+        inst_pos++; return;
+    }
+    case ST_FILES:
+        while (inst_pos < FS_MAX && !fsdir[inst_pos].used) inst_pos++;
+        if (inst_pos < FS_MAX) {
+            if (!fs_flush_file(inst_pos)) { inst_fail("Cannot copy your files."); return; }
+            inst_pos++; return;
+        }
+        if (!fs_flush_dir()) { inst_fail("Cannot write the directory."); return; }
+        inst_step = ST_VERIFY; inst_pos = 0; return;
+    case ST_VERIFY: {
+        u32 ks = inst_ksecs(), first = (u32)inst_pos * 64;
+        if (!sys_ok) { inst_step = ST_DONE; return; }
+        if (inst_pos == 0) {                                       /* boot sector and loader first */
+            u8 want[512], s2[4096];
+            sys_boot_sector(want, drv[d].sectors);
+            if (!ata_read(d, 0, 1, sec) || memcmp(sec, want, 512)) { inst_fail("Boot sector check failed."); return; }
+            sys_stage2(s2);
+            for (int i = 0; i < 8; i++) if (!ata_read(d, S2_LBA + (u32)i, 1, sec) || memcmp(sec, s2 + i * 512, 512)) { inst_fail("Boot loader check failed."); return; }
+        }
+        if (first >= ks) { inst_step = ST_DONE; return; }
+        u32 n = ks - first > 64 ? 64 : ks - first;
+        if (!ata_read(d, SYS_LBA + first, (int)n, inst_tmp) || memcmp(inst_tmp, sys_img + first * 512, n * 512)) { inst_fail("System check failed."); return; }
+        inst_pos++; return;
+    }
+    default:
+        drive_probe(d);
+        inst_state = IS_OK;
+        if (wins[A_FILES].open) fm_pick_drive(fs_drive);
+        return;
+    }
+}
 static void install_draw(int x, int y, int w, int h) {
     (void)h;
-    draw_str(x + 12, y + 12, "Format a drive as LeactedFS", C_TEXT);
+    draw_str(x + 12, y + 12, "Install LeactedOS on a drive", C_TEXT);
     rect(x + 10, y + 30, w - 20, 1, C_DARK);
+    if (inst_state == IS_RUN || inst_state == IS_OK || (inst_state == IS_FAIL && inst_step > ST_PREP)) {
+        drawf(x + 12, y + 40, C_TEXT, "Installing on %c:", 'C' + inst_drive);
+        for (int i = 0; i < 5; i++) {
+            int yy = y + 60 + i * 18;
+            int done = inst_state == IS_OK || i < inst_step, cur = inst_state == IS_RUN && i == inst_step, bad = inst_state == IS_FAIL && i == inst_step;
+            if (done) draw_str(x + 14, yy, "OK", RGB(0, 130, 0));
+            else if (cur) draw_str(x + 14, yy, ">>", RGB(49, 106, 197));
+            else if (bad) draw_str(x + 14, yy, "!!", RGB(200, 0, 0));
+            draw_str(x + 40, yy, inst_steps[i], done || cur ? C_TEXT : bad ? RGB(200, 0, 0) : C_DARK);
+        }
+        int pct = inst_state == IS_OK ? 100 : inst_progress();
+        rect(x + 14, y + 158, w - 28, 14, C_LIGHT); frame(x + 13, y + 157, w - 26, 16, C_DARK);
+        rect(x + 15, y + 160, (w - 32) * pct / 100, 10, RGB(49, 106, 197));
+        drawf(x + w / 2 - 12, y + 160, pct > 50 ? C_LIGHT : C_TEXT, "%d%%", pct);
+        if (inst_state == IS_OK) {
+            draw_str_c(x + w / 2, y + 182, "Install successful!", RGB(0, 130, 0));
+            draw_str_c(x + w / 2, y + 196, sys_ok ? "Restart without the -kernel option to boot it." : "Files copied (data disk only).", C_DARK);
+            button(x + w / 2 - 74, y + 212, 148, 24, "Restart now", 0);
+        } else if (inst_state == IS_FAIL) draw_str_c(x + w / 2, y + 182, inst_err, RGB(200, 0, 0));
+        return;
+    }
     if (!n_drives()) {
         draw_str(x + 12, y + 44, "No disk detected!", RGB(180, 0, 0));
         draw_str(x + 12, y + 62, "Attach a drive when starting QEMU:", C_TEXT);
@@ -3047,25 +3164,35 @@ static void install_draw(int x, int y, int w, int h) {
     else if (ty == DT_LEACTED) draw_str(x + 12, y + 130, "Already LeactedFS (it will be reset)", RGB(160, 100, 0));
     else draw_str(x + 12, y + 130, "Drive is empty / unformatted", C_TEXT);
     if (inst_sel >= 0 && drv[inst_sel].sectors < FS2_MIN_SECTORS) draw_str(x + 12, y + 144, "Too small: needs about 9 MB or more.", RGB(190, 0, 0));
+    else if (sys_ok) drawf(x + 12, y + 144, C_TEXT, "Writes boot loader, system (%u KB), your files.", (sys_n + 1023) / 1024);
     else draw_str(x + 12, y + 144, "Files in RAM are copied to the drive.", C_TEXT);
-    button(x + w / 2 - 74, y + 164, 148, 26, inst_state == 1 ? "Click again to erase" : "Install Now", 0);
-    if (inst_state == 2) draw_str_c(x + w / 2, y + 202, "Install successful!", RGB(0, 130, 0));
-    if (inst_state == 3) draw_str_c(x + w / 2, y + 202, "Install FAILED", RGB(200, 0, 0));
+    button(x + w / 2 - 74, y + 164, 148, 26, inst_state == IS_CONFIRM ? "Click again to erase" : "Install Now", 0);
+    if (inst_state == IS_FAIL) draw_str_c(x + w / 2, y + 202, inst_err[0] ? inst_err : "Install FAILED", RGB(200, 0, 0));
+    if (boot_from_disk) draw_str_c(x + w / 2, y + 220, "(running from an installed disk)", C_DARK);
 }
 static void fm_pick_drive(int d);
+/* install without the window: used by tests and scripts */
+__attribute__((unused)) static int fs_install(int d) {
+    if (d < 0 || d >= N_DRIVES || !drv[d].present || drv[d].sectors < FS2_MIN_SECTORS) return 0;
+    inst_drive = d; inst_step = ST_PREP; inst_pos = 0; inst_err = ""; inst_state = IS_RUN;
+    for (int g = 0; g < 200000 && inst_state == IS_RUN; g++) inst_tick();
+    return inst_state == IS_OK;
+}
 static void install_click(int rx, int ry) {
     int w = CW(A_INSTALL);
+    if (inst_state == IS_RUN) return;
+    if (inst_state == IS_OK) { if (inrect(rx, ry, w / 2 - 74, 212, 148, 24)) reboot_now(); return; }
+    if (inst_state == IS_FAIL && inst_step > ST_PREP) { inst_state = IS_IDLE; return; }
     if (!n_drives()) return;
     for (int d = 0, row = 0; d < N_DRIVES; d++) {
         if (!drv[d].present) continue;
-        if (inrect(rx, ry, 8, 50 + row * 18, w - 16, 16)) { inst_sel = d; inst_state = 0; return; }
+        if (inrect(rx, ry, 8, 50 + row * 18, w - 16, 16)) { inst_sel = d; inst_state = IS_IDLE; return; }
         row++;
     }
     if (inrect(rx, ry, w / 2 - 74, 164, 148, 26)) {
-        if (inst_sel < 0 || drv[inst_sel].sectors < FS2_MIN_SECTORS) { inst_state = 3; return; }
-        if (inst_state != 1) { inst_state = 1; return; }
-        inst_state = fs_install(inst_sel) ? 2 : 3;
-        if (inst_state == 2 && wins[A_FILES].open) fm_pick_drive(fs_drive);
+        if (inst_sel < 0 || drv[inst_sel].sectors < FS2_MIN_SECTORS) { inst_err = "Drive too small."; inst_state = IS_FAIL; return; }
+        if (inst_state != IS_CONFIRM) { inst_state = IS_CONFIRM; return; }
+        inst_drive = inst_sel; inst_step = ST_PREP; inst_pos = 0; inst_err = ""; inst_state = IS_RUN;
     }
 }
 
@@ -3669,7 +3796,7 @@ static int br_is_void(const char *nm) {
 }
 /* copy the CSS of the element on top of the stack into the layout state */
 static void br_apply_state(void) {
-    static const struct cstyle none = { CSS_NONE, CSS_NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const struct cstyle none = { .fg = CSS_NONE, .bg = CSS_NONE };
     const struct cstyle *s = br_sd > 0 ? &br_stk[br_sd - 1].st : &none;
     br_fgc = s->fg; br_big = s->big; br_align = s->align; br_cind = s->cind; br_hide = s->hidden; br_xform = s->xform;
     br_deco = s->deco; br_nolist = s->nolist; br_sbold = s->bold; br_pre = br_pretag || s->pre;
@@ -4817,7 +4944,7 @@ static void app_init(int a) {
     else if (a == A_CALC) calc_reset();
     else if (a == A_BROWSER) br_open();
     else if (a == A_FILES) { if (fm_drive < 0 || (fm_drive != FM_RAM && !drv[fm_drive].present)) fm_pick_drive(fs_on_disk ? fs_drive : FM_RAM); else fm_refresh(); }
-    else if (a == A_INSTALL) { inst_state = 0; install_pick_default(); }
+    else if (a == A_INSTALL) { if (inst_state != IS_RUN) inst_state = IS_IDLE; install_pick_default(); }
     else if (a >= A_EXT0) { if (xcall(a, EV_INIT, 0, 0, 0, 0)) xapp[a - A_EXT0].want_close = 1; }
 }
 static void app_draw(int a, int x, int y, int w, int h) {
@@ -5298,7 +5425,7 @@ static int prev_btn;
 static void os_events(void) {
     xapp_reap();
     input_poll();
-    net_poll(); tjob_tick(); br_check();
+    net_poll(); tjob_tick(); br_check(); inst_tick();
     int k;
     while ((k = kq_pop())) {
         int a = top_app();
@@ -5324,6 +5451,7 @@ static void splash(int pct, const char *msg) {
 }
 static void os_init(u32 magic, const u32 *mbi) {
     boot_via_multiboot = magic == 0x2BADB002;
+    if (boot_via_multiboot && mbi && (mbi[0] & 0x200) && mbi[16]) boot_from_disk = !kmemcmp((const char *)(unsigned long)mbi[16], "LeactedOS", 10);
     if (boot_via_multiboot && mbi && (mbi[0] & 1)) mem_kb = 1024 + mbi[2];
 #ifdef HOST
     mem_kb = 262144;
@@ -5350,6 +5478,7 @@ static void os_init(u32 magic, const u32 *mbi) {
 }
 
 void kernel_main(u32 magic, const u32 *mbi) {
+    sys_capture();
     os_init(magic, mbi);
     u32 next = ticks;
     for (;;) {

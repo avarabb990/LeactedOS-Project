@@ -21,9 +21,13 @@ for t in css_test js_test; do
     gcc -m64 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wno-unused-function -Wno-misleading-indentation -o tests/out/$t tests/$t.c
     ./tests/out/$t | tail -1
 done
+# 1d. the boot loader (stage 1 + 2) is run on a small x86 emulator against the disk the Installer wrote
+#     (host_test writes tests/out/installed_disk.img below; checked after it)
 # 2. the whole OS (File Manager, apps, windows...) on the PC with the same app sources built natively
 for a in hello snake doodle; do
     gcc -m64 -O1 -g -fsanitize=address,undefined -Dlapp_main=${a}_main -c sdk/apps/$a.c -o tests/out/$a.o
 done
 gcc -m64 -O1 -g -fsanitize=address,undefined -Wall -Wno-unused-function -o host_test host_test.c tests/out/hello.o tests/out/snake.o tests/out/doodle.o
 ./host_test
+# 3. boot the disk the Installer just wrote (needs python3)
+python3 tests/boot_emu.py tests/out/installed_disk.img

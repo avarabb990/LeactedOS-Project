@@ -67,3 +67,5 @@ lines) and the `.lapp` files. Build one with `python3 tools/mkrepo.py --dir repo
 gateway, a small web server, packet loss, redirects) under AddressSanitizer.
 
 `tests/css_test.c` and `tests/js_test.c` test the CSS engine and the JavaScript interpreter on their own; `host_test.c` runs pages with scripts, external `.css`/`.js` and timers through the Browser.
+
+The boot loader sources are in `boot/`; `python3 tools/mkboot.py` (needs nasm) regenerates `boot_bin.h`. `tests/boot_emu.py` runs the loader on a tiny x86 emulator against the disk image that `host_test` makes with the Installer, in several BIOS variants (A20 off, E801 answering in AX/BX, a BIOS that undoes unreal mode, only INT 15h/88h).
