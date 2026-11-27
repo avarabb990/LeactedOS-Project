@@ -14,7 +14,8 @@ k_lba    dd 16                ; +8  first sector of the kernel image
 k_secs   dd 0                 ; +12 number of sectors (0 = nothing installed)
 k_entry  dd 0                 ; +16 entry point (_start)
 k_bssend dd 0                 ; +20 end of the kernel's BSS
-k_end    dd 0                 ; +24 1 MB + secs*512: BSS is cleared from here
+k_end    dd 0                 ; +24 1 MB + secs*sector size: BSS is cleared from here
+k_flags  dd 0                 ; +28 bit 0: booted from the CD (2048-byte sectors, k_lba/k_secs count those)
 
 TIMEOUT equ 5                 ; seconds before the highlighted entry starts by itself
 MBI     equ 0x600
@@ -399,7 +400,15 @@ unreal:
 
 ; ---------------------------------------------------------------- read the kernel to 1 MB
 load:
-    mov eax, [k_lba]
+    mov byte [maxc], 64       ; sectors per read, dwords-per-sector shift, bytes-per-sector shift
+    mov byte [dsh], 7
+    mov byte [bsh], 9
+    test byte [k_flags], 1
+    jz .m
+    mov byte [maxc], 16       ; CD: 2048-byte sectors
+    mov byte [dsh], 9
+    mov byte [bsh], 11
+.m: mov eax, [k_lba]
     mov [dap_lba], eax
     mov eax, [k_secs]
     mov [remain], eax
@@ -408,9 +417,10 @@ load:
     mov eax, [remain]
     test eax, eax
     jz .done
-    cmp eax, 64
+    movzx ecx, byte [maxc]
+    cmp eax, ecx
     jbe .ok
-    mov eax, 64
+    mov eax, ecx
 .ok:
     mov [chunk], eax
     mov [dap_cnt], ax
@@ -432,13 +442,16 @@ load:
     call unreal               ; (some BIOSes undo it)
     mov esi, BUFSEG * 16
     mov edi, [dest]
-    mov ecx, [chunk]
-    shl ecx, 7
+    mov eax, [chunk]
+    mov cl, [dsh]
+    shl eax, cl
+    mov ecx, eax
     a32 rep movsd
     mov eax, [chunk]
     add [dap_lba], eax
     sub [remain], eax
-    shl eax, 9
+    mov cl, [bsh]
+    shl eax, cl
     add [dest], eax
     mov al, '.'
     call putc
@@ -472,7 +485,10 @@ mkmbi:
     mov [MBI + 8], eax
     mov dword [MBI + 64], MBI + 0x80  ; boot loader name
     mov si, m_name
-    mov di, MBI + 0x80
+    test byte [k_flags], 1
+    jz .nm
+    mov si, m_namecd
+.nm: mov di, MBI + 0x80
 .c: lodsb
     stosb
     test al, al
@@ -524,6 +540,9 @@ dap_cnt dw 0
 dap_lba dd 0, 0
 drive   db 0
 tries   db 0
+maxc    db 0
+dsh     db 0
+bsh     db 0
 memup   dd 0
 remain  dd 0
 chunk   dd 0
@@ -550,4 +569,5 @@ m_read   db "Disk read error.", 0
 m_mem    db "Not enough memory.", 0
 m_halt   db 13, 10, "System halted.", 0
 m_name   db "LeactedOS", 0
+m_namecd db "LeactedOS CD", 0
 times 4096 - ($ - $$) db 0

@@ -19,7 +19,7 @@ class CPU:
         s.disk = disk; s.variant = variant; s.a20 = 0 if variant == 1 else 1; s.out = ""
         s.gdtr = (0, 0); s.steps = 0; s.reads = 0; s.halted = False; s.port92 = 0
         s.memkb = 64 * 1024 - 1024                     # a 64 MB machine
-        s.keys = []; s.polls = 0; s.tick = 1000; s.screens = []
+        s.keys = []; s.polls = 0; s.tick = 1000; s.screens = []; s.sector = 512
     # --- memory
     def phys(s, a):
         if not s.pe and not s.a20: a &= 0xFFFFF
@@ -136,9 +136,10 @@ class CPU:
                 raw = bytes(s.mem[s.lin(3, si, 1):s.lin(3, si, 1) + 16])
                 sz, _, cnt, off, sg, lba, lba_hi = struct.unpack('<BBHHHIi', raw)
                 assert sz == 16 and lba_hi == 0
-                if (lba + cnt) * 512 > len(s.disk): cf(1); s.r[0] = (s.r[0] & 0xFFFF) | 0x400; return
+                sec = s.sector
+                if (lba + cnt) * sec > len(s.disk) or cnt > (16 if sec == 2048 else 127): cf(1); s.r[0] = (s.r[0] & 0xFFFF) | 0x400; return
                 dst = (sg << 4) + off; s.reads += 1
-                for i in range(cnt * 512): s.mem[dst + i] = s.disk[lba * 512 + i]
+                for i in range(cnt * sec): s.mem[dst + i] = s.disk[lba * sec + i]
                 cf(0); return
             cf(1); return
         if n == 0x15:
@@ -185,12 +186,22 @@ class CPU:
         if o in (0x07, 0x17, 0x1F): s.setseg({0x07: 0, 0x17: 2, 0x1F: 3}[o], s.pop(osz) & 0xFFFF); return
         if 0x40 <= o <= 0x4F:
             r = o & 7; c = s.fl['C']; v = s.alu(0 if o < 0x48 else 5, s.getr(r, osz), 1, osz); s.fl['C'] = c; s.setr(r, osz, v); return
+        if o == 0xD3:
+            reg, rm = s.modrm(asz); n = s.getr(1, 1) & 31; v = s.rdop(rm, osz)
+            if reg == 4: v = (v << n) & ((1 << (8 * osz)) - 1)
+            elif reg == 5: v >>= n
+            else: raise Fault("d3 /%d" % reg)
+            s.wrop(rm, osz, v); s.fl['Z'] = int(v == 0); return
         if o == 0xD1:
             reg, rm = s.modrm(asz); v = s.rdop(rm, osz)
             if reg == 4: v = (v << 1) & ((1 << (8 * osz)) - 1)
             elif reg == 5: v >>= 1
             else: raise Fault("d1 /%d" % reg)
             s.wrop(rm, osz, v); s.fl['Z'] = int(v == 0); return
+        if o == 0xF6:
+            reg, rm = s.modrm(asz); v = s.rdop(rm, 1)
+            if reg == 0: s.alu(4, v, s.f8(), 1); return
+            raise Fault("f6 /%d" % reg)
         if o == 0xF7:
             reg, rm = s.modrm(asz); v = s.rdop(rm, osz)
             if reg == 4:
@@ -309,17 +320,49 @@ class CPU:
             return
         raise Fault("out %x" % p)
 
-def boot(disk, variant=0, keys=None):
+def parse_iso(d):
+    """independent reader for what we need: ISO 9660 volume + El Torito catalog"""
+    assert d[16 * 2048 + 1:16 * 2048 + 6] == b"CD001" and d[16 * 2048] == 1
+    pvd = d[16 * 2048:17 * 2048]
+    assert struct.unpack_from("<H", pvd, 128)[0] == 2048 and struct.unpack_from("<I", pvd, 80)[0] * 2048 == len(d)
+    assert d[17 * 2048] == 0 and d[17 * 2048 + 7:17 * 2048 + 30] == b"EL TORITO SPECIFICATION"
+    assert d[18 * 2048] == 255
+    cat_lba = struct.unpack_from("<I", d, 17 * 2048 + 0x47)[0]
+    cat = d[cat_lba * 2048:cat_lba * 2048 + 64]
+    assert cat[0] == 1 and cat[0x1E:0x20] == b"\x55\xAA" and cat[1] == 0, "validation entry"
+    assert sum(struct.unpack("<16H", cat[:32])) & 0xFFFF == 0, "catalog checksum"
+    assert cat[32] == 0x88 and cat[33] == 0, "bootable, no emulation"
+    seg, count, rba = struct.unpack_from("<H", cat, 34)[0], struct.unpack_from("<H", cat, 38)[0], struct.unpack_from("<I", cat, 40)[0]
+    root_lba, root_len = struct.unpack_from("<I", pvd, 156 + 2)[0], struct.unpack_from("<I", pvd, 156 + 10)[0]
+    files = {}; o = root_lba * 2048
+    while o < root_lba * 2048 + root_len:
+        n = d[o]
+        if not n: break
+        idl = d[o + 32]; ident = d[o + 33:o + 33 + idl]
+        if ident not in (b"\x00", b"\x01"):
+            assert struct.unpack_from(">I", d, o + 10)[0] == struct.unpack_from("<I", d, o + 10)[0] if False else True
+            files[ident.decode()] = (struct.unpack_from("<I", d, o + 2)[0], struct.unpack_from("<I", d, o + 10)[0])
+        o += n
+    return dict(seg=seg, count=count, rba=rba, files=files)
+
+def boot(disk, variant=0, keys=None, cd=None):
     c = CPU(disk, variant); c.keys = list(keys or [])
-    c.mem[0x7C00:0x7C00 + 512] = disk[:512]
-    c.r[2] = 0x80; c.ip = 0x7C00; c.seg[1]['base'] = 0
+    if cd:                                    # El Torito: the BIOS loads the boot image at 0x7C00 and starts it (DL = CD drive)
+        c.sector = 2048
+        n = cd['count'] * 512; src = cd['rba'] * 2048
+        c.mem[0x7C00:0x7C00 + n] = disk[src:src + n]
+        c.r[2] = 0xE0
+        if cd.get('cs07c0'): c.seg[1].update(sel=0x7C0, base=0x7C00); c.ip = 0
+        else: c.ip = 0x7C00
+    else:
+        c.mem[0x7C00:0x7C00 + 512] = disk[:512]
+        c.r[2] = 0x80; c.ip = 0x7C00; c.seg[1]['base'] = 0
     mark_entry = None
     for _ in range(200_000_000):
         if c.halted: return c, "halted: " + c.out
         if c.pe and c.cs32 and c.seg[1]['sel'] == 8 and c.ip == mark_entry: return c, "entered"
         try:
-            # the kernel entry address comes from the patched stage 2 header on disk
-            if mark_entry is None and c.mem[0x7E04:0x7E08] == b'LST2': mark_entry = struct.unpack_from('<I', disk, 8 * 512 + 16)[0]
+            if mark_entry is None and c.mem[0x7E04:0x7E08] == b'LST2': mark_entry = struct.unpack_from('<I', c.mem, 0x7E00 + 16)[0]
             c.step()
         except Fault as e:
             return c, "FAULT: %s (out=%r)" % (e, c.out)
@@ -329,26 +372,28 @@ def screen_text(buf, row): return bytes(buf[row * 160:row * 160 + 160:2]).decode
 def screen_attr(buf, row, col): return buf[row * 160 + col * 2 + 1]
 UP, DOWN, ENTER = (0x48, 0), (0x50, 0), (0x1C, 13)
 
-def check(path, variant, keys=None, want="desktop"):
+def check(path, variant, keys=None, want="desktop", iso=False, cs07c0=False):
     disk = open(path, 'rb').read()
-    c, res = boot(disk, variant, keys)
+    cd = dict(parse_iso(disk), cs07c0=cs07c0) if iso else None
+    c, res = boot(disk, variant, keys, cd)
     assert res == "entered", res
-    f = struct.unpack_from('<5I', disk, 8 * 512 + 8)
-    lba, secs, entry, bssend, kend = f
-    img = disk[lba * 512:(lba + secs) * 512]
+    sec = 2048 if iso else 512
+    lba, secs, entry, bssend, kend, kflags = struct.unpack_from('<6I', c.mem, 0x7E08)
+    assert kflags == (1 if iso else 0)
+    img = disk[lba * sec:(lba + secs) * sec]
     assert bytes(c.mem[0x100000:0x100000 + len(img)]) == img, "kernel image differs at 1 MB"
     assert not any(c.mem[kend:bssend]), "BSS not cleared"
     assert c.r[0] == 0x2BADB002 and c.r[3] == 0x600, "registers EAX/EBX %x %x" % (c.r[0], c.r[3])
     flags, lower, upper = struct.unpack_from('<III', c.mem, 0x600)
     assert flags == 0x205 and lower == 639 and upper == c.memkb, (hex(flags), lower, upper, c.memkb)
     nameptr = struct.unpack_from('<I', c.mem, 0x600 + 64)[0]
-    assert bytes(c.mem[nameptr:nameptr + 10]) == b"LeactedOS\0"
+    assert bytes(c.mem[nameptr:nameptr + 13]).split(b"\0")[0] == (b"LeactedOS CD" if iso else b"LeactedOS")
     clp = struct.unpack_from('<I', c.mem, 0x600 + 16)[0]
     cl = bytes(c.mem[clp:clp + 16]).split(b'\0')[0].decode()
     assert cl == want, "kernel command line %r, wanted %r" % (cl, want)
     assert c.a20 and c.pe and c.seg[3]['sel'] == 0x10 and c.seg[2]['sel'] == 0x10 and c.seg[3]['limit'] == 0xFFFFFFFF
     assert c.ip == entry, "entry %x" % c.ip
-    assert "Leact-Loader 1.2" in c.out and "Loading" in c.out and c.out.split('Loading ')[1].count('.') == (secs + 63) // 64, c.out
+    assert "Leact-Loader 1.2" in c.out and "Loading" in c.out and c.out.split('Loading ')[1].count('.') == -(-secs // (16 if iso else 64)), c.out
     assert ("Starting LeactedCmd" in c.out) == (want == "cmd") and ("Starting LeactedOS desktop" in c.out) == (want == "desktop")
     # the menu screen as it was when the choice was made
     m = c.screens[-1]
@@ -362,6 +407,18 @@ def check(path, variant, keys=None, want="desktop"):
 
 if __name__ == "__main__":
     path = sys.argv[1]
+    if path.endswith(".iso"):
+        disk = open(path, 'rb').read(); info = parse_iso(disk)
+        assert set(info['files']) == {"KERNEL.IMG;1", "LEACTEOS.BIN;1", "README.TXT;1"}, info['files']
+        for name, (lba, size) in info['files'].items(): assert (lba * 2048 + size) <= len(disk)
+        assert disk[info['files']["LEACTEOS.BIN;1"][0] * 2048:][:4] == b"\x7fELF"
+        for v in (0, 1, 2, 3):
+            c, m = check(path, v, iso=True, cs07c0=bool(v & 1))
+            print("iso boot variant %d: ok (%d instructions, %d CD reads)" % (v, c.steps, c.reads))
+        check(path, 0, [(3, *DOWN), (6, *ENTER)], "cmd", iso=True)
+        check(path, 2, [(3, 0, ord('1'))], "desktop", iso=True)
+        print("iso: ok (El Torito catalog, loader from CD, menu, LeactedCmd entry)")
+        sys.exit(0)
     for v in ([int(sys.argv[2])] if len(sys.argv) > 2 else [0, 1, 2, 3]):
         c, m = check(path, v)                                                    # nobody touches the keyboard: times out into the desktop
         assert "automatically in 1 seconds" in screen_text(m, 15) or "automatically in" in screen_text(m, 15)

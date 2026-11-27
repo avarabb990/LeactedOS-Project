@@ -45,6 +45,7 @@ Every version is a git tag, so you can browse the source of any of them (`git ch
 | v10 | Browser: CSS and JavaScript (`css.h`, `js.h`), external `.css`/`.js` files, DOM, timers |
 | v11 | Real installer: writes a boot loader and the system to a disk, which then boots on its own (no `-kernel`) |
 | v12 | Leact-Loader 1.2 boot menu: LeactedOS desktop (Normal) or LeactedCmd (full-screen command line) |
+| v13 | Bootable install CD (`releases/leacteos-v13.iso`, built by `tools/mkiso.py`) |
 
 v7, v8 and v9 were built in one go and share a single source commit (the binaries of each are in `releases/`).
 
@@ -78,3 +79,11 @@ Disk layout: sector 0 boot sector + partition table, 1 LeactedFS super block, 3-
 ## Leact-Loader 1.2 (boot menu)
 A disk made by the Installer starts with a GRUB-style menu: **LeactedOS desktop (Normal)** or **LeactedCmd (command line)**. Use the up/down keys (or 1 / 2) and Enter; if you press nothing the highlighted entry starts after 5 seconds. LeactedCmd is a full-screen console without the desktop: the same commands as the Terminal, 78x46 characters. Type `desktop` to start the desktop from it, and `cmdmode` in the desktop Terminal to go the other way. The menu choice reaches the kernel as the multiboot command line (`desktop` or `cmd`), so `qemu-system-i386 -kernel leacteos-v12.bin -append cmd ...` starts LeactedCmd without any disk.
 Disks installed with an older version keep the old loader (no menu): run the Installer again to update it.
+
+## Install CD (ISO)
+`releases/leacteos-v13.iso` boots from a CD/DVD drive or a virtual machine (BIOS, El Torito, no emulation) into Leact-Loader 1.2 and then LeactedOS or LeactedCmd, running from the CD. Attach a hard disk, open **Installer** and install as usual; the installed disk gets the same loader and menu and boots on its own.
+```
+qemu-img create -f raw disk.img 64M
+qemu-system-i386 -cdrom leacteos-v13.iso -boot d -m 256 -nic user,model=rtl8139 -drive file=disk.img,format=raw,if=ide
+```
+After the install, remove `-cdrom ... -boot d` to boot the disk. Build your own ISO from a kernel with `python3 tools/mkiso.py leacteos.bin leacteos.iso` (no external tools needed). The ISO also contains `LEACTEOS.BIN` (the multiboot kernel, for GRUB or `qemu -kernel`) and a README. The system itself is one kernel image, so there are no separate system files on the CD or the disk to delete: your files live in LeactedFS next to it.

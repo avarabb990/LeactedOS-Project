@@ -1097,7 +1097,7 @@ static int fs_write_super(int d, u32 sectors) {
 #define SYS_LBA FS2_BOOT_LBA
 #define S2_LBA 8
 static u8 sys_img[FS2_BOOT_SECS * 512];
-static u32 sys_n, sys_entry, sys_bssend; static int sys_ok, boot_from_disk;
+static u32 sys_n, sys_entry, sys_bssend; static int sys_ok, boot_from_disk, boot_from_cd;
 #ifndef HOST
 extern char __image_start[], __image_end[], __bss_end[];
 extern void _start(void);
@@ -3155,7 +3155,7 @@ static void install_draw(int x, int y, int w, int h) {
         drawf(x + w / 2 - 12, y + 160, pct > 50 ? C_LIGHT : C_TEXT, "%d%%", pct);
         if (inst_state == IS_OK) {
             draw_str_c(x + w / 2, y + 182, "Install successful!", RGB(0, 130, 0));
-            draw_str_c(x + w / 2, y + 196, sys_ok ? "Restart without the -kernel option to boot it." : "Files copied (data disk only).", C_DARK);
+            draw_str_c(x + w / 2, y + 196, sys_ok ? (boot_from_cd ? "Remove the CD and restart to boot from the disk." : "Restart without the -kernel option to boot it.") : "Files copied (data disk only).", C_DARK);
             button(x + w / 2 - 74, y + 212, 148, 24, "Restart now", 0);
         } else if (inst_state == IS_FAIL) draw_str_c(x + w / 2, y + 182, inst_err, RGB(200, 0, 0));
         return;
@@ -3191,7 +3191,7 @@ static void install_draw(int x, int y, int w, int h) {
     else draw_str(x + 12, y + 144, "Files in RAM are copied to the drive.", C_TEXT);
     button(x + w / 2 - 74, y + 164, 148, 26, inst_state == IS_CONFIRM ? "Click again to erase" : "Install Now", 0);
     if (inst_state == IS_FAIL) draw_str_c(x + w / 2, y + 202, inst_err[0] ? inst_err : "Install FAILED", RGB(200, 0, 0));
-    if (boot_from_disk) draw_str_c(x + w / 2, y + 220, "(running from an installed disk)", C_DARK);
+    if (boot_from_disk) draw_str_c(x + w / 2, y + 220, boot_from_cd ? "(running from the install CD)" : "(running from an installed disk)", C_DARK);
 }
 static void fm_pick_drive(int d);
 /* install without the window: used by tests and scripts */
@@ -5481,7 +5481,7 @@ static void os_init(u32 magic, const u32 *mbi) {
         const char *cl = (const char *)(unsigned long)mbi[4];
         for (const char *p = cl; *p; p++) if ((p == cl || p[-1] == ' ') && !kmemcmp(p, "cmd", 3) && (p[3] == 0 || p[3] == ' ')) cmd_mode = 1;
     }
-    if (boot_via_multiboot && mbi && (mbi[0] & 0x200) && mbi[16]) boot_from_disk = !kmemcmp((const char *)(unsigned long)mbi[16], "LeactedOS", 10);
+    if (boot_via_multiboot && mbi && (mbi[0] & 0x200) && mbi[16]) { const char *bn = (const char *)(unsigned long)mbi[16]; boot_from_cd = !kmemcmp(bn, "LeactedOS CD", 13); boot_from_disk = boot_from_cd || !kmemcmp(bn, "LeactedOS", 10); }
     if (boot_via_multiboot && mbi && (mbi[0] & 1)) mem_kb = 1024 + mbi[2];
 #ifdef HOST
     mem_kb = 262144;

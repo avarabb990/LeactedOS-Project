@@ -29,5 +29,8 @@ for a in hello snake doodle; do
 done
 gcc -m64 -O1 -g -fsanitize=address,undefined -Wall -Wno-unused-function -o host_test host_test.c tests/out/hello.o tests/out/snake.o tests/out/doodle.o
 ./host_test
-# 3. boot the disk the Installer just wrote (needs python3)
+# 3. boot the disk the Installer just wrote, then the install CD built from the kernel (needs python3)
 python3 tests/boot_emu.py tests/out/installed_disk.img
+make -s
+python3 tools/mkiso.py leacteos.bin tests/out/leacteos.iso
+python3 tests/boot_emu.py tests/out/leacteos.iso
