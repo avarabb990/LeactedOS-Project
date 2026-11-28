@@ -5,7 +5,7 @@ It checks that the kernel arrives at 1 MB intact, the BSS is cleared, the multib
 are handled, and that execution ends with EAX=0x2BADB002, EBX=mbi at the kernel's entry point.
 The boot menu (Leact-Loader 1.2) is driven with scripted key presses; the screen is captured from video memory.
 usage: boot_emu.py disk.img [variant]      variant: 0 normal, 1 A20 off + E801 in AX/BX, 2 BIOS resets segment limits, 3 only INT 15h/88h"""
-import sys, struct
+import sys, os, struct
 
 class Fault(Exception): pass
 
@@ -201,6 +201,10 @@ class CPU:
         if o == 0xF6:
             reg, rm = s.modrm(asz); v = s.rdop(rm, 1)
             if reg == 0: s.alu(4, v, s.f8(), 1); return
+            if reg == 6:
+                n = s.getr(0, 2)
+                if v == 0 or n // v > 255: raise Fault("divide error")
+                s.setr(0, 1, n // v); s.setr(4, 1, n % v); return      # AL = quotient, AH = remainder
             raise Fault("f6 /%d" % reg)
         if o == 0xF7:
             reg, rm = s.modrm(asz); v = s.rdop(rm, osz)
@@ -235,6 +239,16 @@ class CPU:
         if o == 0x8C: reg, rm = s.modrm(asz); s.wrop(rm, 2, s.seg[{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}[reg]]['sel']); return
         if o == 0x8E: reg, rm = s.modrm(asz); s.setseg({0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}[reg], s.rdop(rm, 2)); return
         if o == 0x90: return
+        if o in (0xA0, 0xA2):
+            off = s.f32() if asz == 4 else s.f16(); sg = s.segov if s.segov is not None else 3
+            if o == 0xA0: s.setr(0, 1, s.rd(sg, off, 1))
+            else: s.wr(sg, off, 1, s.getr(0, 1))
+            return
+        if o in (0x6B, 0x69):
+            reg, rm = s.modrm(asz); v = s.rdop(rm, osz)
+            im = s.f8() if o == 0x6B else s.fimm(osz)
+            if o == 0x6B and im & 0x80: im -= 256
+            s.setr(reg, osz, (v * im) & ((1 << (8 * osz)) - 1)); return
         if o in (0xA1, 0xA3):
             off = s.f32() if asz == 4 else s.f16(); sg = s.segov if s.segov is not None else 3
             if o == 0xA1: s.setr(0, osz, s.rd(sg, off, osz))
@@ -394,13 +408,13 @@ def check(path, variant, keys=None, want="desktop", iso=False, cs07c0=False):
     assert c.a20 and c.pe and c.seg[3]['sel'] == 0x10 and c.seg[2]['sel'] == 0x10 and c.seg[3]['limit'] == 0xFFFFFFFF
     assert c.ip == entry, "entry %x" % c.ip
     assert "Leact-Loader 1.2" in c.out and "Loading" in c.out and c.out.split('Loading ')[1].count('.') == -(-secs // (16 if iso else 64)), c.out
-    assert ("Starting LeactedCmd" in c.out) == (want == "cmd") and ("Starting LeactedOS desktop" in c.out) == (want == "desktop")
+    assert ("Starting LeactedCmd" in c.out) == want.startswith("cmd") and ("Starting LeactedOS desktop" in c.out) == want.startswith("desktop")
     # the menu screen as it was when the choice was made
     m = c.screens[-1]
     assert "Leact-Loader 1.2" in screen_text(m, 1) and screen_attr(m, 1, 32) == 0x1F
     assert screen_text(m, 3)[10] == '\u2554' and screen_text(m, 10)[69] == '\u255d' and screen_text(m, 6)[10] == '\u2551'
     assert "LeactedOS desktop (Normal)" in screen_text(m, 5) and "LeactedCmd (command line)" in screen_text(m, 6)
-    hi = 5 if want == "desktop" else 6
+    hi = 6 if want.startswith("cmd") else 5
     assert screen_attr(m, hi, 20) == 0x70 and screen_attr(m, 11 - hi, 20) == 0x07, "highlight on the wrong entry"
     assert "keys to select which entry is highlighted" in screen_text(m, 12) and "Press enter to boot the selected OS." in screen_text(m, 13)
     return c, m
@@ -429,6 +443,24 @@ if __name__ == "__main__":
     c, m = check(path, 2, [(3, *DOWN), (5, *ENTER)], "cmd")
     c, m = check(path, 1, [(2, *ENTER)], "desktop")
     c, m = check(path, 0, [(3, 0, ord('x')), (5, *DOWN), (7, *ENTER)], "cmd")
-    print("boot menu: ok (timeout, arrows, enter, number keys)")
+    c, m = check(path, 0, [(3, 0, ord('s'))], "desktop safe")
+    print("boot menu: ok (timeout, arrows, enter, number keys, S = safe mode)")
+    cfgp = os.path.join(os.path.dirname(path), "cfg_disk.img")
+    if os.path.exists(cfgp):                                                     # SYSTEM\BOOT.CFG: timeout=2 default=2 (written by host_test)
+        c, m = check(cfgp, 0, None, "cmd"); assert "in  2 seconds" in screen_text(m, 15) or "in 2 seconds" in screen_text(m, 15) or "automatically" in screen_text(m, 15)
+        c, m = check(cfgp, 0, [(3, *UP), (4, *ENTER)], "desktop")                # a key still overrides the file
+        d = bytearray(open(cfgp, 'rb').read())                                   # same disk with timeout=off: nothing starts by itself
+        ents = d[3 * 512 + 16:3 * 512 + 16 + 64 * 32]; sysslot = bootslot = None
+        for i in range(64):
+            nm = bytes(ents[i * 32:i * 32 + 24]).split(b'\0')[0]; fl = struct.unpack_from('<I', ents, i * 32 + 28)[0]
+            if nm == b"SYSTEM" and fl & 4: sysslot = i
+        for i in range(64):
+            nm = bytes(ents[i * 32:i * 32 + 24]).split(b'\0')[0]; fl = struct.unpack_from('<I', ents, i * 32 + 28)[0]
+            if nm == b"BOOT.CFG" and (fl >> 8) & 255 == sysslot + 1: bootslot = i
+        assert sysslot is not None and bootslot is not None
+        off = (2064 + bootslot * 256) * 512; d[off:off + 512] = b"timeout=off\ndefault=2\n".ljust(512, b'\0')
+        open("/tmp/off_disk.img", "wb").write(d)
+        c, m = check("/tmp/off_disk.img", 0, [(400000, *ENTER)], "cmd"); assert screen_text(m, 15).strip() == ""
+        print("boot.cfg: ok (timeout, default, off, key override)")
     if len(sys.argv) > 3:
         open(sys.argv[3], "wb").write(m)

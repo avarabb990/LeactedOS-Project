@@ -17,7 +17,6 @@ k_bssend dd 0                 ; +20 end of the kernel's BSS
 k_end    dd 0                 ; +24 1 MB + secs*sector size: BSS is cleared from here
 k_flags  dd 0                 ; +28 bit 0: booted from the CD (2048-byte sectors, k_lba/k_secs count those)
 
-TIMEOUT equ 5                 ; seconds before the highlighted entry starts by itself
 MBI     equ 0x600
 BUFSEG  equ 0x1000            ; 64 sectors are read to 0x10000 at a time
 
@@ -40,6 +39,7 @@ start:
     mov si, m_nokern
     jmp fatal
 .have:
+    call readcfg
     call menu
     call a20
     call getmem
@@ -109,6 +109,19 @@ drawsel:                      ; the two entries, the selected one is shown inver
     cmp bp, 2
     jb .e
     ret
+showcount:                    ; CL = seconds left, shown as two characters
+    mov al, cl
+    xor ah, ah
+    mov dl, 10
+    div dl
+    add ah, '0'
+    mov [cnt_e], ah
+    mov bl, ' '
+    test al, al
+    jz .t
+    add al, '0'
+    mov bl, al
+.t: mov [cnt_d], bl
 drawcount:
     mov dh, 15
     mov dl, 2
@@ -166,13 +179,23 @@ menu:
     mov dl, 2
     mov si, m_help2
     call str_at
-    mov byte [sel], 0
+    mov dh, 14
+    mov dl, 2
+    mov si, m_help3
+    mov bl, 0x07
+    call str_at
+    mov al, [sel0]
+    mov [sel], al
     call drawsel
+    mov byte [timeout], 0
+    cmp byte [tmo], 255       ; BOOT.CFG: timeout=off
+    je .wait
     mov byte [timeout], 1
     call gettick
     mov [t0], ax
-    mov byte [cnt_d], '0' + TIMEOUT
-    call drawcount
+    mov cl, [tmo]
+    mov [cnt_last], cl
+    call showcount
 .wait:
     cmp byte [timeout], 0
     je .poll
@@ -181,15 +204,14 @@ menu:
     xor dx, dx
     mov cx, 18
     div cx
-    cmp ax, TIMEOUT
+    movzx cx, byte [tmo]
+    cmp ax, cx
     jae .go
-    mov cx, TIMEOUT
     sub cx, ax
-    add cl, '0'
-    cmp cl, [cnt_d]
+    cmp cl, [cnt_last]
     je .poll
-    mov [cnt_d], cl
-    call drawcount
+    mov [cnt_last], cl
+    call showcount
 .poll:
     mov ah, 1
     int 0x16
@@ -214,6 +236,10 @@ menu:
     je .down
     cmp al, 13
     je .go
+    cmp al, 's'
+    je .safe
+    cmp al, 'S'
+    je .safe
     cmp al, '1'
     je .one
     cmp al, '2'
@@ -225,6 +251,9 @@ menu:
 .down:
     mov byte [sel], 1
     jmp .redraw
+.safe:
+    mov byte [safe], 1
+    jmp .go
 .one:
     mov byte [sel], 0
     jmp .go
@@ -502,6 +531,164 @@ mkmbi:
     stosb
     test al, al
     jnz .d
+    cmp byte [safe], 0
+    je .r
+    dec di
+    mov si, m_safe
+.e: lodsb
+    stosb
+    test al, al
+    jnz .e
+.r: ret
+
+; ---------------------------------------------------------------- BOOT.CFG (SYSTEM\BOOT.CFG on the LeactedFS of this disk)
+; Directory: LBA 3..7 = "LDIR" + 12 bytes, then 64 entries of 32 bytes (name[24], size, flags; flags bits 8..15 = parent slot+1).
+; Slot n of file data starts at LBA 2064 + n*256. Any problem simply leaves the defaults.
+rd:
+    mov si, dap
+    mov dl, [drive]
+    mov ah, 0x42
+    int 0x13
+    ret
+cmpname:                      ; entry name at ES:SI against the string at DS:DI -> ZF=1 when equal
+    push si
+    push di
+.l: mov al, [di]
+    cmp al, [es:si]
+    jne .x
+    test al, al
+    jz .x
+    inc si
+    inc di
+    jmp .l
+.x: pop di
+    pop si
+    ret
+findent:                      ; find name DS:DI whose parent is BL (0 = top) -> CX = slot, ZF=1 when found (entries at ES:16)
+    mov si, 16
+    xor cx, cx
+.f: mov edx, [es:si + 28]
+    test edx, edx
+    jz .n
+    shr edx, 8
+    cmp dl, bl
+    jne .n
+    call cmpname
+    je .ok
+.n: add si, 32
+    inc cx
+    cmp cx, 64
+    jb .f
+    or cx, cx                 ; (cx <> 0 here)
+    ret
+.ok: xor dx, dx               ; ZF = 1
+    ret
+pref:                         ; text at ES:BX starts with the string at DS:DI ? ZF=1 and BX moves past it
+    push bx
+    push di
+.l: mov al, [di]
+    test al, al
+    jz .ok
+    cmp al, [es:bx]
+    jne .no
+    inc di
+    inc bx
+    jmp .l
+.ok: pop di
+    pop ax
+    xor ax, ax
+    ret
+.no: pop di
+    pop bx
+    ret
+getnum:                       ; decimal number at ES:BX -> AX
+    xor ax, ax
+.l: movzx cx, byte [es:bx]
+    sub cl, '0'
+    cmp cl, 9
+    ja .d
+    imul ax, ax, 10
+    add ax, cx
+    inc bx
+    jmp .l
+.d: ret
+readcfg:
+    test byte [k_flags], 1    ; no LeactedFS on the CD
+    jnz .no
+    mov word [dap_cnt], 5
+    mov dword [dap_lba], 3
+    call rd
+    jc .no
+    mov ax, BUFSEG
+    mov es, ax
+    cmp dword [es:0], 'LDIR'
+    jne .no
+    xor bx, bx
+    mov di, m_system
+    call findent
+    jne .no
+    mov bx, cx
+    inc bx                    ; parent id of the files inside SYSTEM
+    mov di, m_bootcfg
+    call findent
+    jne .no
+    mov eax, [es:si + 24]     ; size
+    cmp eax, 511
+    jbe .sz
+    mov eax, 511
+.sz: mov [cfglen], ax
+    movzx eax, cx
+    shl eax, 8
+    add eax, 2064
+    mov [dap_lba], eax
+    mov word [dap_cnt], 1
+    mov word [dap_seg], BUFSEG + 0x100
+    call rd
+    mov word [dap_seg], BUFSEG
+    jc .no
+    mov ax, BUFSEG + 0x100
+    mov es, ax
+    mov bx, [cfglen]
+    mov byte [es:bx], 0
+    xor bx, bx
+.line:
+    mov al, [es:bx]
+    test al, al
+    jz .no
+    cmp al, ' '
+    ja .t1
+    inc bx
+    jmp .line
+.t1: mov di, m_ktime
+    call pref
+    jne .t2
+    cmp byte [es:bx], 'o'
+    jne .num
+    mov byte [tmo], 255
+    jmp .eol
+.num: call getnum
+    cmp ax, 99
+    jbe .tm
+    mov ax, 99
+.tm: mov [tmo], al
+    jmp .eol
+.t2: mov di, m_kdef
+    call pref
+    jne .eol
+    mov al, [es:bx]
+    sub al, '1'
+    cmp al, 1
+    ja .eol
+    mov [sel0], al
+.eol: mov al, [es:bx]
+    test al, al
+    jz .no
+    inc bx
+    cmp al, 10
+    jne .eol
+    jmp .line
+.no: xor ax, ax
+    mov es, ax
     ret
 
 ; ---------------------------------------------------------------- go
@@ -536,7 +723,8 @@ gdtr:   dw gdtr - gdt - 1
         dd gdt
 dap:    db 0x10, 0
 dap_cnt dw 0
-        dw 0, BUFSEG
+        dw 0
+dap_seg dw BUFSEG
 dap_lba dd 0, 0
 drive   db 0
 tries   db 0
@@ -548,6 +736,11 @@ remain  dd 0
 chunk   dd 0
 dest    dd 0
 sel      db 0
+sel0     db 0
+safe     db 0
+tmo      db 5
+cnt_last db 0
+cfglen   dw 0
 timeout  db 0
 t0       dw 0
 m_title  db "Leact-Loader 1.2", 0
@@ -556,8 +749,15 @@ m_entry0 db "LeactedOS desktop (Normal)", 0
 m_entry1 db "LeactedCmd (command line)", 0
 m_help1  db "Use the ", 0x18, " and ", 0x19, " keys to select which entry is highlighted.", 0
 m_help2  db "Press enter to boot the selected OS.", 0
+m_help3  db "Press S to start in safe mode (skips SYSTEM\STARTUP.CMD).", 0
+m_safe   db " safe", 0
+m_system db "SYSTEM", 0
+m_bootcfg db "BOOT.CFG", 0
+m_ktime  db "timeout=", 0
+m_kdef   db "default=", 0
 m_count  db "The highlighted entry will be started automatically in "
-cnt_d    db "5"
+cnt_d    db " "
+cnt_e    db "5"
          db " seconds. ", 0
 m_start0 db "Starting LeactedOS desktop...", 13, 10, "Loading ", 0
 m_start1 db "Starting LeactedCmd...", 13, 10, "Loading ", 0

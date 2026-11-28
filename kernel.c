@@ -942,6 +942,16 @@ static u32 fat_read_file(const struct fatvol *v, u32 cluster, u32 size, u8 *buf,
 #define FS1_SLOT 4096u
 #define FS1_DATA_LBA 8
 struct fent { char name[FS_NAME]; u32 size; u32 used; };
+/* `used` holds flags: 1 in use, 2 system file, 4 folder, 0x10 = KERNEL.SYS (boot area), 0x20 = LOADER.SYS (stage 2),
+ * bits 8..15 = parent folder (slot + 1, 0 = top level). Older kernels only test it for zero, so the layout is unchanged. */
+#define FSU_USED 1
+#define FSU_SYS 2
+#define FSU_DIR 4
+#define FSU_KERNEL 0x10
+#define FSU_LOADER 0x20
+#define FSU_PHYS (FSU_KERNEL | FSU_LOADER)
+#define SYS_LBA FS2_BOOT_LBA
+#define S2_LBA 8
 static struct fent fsdir[FS_MAX];
 static u8 fsdata[FS_MAX][FS_SLOT];
 static int fs_on_disk;                           /* LeactedFS volume present */
@@ -955,14 +965,19 @@ static void fs_norm(char *d, const char *s) {
     for (; s[i] && i < FS_NAME - 1; i++) d[i] = kupper(s[i]);
     d[i] = 0;
 }
-static int fs_find(const char *name) {
+static int fs_par(int i) { return (int)((fsdir[i].used >> 8) & 0xFF); }
+static int fs_isdir(int i) { return (fsdir[i].used & FSU_DIR) != 0; }
+static int fs_issys(int i) { return (fsdir[i].used & FSU_SYS) != 0; }
+static int fs_find_in(int parent, const char *name) {
     char n[FS_NAME]; fs_norm(n, name);
-    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && !kstrcmp(fsdir[i].name, n)) return i;
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && fs_par(i) == parent && !kstrcmp(fsdir[i].name, n)) return i;
     return -1;
 }
+static int fs_find(const char *name) { return fs_find_in(0, name); }       /* top level */
+static int fs_has_children(int i) { for (int k = 0; k < FS_MAX; k++) if (fsdir[k].used && fs_par(k) == i + 1) return 1; return 0; }
 static int fs_count(void) { int c = 0; for (int i = 0; i < FS_MAX; i++) c += fsdir[i].used ? 1 : 0; return c; }
 
-static u32 fs_data_lba(int i) { return fs_ver == 1 ? (u32)(FS1_DATA_LBA + i * 8) : (u32)(FS2_DATA_LBA + i * FS2_SLOT_SECS); }
+static u32 fs_data_lba(int i) { if (fsdir[i].used & FSU_KERNEL) return SYS_LBA; if (fsdir[i].used & FSU_LOADER) return S2_LBA; return fs_ver == 1 ? (u32)(FS1_DATA_LBA + i * 8) : (u32)(FS2_DATA_LBA + i * FS2_SLOT_SECS); }
 /* read/write many sectors on the LeactedFS drive (ata_* handle at most 255 per call) */
 static int fs_io(int wr, u32 lba, u32 secs, void *buf) {
     u8 *p = buf;
@@ -992,17 +1007,26 @@ static int fs_flush_file(int i) {
     return fs_flush_dir();
 }
 /* returns slot or -1 (full) */
-static int fs_create(const char *name) {
-    int i = fs_find(name);
-    if (i >= 0) return i;
+static int fs_create_in(int parent, const char *name) {
+    int i = fs_find_in(parent, name);
+    if (i >= 0) return fs_isdir(i) ? -1 : i;
     for (i = 0; i < fs_max_files; i++) if (!fsdir[i].used) {
         memset(&fsdir[i], 0, sizeof fsdir[i]);
         fs_norm(fsdir[i].name, name);
-        fsdir[i].used = 1;
+        fsdir[i].used = FSU_USED | ((u32)parent << 8);
         memset(fsdata[i], 0, FS_SLOT);
         return i;
     }
     return -1;
+}
+static int fs_create(const char *name) { return fs_create_in(0, name); }
+/* a new folder: slot, -1 full, -2 exists */
+static int fs_mkdir(int parent, const char *name) {
+    if (fs_find_in(parent, name) >= 0) return -2;
+    int i = fs_create_in(parent, name);
+    if (i < 0) return -1;
+    fsdir[i].used |= FSU_DIR; fsdir[i].size = 0;
+    return i;
 }
 /* 0 = ok in RAM+disk, 1 = ok RAM only (no disk), -1 = error */
 static int fs_store(int i, const void *data, u32 len) {
@@ -1013,17 +1037,29 @@ static int fs_store(int i, const void *data, u32 len) {
     if (!fs_on_disk) return 1;
     return fs_flush_file(i) ? 0 : -1;
 }
+static u8 fs_zero[4096];
 static int fs_delete(int i) {
+    if ((fsdir[i].used & FSU_PHYS) && fs_on_disk)            /* deleting the kernel or the loader really removes it from the disk */
+        if (!fs_io(1, (fsdir[i].used & FSU_KERNEL) ? SYS_LBA : S2_LBA, 8, fs_zero)) return -1;
     memset(&fsdir[i], 0, sizeof fsdir[i]);
     if (!fs_on_disk) return 1;
     return fs_flush_dir() ? 0 : -1;
 }
-/* 0 = ok, 1 = ok RAM only, -1 = error */
-static int fs_rename(int i, const char *name) {
+static int fs_delete_tree(int i) {                          /* a folder with everything inside it */
+    int worst = 0;
+    for (int k = 0; k < FS_MAX; k++) if (fsdir[k].used && fs_par(k) == i + 1) { int r = fs_delete_tree(k); if (r < 0) worst = r; }
+    int r = fs_delete(i);
+    return r < 0 ? r : worst;
+}
+/* move/rename into another folder; 0 ok, 1 RAM only, -1 error, -2 would put a folder inside itself */
+static int fs_move(int i, int parent, const char *name) {
+    for (int p = parent; p; p = fs_par(p - 1)) if (p - 1 == i) return -2;
     fs_norm(fsdir[i].name, name);
+    fsdir[i].used = (fsdir[i].used & 0xFF) | ((u32)parent << 8);
     if (!fs_on_disk) return 1;
     return fs_flush_dir() ? 0 : -1;
 }
+/* 0 = ok, 1 = ok RAM only, -1 = error */
 static void fs_defaults(void) {
     static const char readme[] =
         "Welcome to LeactedOS XP Edition!\n"
@@ -1071,6 +1107,8 @@ static void fs_load(void) {
                 if (i >= fs_max_files) { memset(&fsdir[i], 0, sizeof fsdir[i]); continue; }
                 if (fsdir[i].size > fs_slot_limit) fsdir[i].size = fs_slot_limit;
                 fsdir[i].name[FS_NAME - 1] = 0;
+                { int p = fs_par(i); if (p && (p > FS_MAX || !fsdir[p - 1].used || !fs_isdir(p - 1) || p - 1 == i)) fsdir[i].used &= 0xFF; }   /* orphan -> top level */
+                if (fs_isdir(i)) { fsdir[i].size = 0; continue; }
                 u32 secs = (fsdir[i].size + 511) / 512;
                 if (secs) fs_io(0, fs_data_lba(i), secs, fsdata[i]);
             }
@@ -1094,8 +1132,6 @@ static int fs_write_super(int d, u32 sectors) {
 /* The running system copies its own image at start-up (before any variable changes), so the Installer can write a
  * bootable disk: boot sector + stage 2 + this kernel. Layout of an installed disk (see boot/stage2.asm):
  *   LBA 0 boot sector + partition table, 1 LeactedFS super block, 3..7 directory, 8..15 stage 2, 16.. kernel image. */
-#define SYS_LBA FS2_BOOT_LBA
-#define S2_LBA 8
 static u8 sys_img[FS2_BOOT_SECS * 512];
 static u32 sys_n, sys_entry, sys_bssend; static int sys_ok, boot_from_disk, boot_from_cd;
 #ifndef HOST
@@ -1125,6 +1161,63 @@ static void sys_stage2(u8 *out) {                                  /* stage 2 wi
     memcpy(out, boot_stage2, 4096);
     u32 secs = (sys_n + 511) / 512, v[5] = { SYS_LBA, secs, sys_entry, sys_bssend, 0x100000u + secs * 512u };
     memcpy(out + 8, v, sizeof v);
+}
+/* ---- system files: SYSTEM\ holds KERNEL.SYS and LOADER.SYS (the real boot code on the disk), BOOT.CFG (read by
+ * Leact-Loader), STARTUP.CMD (run at every start), SETTINGS.CFG and USER.CFG. They are normal files that you can edit or delete. */
+static char sys_user[FS_NAME], sys_comp[FS_NAME];
+static int safe_mode;
+static int fs_find_dir(int parent, const char *name) { int i = fs_find_in(parent, name); return i >= 0 && fs_isdir(i) ? i : -1; }
+static int sys_dir(void) { int i = fs_find_dir(0, "SYSTEM"); return i >= 0 ? i + 1 : 0; }
+static int sys_put(int par, const char *name, u32 flags, const void *d, u32 n) {
+    int i = fs_create_in(par, name);
+    if (i < 0) return -1;
+    fsdir[i].used |= flags; fsdir[i].size = n;
+    if (n) memcpy(fsdata[i], d, n);
+    return i;
+}
+static const char boot_cfg_txt[] = "# Leact-Loader settings. Edit and save, it is read at every boot.\n# timeout=SECONDS (0-99) or timeout=off, default=1 (desktop) or 2 (LeactedCmd)\ntimeout=5\ndefault=1\n";
+static const char startup_txt[] = "# SYSTEM\\STARTUP.CMD runs every time LeactedOS starts (not in safe mode).\n# One terminal command per line. Try:  echo Hello from STARTUP.CMD\n";
+/* phys: also KERNEL.SYS / LOADER.SYS / BOOT.CFG. from_mem: the boot area is not written yet, take the data from this running image. */
+static void sys_make(int phys, int from_mem) {
+    int sd = fs_find_dir(0, "SYSTEM");
+    if (sd < 0) sd = fs_mkdir(0, "SYSTEM");
+    if (sd < 0) return;
+    fsdir[sd].used |= FSU_SYS;
+    int par = sd + 1;
+    int st = fs_find("SETTINGS.CFG");
+    if (st >= 0 && !fs_isdir(st) && fs_find_in(par, "SETTINGS.CFG") < 0) fsdir[st].used = (fsdir[st].used & 0xFF) | ((u32)par << 8) | FSU_SYS;
+    if (fs_find_in(par, "STARTUP.CMD") < 0) sys_put(par, "STARTUP.CMD", FSU_SYS, startup_txt, sizeof startup_txt - 1);
+    if (!phys) return;
+    if (fs_find_in(par, "BOOT.CFG") < 0) sys_put(par, "BOOT.CFG", FSU_SYS, boot_cfg_txt, sizeof boot_cfg_txt - 1);
+    if (fs_find_in(par, "LOADER.SYS") < 0) {
+        int i = sys_put(par, "LOADER.SYS", FSU_SYS | FSU_LOADER, 0, 0);
+        if (i >= 0) {
+            fsdir[i].size = 4096;
+            if (from_mem) sys_stage2(fsdata[i]); else fs_io(0, S2_LBA, 8, fsdata[i]);
+        }
+    }
+    if (fs_find_in(par, "KERNEL.SYS") < 0) {
+        u32 n = from_mem ? sys_n : 0;
+        if (!from_mem) { u8 s2[512]; if (ata_read(fs_drive, S2_LBA, 1, s2)) memcpy(&n, s2 + 12, 4), n *= 512; }
+        if (n > fs_slot_limit) n = fs_slot_limit;
+        int i = sys_put(par, "KERNEL.SYS", FSU_SYS | FSU_KERNEL, 0, 0);
+        if (i >= 0) {
+            fsdir[i].size = n;
+            if (from_mem) memcpy(fsdata[i], sys_img, n); else if (n) fs_io(0, SYS_LBA, (n + 511) / 512, fsdata[i]);
+        }
+    }
+}
+static void fs_set_sysflag(int d) { u8 sb[512]; if (ata_read(d, 1, 1, sb)) { sb[0x30] = 1; ata_write(d, 1, 1, sb); } }
+/* first start with this kernel: a disk made by an older kernel gets its system files once; after that deleting them sticks */
+static void sys_boot_files(void) {
+    if (!fs_on_disk) { sys_make(0, 0); return; }
+    if (fs_ver != 2) return;
+    u8 sb[512];
+    if (!ata_read(fs_drive, 1, 1, sb) || sb[0x30]) return;
+    u8 s2[512]; int phys = 0; u32 ks = 0;
+    if (ata_read(fs_drive, S2_LBA, 1, s2)) { memcpy(&ks, s2 + 12, 4); phys = !memcmp(s2 + 4, "LST2", 4) && ks; }
+    sys_make(phys, 0);
+    if (fs_flush_dir()) fs_set_sysflag(fs_drive);
 }
 /* Move a mounted v1 volume to the v2 layout. Files are written first, the
  * superblock last, so a power cut leaves the old volume intact.
@@ -1303,17 +1396,17 @@ static int x_file_read(const char *name, void *buf, u32 max) {
 static int x_file_write(const char *name, const void *buf, u32 len) {
     if (!name || !*name || (len && !buf) || len > fs_slot_limit) return -1;
     int i = fs_create(name);
-    if (i < 0) return -1;
+    if (i < 0 || (fsdir[i].used & FSU_SYS)) return -1;
     return fs_store(i, buf, len) < 0 ? -1 : 0;
 }
 static int x_file_delete(const char *name) {
     int i = name ? fs_find(name) : -1;
-    if (i < 0) return -1;
+    if (i < 0 || fs_isdir(i) || (fsdir[i].used & FSU_SYS)) return -1;
     return fs_delete(i) < 0 ? -1 : 0;
 }
 static int x_file_name(int idx, char *out, u32 max) {
     int k = 0;
-    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used && !fs_par(i) && !fs_isdir(i) && !(fsdir[i].used & FSU_SYS)) {
         if (k++ != idx) continue;
         if (out && max) kstrcpy(out, fsdir[i].name, (int)max);
         return (int)fsdir[i].size;
@@ -1442,9 +1535,10 @@ static void tp_sort(struct dent *e, int n) {
 static int tp_list(const struct tpath *p, struct dent *out, int max) {
     int n = 0;
     if (p->drive < 0) {
-        for (int i = 0; i < FS_MAX && n < max; i++) if (fsdir[i].used) {
+        int par = (int)p->stack[p->depth];                    /* LeactedFS: stack holds folder ids (slot + 1) */
+        for (int i = 0; i < FS_MAX && n < max; i++) if (fsdir[i].used && fs_par(i) == par) {
             kstrcpy(out[n].name, fsdir[i].name, sizeof out[n].name);
-            out[n].size = fsdir[i].size; out[n].cluster = (u32)i; out[n].isdir = 0; n++;
+            out[n].size = fsdir[i].size; out[n].isdir = fs_isdir(i) ? 1 : 0; out[n].cluster = (u32)(out[n].isdir ? i + 1 : i); n++;
         }
         return n;
     }
@@ -1542,19 +1636,27 @@ static const char *prompt(void) {
 #define NOTE_MAX 16000
 static char nbuf[NOTE_MAX + 1]; static int nlen;
 static char nname[FS_NAME] = "UNTITLED.TXT";
+static int note_parent;                 /* LeactedFS folder (slot + 1, 0 = top) of the file in Notepad */
 static char nmsg[40];
 static int ndirty;
-static void note_open_file(const char *name) {
+static const char *fs_walk(const char *path, int *parent, char *last);
+static void note_open_in(int par, const char *name) {
     open_app(A_NOTE);
     char n[FS_NAME]; fs_norm(n, name);
-    kstrcpy(nname, n, FS_NAME);
+    kstrcpy(nname, n, FS_NAME); note_parent = par;
     nlen = 0; nbuf[0] = 0; ndirty = 0; nmsg[0] = 0;
-    int i = fs_find(n);
-    if (i >= 0) { nlen = fsdir[i].size < NOTE_MAX ? fsdir[i].size : NOTE_MAX; memcpy(nbuf, fsdata[i], nlen); nbuf[nlen] = 0; }
+    int i = fs_find_in(par, n);
+    if (i >= 0 && !fs_isdir(i)) { nlen = fsdir[i].size < NOTE_MAX ? fsdir[i].size : NOTE_MAX; memcpy(nbuf, fsdata[i], nlen); nbuf[nlen] = 0; }
 }
+static void note_open_file(const char *name) {         /* from the terminal: relative to the current folder */
+    char n[FS_NAME]; int par; const char *err = fs_walk(name, &par, n);
+    if (err || !n[0]) { open_app(A_NOTE); kstrcpy(nmsg, err ? "Folder not found." : "No file name.", sizeof nmsg); return; }
+    note_open_in(par, n);
+}
+static void note_open_slot(int slot) { note_open_in(fs_par(slot), fsdir[slot].name); }
 
 static void note_open_data(const char *name, const u8 *data, u32 len, int ro, int cut) {
-    open_app(A_NOTE);
+    open_app(A_NOTE); note_parent = 0;
     kstrcpy(nname, name, FS_NAME);
     nlen = 0;
     for (u32 i = 0; i < len && nlen < NOTE_MAX; i++) {
@@ -1611,7 +1713,8 @@ static void cmd_ls(const char *arg) {
     for (int i = 0; i < n; i++) {
         char z[16];
         if (tp_ents[i].isdir) { dirs++; kstrcpy(z, "<DIR>", sizeof z); } else fmt_size(z, sizeof z, tp_ents[i].size);
-        tprintf(" %-34s %s\n", tp_ents[i].name, z);
+        int sl = dir.drive < 0 ? (int)(tp_ents[i].cluster) - (tp_ents[i].isdir ? 1 : 0) : -1;
+        tprintf(" %-34s %s%s\n", tp_ents[i].name, z, sl >= 0 && fs_issys(sl) ? "  [system]" : "");
     }
     tprintf("%d file(s), %d folder(s)", n - dirs, dirs);
     if (dir.drive < 0) tprintf(", %s", fs_on_disk ? "stored on disk" : "RAM only");
@@ -1775,60 +1878,111 @@ static void cmd_hexdump(const char *arg, const char *off) {
     }
     if (pos < len) tprintf("(more: hexdump %s %u)\n", arg, pos);
 }
-/* where a copy/move target lands: always the root of LeactedFS. 0 = ok */
-static const char *dest_name(const char *dst, const char *srcname, char *out) {
-    const char *d = dst;
+/* LeactedFS folder of a path, for creating things: *parent = folder id (0 = top), last = final name ("" if the path ends in a folder) */
+static const char *fs_walk(const char *path, int *parent, char *last) {
+    const char *d = path; int par = tcwd.drive < 0 ? (int)tcwd.stack[tcwd.depth] : 0;
     if (d[0] && d[1] == ':') {
         char L = kupper(d[0]);
         int ok = fs_on_disk ? (L == 'C' + fs_drive) : L == 'R';
         if (!ok) return "Files can only be copied into LeactedFS (FAT drives are read-only).";
-        d += 2;
+        d += 2; par = 0;
     }
-    while (*d == '/' || *d == '\\') d++;
-    for (const char *q = d; *q; q++) if ((*q == '/' || *q == '\\') && q[1]) return "LeactedFS has no folders: give a plain file name.";
+    if (*d == '/' || *d == '\\') par = 0;
+    char comp[FS_NAME + 8];
+    for (;;) {
+        while (*d == '/' || *d == '\\') d++;
+        int n = 0;
+        while (*d && *d != '/' && *d != '\\') { if (n < FS_NAME + 6) comp[n++] = *d; d++; }
+        comp[n] = 0;
+        int more = 0; for (const char *q = d; *q; q++) if (*q != '/' && *q != '\\') more = 1;
+        if (!more) {
+            if (!kstrcmp(comp, ".")) comp[0] = 0;
+            else if (!kstrcmp(comp, "..")) { par = par ? fs_par(par - 1) : 0; comp[0] = 0; }
+            if (slen(comp) >= FS_NAME) return "That name is too long (23 characters at most).";
+            kstrcpy(last, comp, FS_NAME); *parent = par; return 0;
+        }
+        if (!kstrcmp(comp, ".")) continue;
+        if (!kstrcmp(comp, "..")) { par = par ? fs_par(par - 1) : 0; continue; }
+        int k = fs_find_in(par, comp);
+        if (k < 0 || !fs_isdir(k)) return "Folder not found.";
+        par = k + 1;
+    }
+}
+/* where a copy/move/new file lands: folder id and a normalised name. 0 = ok */
+static const char *dest_resolve(const char *dst, const char *srcname, int *parent, char *out) {
+    char last[FS_NAME]; int par;
+    const char *err = fs_walk(dst, &par, last);
+    if (err) return err;
+    const char *use = last;
+    if (!last[0]) use = srcname;
+    else { int k = fs_find_in(par, last); if (k >= 0 && fs_isdir(k)) { par = k + 1; use = srcname; } }
+    if (!use[0]) return "Missing file name.";
     char nm[FS_NAME]; int n = 0;
-    const char *use = *d ? d : srcname;
-    for (; use[n] && use[n] != '/' && use[n] != '\\' && n < FS_NAME - 1; n++) nm[n] = use[n];
+    for (; use[n] && n < FS_NAME - 1; n++) nm[n] = use[n];
     nm[n] = 0;
-    if (!n) return "Missing file name.";
     fs_norm(out, nm);
+    *parent = par;
     return 0;
 }
 static void cmd_cp(const char *src, const char *dst) {
     struct fref f;
     if (!tp_find_file(src, &f, 0)) return;
-    char nm[FS_NAME]; const char *err = dest_name(dst, f.name, nm);
+    char nm[FS_NAME]; int par; const char *err = dest_resolve(dst, f.name, &par, nm);
     if (err) { tprintf("%s\n", err); return; }
-    int ex = fs_find(nm);
+    int ex = fs_find_in(par, nm);
     if (f.kind == 1 && ex == (int)f.cluster) { tputs("Source and target are the same file.\n"); return; }
+    if (ex >= 0 && fs_isdir(ex)) { tprintf("%s is a folder.\n", nm); return; }
     if (ex >= 0 && !is_root) { tprintf("%s exists. Use 'super' to overwrite.\n", nm); return; }
+    if (ex >= 0 && fs_issys(ex) && !(fsdir[ex].used & FSU_PHYS) == 0) { tputs("That system file cannot be overwritten by copying.\n"); return; }
     u32 want = f.size < fs_slot_limit ? f.size : fs_slot_limit;
     u32 n = want ? fref_load(&f, tbuf, fs_slot_limit) : 0;
     if (n != want) { tputs("Disk read error.\n"); return; }
-    int i = fs_create(nm);
+    int i = fs_create_in(par, nm);
     if (i < 0) { tprintf("LeactedFS is full (%d files).\n", fs_max_files); return; }
     int r = fs_store(i, tbuf, n);
     if (f.size > fs_slot_limit) tprintf("Copied the first %u KB of %u bytes.\n", fs_slot_limit / 1024, f.size);
     print_store_result(r);
 }
+/* a LeactedFS file or folder named by a terminal path: slot, or -1 (message printed) */
+static int tp_leacted_item(const char *arg) {
+    struct tpath sd; struct dent fe;
+    int r = tp_resolve(arg, &sd, &fe);
+    if (r < 0) { tp_err(r, arg); return -1; }
+    if (sd.drive >= 0) { tputs("That is not on LeactedFS (FAT drives are read-only).\n"); return -1; }
+    if (r == 1) return (int)fe.cluster;
+    if (!sd.depth) { tputs("That is the top of the drive.\n"); return -1; }
+    return (int)sd.stack[sd.depth] - 1;
+}
 static void cmd_mv(const char *from, const char *to) {
-    int i = fs_find(from[0] && from[1] == ':' ? from + 2 : from);
-    if (i < 0) { tprintf("Not found in LeactedFS: %s\n", from); return; }
-    char nm[FS_NAME]; const char *err = dest_name(to, fsdir[i].name, nm);
+    int i = tp_leacted_item(from);
+    if (i < 0) return;
+    char nm[FS_NAME]; int par; const char *err = dest_resolve(to, fsdir[i].name, &par, nm);
     if (err) { tprintf("%s\n", err); return; }
-    int ex = fs_find(nm);
+    int ex = fs_find_in(par, nm);
     if (ex == i) { tputs("Same name.\n"); return; }
-    if (ex >= 0) { tprintf("%s already exists.\n", nm); return; }
-    int r = fs_rename(i, nm);
-    tputs(r < 0 ? "Disk write failed!\n" : "Renamed.\n");
+    if (ex >= 0) { tprintf("%s already exists there.\n", nm); return; }
+    int r = fs_move(i, par, nm);
+    if (r == -2) tputs("A folder cannot be moved into itself.\n");
+    else tputs(r < 0 ? "Disk write failed!\n" : "Moved.\n");
 }
 static void cmd_touch(const char *name) {
-    char nm[FS_NAME]; const char *err = dest_name(name, "", nm);
+    char nm[FS_NAME]; int par; const char *err = dest_resolve(name, "", &par, nm);
     if (err) { tprintf("%s\n", err); return; }
-    if (fs_find(nm) >= 0) { tputs("Already exists.\n"); return; }
-    int i = fs_create(nm);
+    if (fs_find_in(par, nm) >= 0) { tputs("Already exists.\n"); return; }
+    int i = fs_create_in(par, nm);
     if (i < 0) { tprintf("LeactedFS is full (%d files).\n", fs_max_files); return; }
     print_store_result(fs_store(i, "", 0));
+}
+static void cmd_mkdir(const char *name) {
+    char nm[FS_NAME]; int par; const char *err = fs_walk(name, &par, nm);
+    if (err) { tprintf("%s\n", err); return; }
+    if (!nm[0]) { tputs("Missing folder name.\n"); return; }
+    fs_norm(nm, nm);
+    int i = fs_mkdir(par, nm);
+    if (i == -2) { tputs("Already exists.\n"); return; }
+    if (i < 0) { tprintf("LeactedFS is full (%d entries).\n", fs_max_files); return; }
+    int r = fs_on_disk ? (fs_flush_dir() ? 0 : -1) : 1;
+    tputs(r < 0 ? "Disk write failed!\n" : "Folder created.\n");
 }
 static void cmd_history(void) {
     for (int i = 0; i < nhist; i++) tprintf("%3d  %s\n", i + 1, hist[i]);
@@ -1845,8 +1999,10 @@ static void cmd_echo_redirect(char *line) {
     char *e = name; while (*e && *e != ' ') e++; *e = 0;
     if (!*name) { tputs("Usage: echo text > file\n"); return; }
     int tl = slen(line); while (tl > 0 && line[tl - 1] == ' ') line[--tl] = 0;
-    int i = fs_create(name);
-    if (i < 0) { tprintf("Disk full (%d files max).\n", fs_max_files); return; }
+    char nmn[FS_NAME]; int par; const char *derr = dest_resolve(name, "", &par, nmn);
+    if (derr) { tprintf("%s\n", derr); return; }
+    int i = fs_create_in(par, nmn);
+    if (i < 0) { tprintf("Disk full (%d files max) or that is a folder.\n", fs_max_files); return; }
     static char buf[FS_SLOT + 2]; u32 len = 0;
     if (append) { len = fsdir[i].size; memcpy(buf, fsdata[i], len); }
     for (int k = 0; line[k] && len < fs_slot_limit - 1; k++) buf[len++] = line[k];
@@ -1854,6 +2010,8 @@ static void cmd_echo_redirect(char *line) {
     print_store_result(fs_store(i, buf, len));
 }
 static void run_cmd(char *line);
+static void setup_start(void);
+static void startup_run(void);
 enum { TJ_NONE, TJ_PING, TJ_LOOKUP, TJ_WGET, TJ_DHCP, TJ_LGET };
 static int tjob;
 static int net_job_ok(void);
@@ -2219,8 +2377,10 @@ static void cmd_help(void) {
     tputs(" cat head tail wc hexdump P   read a file\n");
     tputs(" grep [-i -n -c] TEXT [P]     search\n");
     tputs(" cp SRC NAME   copy into LeactedFS (from any drive)\n");
-    tputs(" mv OLD NEW    rename     touch NAME   new file\n");
-    tputs(" echo T > F    write (>> appends)  rm F (super)\n");
+    tputs(" mv OLD NEW    move/rename  touch NAME   new file\n");
+    tputs(" mkdir NAME    new folder   setup        run Setup\n");
+    tputs(" echo T > F    write (>> appends)\n");
+    tputs(" rm [-r] [-y] F   delete (-r folders, -y system files)\n");
     tputs(" edit F        open in Notepad\n");
     tputs("Modes\n");
     tputs(" desktop   start the desktop (from LeactedCmd)\n");
@@ -2284,12 +2444,22 @@ static void run_cmd(char *line) {
     else if (!kstrcmp(c, "edit") || !kstrcmp(c, "notepad")) {
         if (ac >= 2) note_open_file(av[1]); else open_app(A_NOTE);
     }
+    else if (!kstrcmp(c, "setup")) { if (cmd_mode) tputs("Setup needs the desktop. Type: desktop\n"); else setup_start(); }
+    else if (!kstrcmp(c, "mkdir") || !kstrcmp(c, "md")) { if (ac < 2) tputs("Usage: mkdir NAME\n"); else cmd_mkdir(av[1]); }
     else if (!kstrcmp(c, "rm") || !kstrcmp(c, "del")) {
         if (!is_root) { tputs("Permission denied. Use 'super' first.\n"); return; }
-        if (ac < 2) { tputs("Usage: rm FILE\n"); return; }
-        int i = fs_find(av[1]);
-        if (i < 0) { tputs("File not found.\n"); return; }
-        int r = fs_delete(i);
+        if (ac < 2) { tputs("Usage: rm [-r] [-y] FILE\n"); return; }
+        int rec = 0, yes = 0, ai = 1;
+        while (ai < ac && av[ai][0] == '-' && av[ai][1]) { for (const char *o = av[ai] + 1; *o; o++) { if (*o == 'r') rec = 1; else if (*o == 'y') yes = 1; } ai++; }
+        if (ai >= ac) { tputs("Usage: rm [-r] [-y] FILE\n"); return; }
+        int i = tp_leacted_item(av[ai]);
+        if (i < 0) return;
+        if (fs_isdir(i) && !rec && fs_has_children(i)) { tprintf("%s is a folder with files in it. Use: rm -r %s\n", fsdir[i].name, av[ai]); return; }
+        if (fs_issys(i) && !yes) {
+            tprintf("%s is a SYSTEM file. Deleting it can stop LeactedOS from starting.\nIf you are sure: rm -y%s %s\n", fsdir[i].name, rec ? "r" : "", av[ai]); return;
+        }
+        if (fs_isdir(i) && rec) { int sys = 0; for (int k = 0; k < FS_MAX; k++) if (fsdir[k].used && fs_issys(k) && fs_par(k) == i + 1) sys = 1; if (sys && !yes) { tputs("That folder holds system files. Use rm -ry to delete it anyway.\n"); return; } }
+        int r = fs_isdir(i) ? fs_delete_tree(i) : fs_delete(i);
         tputs(r < 0 ? "Disk write failed!\n" : "Deleted.\n");
     }
     else if (!kstrcmp(c, "calc")) {
@@ -2450,7 +2620,7 @@ static int note_layout(int tx, int ty, int cols, int rows, int skip, int draw, i
     return row + 1;
 }
 static void note_save(void) {
-    int i = fs_create(nname);
+    int i = fs_create_in(note_parent, nname);
     if (i < 0) { kstrcpy(nmsg, "Disk full!", sizeof nmsg); return; }
     int r = fs_store(i, nbuf, nlen);
     kstrcpy(nmsg, r == 0 ? "Saved to disk." : r == 1 ? "Saved (RAM only)." : "Disk error!", sizeof nmsg);
@@ -2767,7 +2937,7 @@ static void ow_launch(void) {
     }
     close_app(A_OPENWITH);
     if (ow_sel == 0) {
-        if (f.kind == 1) note_open_file(f.name);
+        if (f.kind == 1) note_open_slot((int)f.cluster);
         else {
             static u8 tmp[NOTE_MAX + 1];
             u32 n = fref_load(&f, tmp, NOTE_MAX);
@@ -2836,17 +3006,20 @@ static void fm_sort(void) {
         fm_ents[j + 1] = t;
     }
 }
+static u32 fm_arm = 0xFFFF;                 /* system file/folder armed for deletion (press Delete twice) */
+static int fm_slot(const struct dent *e) { return (int)e->cluster - (e->isdir ? 1 : 0); }
 static int fm_is_leacted(void) { return fm_drive == FM_RAM || (fm_drive >= 0 && drv[fm_drive].type == DT_LEACTED && fm_drive == fs_drive); }
 static void fm_refresh(void) {
     fm_n = 0; fm_sel = -1; fm_scroll = 0;
     if (fm_drive < 0) return;
     if (fm_drive == FM_RAM || drv[fm_drive].type == DT_LEACTED) {
         if (fm_drive != FM_RAM && fm_drive != fs_drive) { kstrcpy(fm_msg, "Second LeactedFS drive is not mounted.", sizeof fm_msg); return; }
-        for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) {
+        for (int i = 0; i < FS_MAX && fm_n < MAX_DENT; i++) if (fsdir[i].used && fs_par(i) == (int)fm_stack[fm_depth]) {
             struct dent *d = &fm_ents[fm_n++];
             kstrcpy(d->name, fsdir[i].name, sizeof d->name);
-            d->size = fsdir[i].size; d->cluster = (u32)i; d->isdir = 0;
+            d->isdir = fs_isdir(i); d->size = fsdir[i].size; d->cluster = (u32)(d->isdir ? i + 1 : i);
         }
+        fm_sort();
     } else if (drv[fm_drive].type == DT_FAT) {
         if (!fat_mount(fm_drive, &fm_v)) { kstrcpy(fm_msg, "Cannot read the FAT volume.", sizeof fm_msg); return; }
         fm_n = fat_readdir(&fm_v, fm_stack[fm_depth], fm_ents, MAX_DENT);
@@ -2894,7 +3067,7 @@ static void fm_import(void) {
     static u8 tmp[FS_SLOT];
     struct fref f = { 2, fm_drive, e->cluster, e->size, "" };
     u32 n = fref_load(&f, tmp, fs_slot_limit);
-    int i = fs_create(e->name);
+    int i = fs_create_in(0, e->name);
     if (i < 0) { ksnprintf(fm_msg, sizeof fm_msg, "LeactedFS is full (%d files).", fs_max_files); return; }
     int r = fs_store(i, tmp, n);
     char b[64]; ksnprintf(b, sizeof b, "%s%s %s", r < 0 ? "Disk error: " : "Imported ", fsdir[i].name, e->size > fs_slot_limit ? (fs_slot_limit > 4096 ? "(cut to 128 KB)" : "(cut to 4 KB)") : "");
@@ -2903,19 +3076,38 @@ static void fm_import(void) {
 static void fm_delete(void) {
     if (!fm_is_leacted()) { kstrcpy(fm_msg, "Only LeactedFS files can be deleted.", sizeof fm_msg); return; }
     if (fm_sel < 0 || fm_sel >= fm_n) { kstrcpy(fm_msg, "Select a file first.", sizeof fm_msg); return; }
-    int r = fs_delete((int)fm_ents[fm_sel].cluster);
+    struct dent *e = &fm_ents[fm_sel];
+    int sl = fm_slot(e), risky = fs_issys(sl) || (e->isdir && fs_has_children(sl));
+    if (risky && fm_arm != (u32)sl) {
+        fm_arm = (u32)sl;
+        ksnprintf(fm_msg, sizeof fm_msg, fs_issys(sl) ? "%s is a SYSTEM file! Press Delete again to remove it." : "%s has files in it. Press Delete again.", e->name);
+        return;
+    }
+    fm_arm = 0xFFFF;
+    int r = e->isdir ? fs_delete_tree(sl) : fs_delete(sl);
     kstrcpy(fm_msg, r < 0 ? "Disk error while deleting." : "Deleted.", sizeof fm_msg);
     fm_refresh();
 }
 static void fm_new(void) {
     if (!fm_is_leacted()) { kstrcpy(fm_msg, "New files go on LeactedFS (R: or its drive).", sizeof fm_msg); return; }
     char nm[FS_NAME];
-    for (int n = 1; n < 100; n++) { ksnprintf(nm, sizeof nm, "NEW%d.TXT", n); if (fs_find(nm) < 0) break; }
-    int i = fs_create(nm);
-    if (i < 0) { kstrcpy(fm_msg, "LeactedFS is full (15 files).", sizeof fm_msg); return; }
+    int par = (int)fm_stack[fm_depth];
+    for (int n = 1; n < 100; n++) { ksnprintf(nm, sizeof nm, "NEW%d.TXT", n); if (fs_find_in(par, nm) < 0) break; }
+    int i = fs_create_in(par, nm);
+    if (i < 0) { ksnprintf(fm_msg, sizeof fm_msg, "LeactedFS is full (%d files).", fs_max_files); return; }
     fs_store(i, "", 0);
     fm_refresh();
-    note_open_file(nm);
+    note_open_in(par, nm);
+}
+static void fm_newdir(void) {
+    if (!fm_is_leacted()) { kstrcpy(fm_msg, "Folders can only be made on LeactedFS.", sizeof fm_msg); return; }
+    char nm[FS_NAME];
+    int par = (int)fm_stack[fm_depth];
+    for (int n = 1; n < 100; n++) { ksnprintf(nm, sizeof nm, n == 1 ? "New folder" : "New folder %d", n); if (fs_find_in(par, nm) < 0) break; }
+    int i = fs_mkdir(par, nm);
+    if (i < 0) { ksnprintf(fm_msg, sizeof fm_msg, "LeactedFS is full (%d entries).", fs_max_files); return; }
+    if (fs_on_disk && !fs_flush_dir()) kstrcpy(fm_msg, "Disk error.", sizeof fm_msg); else ksnprintf(fm_msg, sizeof fm_msg, "Created %s (rename with: mv).", nm);
+    fm_refresh();
 }
 static int fm_rows_list(int *out) {
     int n = 0;
@@ -2964,6 +3156,7 @@ static void files_draw(int x, int y, int w, int h) {
         if (e->isdir) { rect(x0 + 4, ry + 1, 8, 6, RGB(240, 200, 70)); rect(x0 + 4, ry, 4, 2, RGB(240, 200, 70)); }
         else { rect(x0 + 5, ry, 6, 8, C_LIGHT); frame(x0 + 5, ry, 6, 8, sel ? C_LIGHT : C_DARK); }
         char nm[36]; kstrcpy(nm, e->name, sizeof nm);
+        if (fm_is_leacted() && fs_issys(fm_slot(e))) { if (!sel) fg = RGB(170, 30, 30); draw_str(x0 + w0 - 150, ry, "system", sel ? C_LIGHT : RGB(170, 30, 30)); }
         draw_str(x0 + 16, ry, nm, fg);
         char sz[16];
         if (e->isdir) kstrcpy(sz, "<DIR>", sizeof sz);
@@ -2985,7 +3178,8 @@ static void files_draw(int x, int y, int w, int h) {
     button(x + 68, y + h - 22, 60, 20, "Import", 0);
     button(x + 134, y + h - 22, 56, 20, "Delete", 0);
     button(x + 196, y + h - 22, 44, 20, "New", 0);
-    button(x + 246, y + h - 22, 66, 20, "Refresh", 0);
+    button(x + 246, y + h - 22, 56, 20, "Folder", 0);
+    button(x + 308, y + h - 22, 62, 20, "Refresh", 0);
 }
 static void files_click(int rx, int ry) {
     int w = CW(A_FILES), h = CH(A_FILES);
@@ -3012,7 +3206,8 @@ static void files_click(int rx, int ry) {
     else if (inrect(rx, ry, 68, h - 22, 60, 20)) fm_import();
     else if (inrect(rx, ry, 134, h - 22, 56, 20)) fm_delete();
     else if (inrect(rx, ry, 196, h - 22, 44, 20)) fm_new();
-    else if (inrect(rx, ry, 246, h - 22, 66, 20)) { fm_msg[0] = 0; fm_refresh(); }
+    else if (inrect(rx, ry, 246, h - 22, 56, 20)) fm_newdir();
+    else if (inrect(rx, ry, 308, h - 22, 62, 20)) { fm_msg[0] = 0; fm_refresh(); }
 }
 static void files_key(int k) {
     if (k == K_UP) { if (fm_sel > 0) fm_sel--; else if (fm_sel < 0 && fm_n) fm_sel = 0; fm_show_sel(); }
@@ -3044,6 +3239,7 @@ static void about_draw(int x, int y, int w, int h) {
     drawf(x + 14, y + 184, C_TEXT, "FS      : %s", fs_on_disk ? (fs_ver == 1 ? "LeactedFS v1 (small)" : "LeactedFS v2") : "none");
     drawf(x + 14, y + 198, C_TEXT, "Uptime  : %02u:%02u:%02u", (s / 3600) % 100, (s / 60) % 60, s % 60);
     drawf(x + 14, y + 212, C_TEXT, "Mode    : %s", is_root ? "super (root)" : "normal");
+    if (sys_user[0]) drawf(x + 14, y + 226, C_TEXT, "User    : %s on %s", sys_user, sys_comp);
     button(x + w - 74, y + h - 30, 62, 22, "OK", 0);
 }
 static void about_click(int rx, int ry) {
@@ -3091,6 +3287,8 @@ static void inst_tick(void) {
         if (!ata_write(d, 0, 1, sec)) { inst_fail("Cannot write the boot sector."); return; }
         if (!fs_write_super(d, drv[d].sectors)) { inst_fail("Cannot write the file system."); return; }
         fs_on_disk = 1; fs_drive = d; fs_ver = 2; fs_max_files = FS_MAX; fs_slot_limit = FS_SLOT;
+        sys_make(sys_ok, 1);                                       /* SYSTEM folder; KERNEL.SYS / LOADER.SYS are the boot area itself */
+        fs_set_sysflag(d);
         inst_step = ST_LOADER; inst_pos = 0; return;
     case ST_LOADER:
         if (sys_ok) {
@@ -3106,7 +3304,7 @@ static void inst_tick(void) {
         inst_pos++; return;
     }
     case ST_FILES:
-        while (inst_pos < FS_MAX && !fsdir[inst_pos].used) inst_pos++;
+        while (inst_pos < FS_MAX && (!fsdir[inst_pos].used || (fsdir[inst_pos].used & (FSU_DIR | FSU_PHYS)))) inst_pos++;
         if (inst_pos < FS_MAX) {
             if (!fs_flush_file(inst_pos)) { inst_fail("Cannot copy your files."); return; }
             inst_pos++; return;
@@ -3227,13 +3425,16 @@ static char set_msg[40];
 static void settings_save(void) {
     char b[64];
     int n = ksnprintf(b, sizeof b, "theme=%d\nicons=%d\nterm=%d\n", th_id, show_icons, term_color_idx);
-    int i = fs_create("SETTINGS.CFG");
+    int sd = sys_dir();
+    int i = fs_create_in(sd, "SETTINGS.CFG");
     if (i < 0) { kstrcpy(set_msg, "Not saved (disk full)", sizeof set_msg); return; }
+    if (sd) fsdir[i].used |= FSU_SYS;
     int r = fs_store(i, b, n);
     kstrcpy(set_msg, r == 0 ? "Saved to disk." : r == 1 ? "Applied (RAM only)." : "Disk error!", sizeof set_msg);
 }
 static void settings_load(void) {
-    int i = fs_find("SETTINGS.CFG");
+    int i = fs_find_in(sys_dir(), "SETTINGS.CFG");
+    if (i < 0) i = fs_find("SETTINGS.CFG");
     if (i < 0) return;
     char b[65]; u32 n = fsdir[i].size > 64 ? 64 : fsdir[i].size;
     memcpy(b, fsdata[i], n); b[n] = 0;
@@ -3520,8 +3721,19 @@ static void dl_name(char *out, int max, const char *url, const char *given) {
     if (!l || !has_path) kstrcpy(seg, "index.html", sizeof seg);
     kstrcpy(out, seg, max);
 }
+/* the Downloads folder: USERS\<user>\Downloads when a user exists, else a top-level Downloads folder (made on demand) */
+static int dl_folder(void) {
+    if (sys_user[0]) {
+        int u = fs_find_dir(0, "USERS"); u = u >= 0 ? fs_find_dir(u + 1, sys_user) : -1;
+        int d = u >= 0 ? fs_find_dir(u + 1, "Downloads") : -1;
+        if (d >= 0) return d + 1;
+    }
+    int d = fs_find_dir(0, "Downloads");
+    if (d < 0) d = fs_mkdir(0, "Downloads");
+    return d >= 0 ? d + 1 : 0;
+}
 static int dl_save(const char *name, char *msg, int mmax) {
-    int i = fs_create(name);
+    int i = fs_create_in(dl_folder(), name);
     if (i < 0) { ksnprintf(msg, mmax, "LeactedFS is full - could not save %s", name); return -1; }
     u32 n = http_len > FS_SLOT ? FS_SLOT : http_len;
     int r = fs_store(i, http_body, n);
@@ -5431,11 +5643,187 @@ static void on_move_held(int x, int y) {
 /* ------------------------------------------------------------------ */
 /* Frame / main                                                        */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Startup commands, user account and the first-boot Setup             */
+/* ------------------------------------------------------------------ */
+static void startup_run(void) {
+    if (safe_mode) { tputs("Safe mode: SYSTEM\\STARTUP.CMD skipped.\n"); return; }
+    int i = fs_find_in(sys_dir(), "STARTUP.CMD");
+    if (i < 0 || fs_isdir(i)) return;
+    static char buf[2050];
+    u32 n = fsdir[i].size > 2048 ? 2048 : fsdir[i].size;
+    memcpy(buf, fsdata[i], n); buf[n] = 0;
+    for (char *p = buf; *p;) {
+        char *e = p; while (*e && *e != '\n') e++;
+        char *nx = *e ? e + 1 : e; *e = 0;
+        if (e > p && e[-1] == '\r') e[-1] = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p && *p != '#') run_cmd(p);
+        p = nx;
+    }
+}
+static int user_load(void) {                 /* SYSTEM\USER.CFG: user=NAME, computer=NAME. 1 = found */
+    int i = fs_find_in(sys_dir(), "USER.CFG");
+    if (i < 0) return 0;
+    char b[161]; u32 n = fsdir[i].size > 160 ? 160 : fsdir[i].size;
+    memcpy(b, fsdata[i], n); b[n] = 0;
+    sys_user[0] = sys_comp[0] = 0;
+    for (char *p = b; *p;) {
+        char *dst = 0;
+        if (!memcmp(p, "user=", 5)) { dst = sys_user; p += 5; }
+        else if (!memcmp(p, "computer=", 9)) { dst = sys_comp; p += 9; }
+        int k = 0;
+        while (*p && *p != '\n') { if (dst && *p != '\r' && k < 16) dst[k++] = *p; p++; }
+        if (dst) dst[k] = 0;
+        if (*p) p++;
+    }
+    return 1;
+}
+static int setup_active, setup_page, setup_field, setup_t0;
+static char su_name[20], su_comp[20], su_msg[64];
+static int setup_theme;
+static void setup_start(void) {
+    setup_active = 1; setup_page = 0; setup_field = 0; setup_t0 = 0; su_msg[0] = 0;
+    kstrcpy(su_name, "User", sizeof su_name); kstrcpy(su_comp, "LEACTED-PC", sizeof su_comp);
+    setup_theme = th_id;
+}
+static int fs_mkpath(int par, const char *name) {                  /* find or make a folder, id = slot + 1 or 0 */
+    int d = fs_find_dir(par, name);
+    if (d < 0) d = fs_mkdir(par, name);
+    return d >= 0 ? d + 1 : 0;
+}
+static void setup_build(void) {                                   /* what the Setup creates on the disk */
+    for (char *p = su_name; *p; p++) if (*p == '\\' || *p == '/' || *p == ':') *p = '_';
+    if (!su_name[0]) kstrcpy(su_name, "User", sizeof su_name);
+    if (!su_comp[0]) kstrcpy(su_comp, "LEACTED-PC", sizeof su_comp);
+    char un[FS_NAME], cn[FS_NAME]; fs_norm(un, su_name); fs_norm(cn, su_comp);
+    kstrcpy(sys_user, un, sizeof sys_user); kstrcpy(sys_comp, cn, sizeof sys_comp);
+    int users = fs_mkpath(0, "USERS"), u = users ? fs_mkpath(users, un) : 0;
+    if (u) {
+        static const char *sub[4] = { "Documents", "Downloads", "Desktop", "Pictures" };
+        for (int k = 0; k < 4; k++) fs_mkpath(u, sub[k]);
+        int docs = fs_find_dir(u, "DOCUMENTS");
+        if (docs >= 0) {
+            char t[200]; int n = ksnprintf(t, sizeof t, "Hello %s!\nThis is your Documents folder.\nYour files go in USERS\\%s.\n", un, un);
+            int i = sys_put(docs + 1, "WELCOME.TXT", 0, t, (u32)n); (void)i;
+        }
+    }
+    sys_make(0, 0);
+    th_id = setup_theme; theme_apply(th_id);
+    char b[64]; int n = ksnprintf(b, sizeof b, "user=%s\ncomputer=%s\n", un, cn);
+    int sd = sys_dir();
+    int i = fs_create_in(sd, "USER.CFG");
+    if (i >= 0) { fsdir[i].used |= sd ? FSU_SYS : 0; fs_store(i, b, (u32)n); }
+    settings_save();
+    if (fs_on_disk) fs_flush_dir();
+    kstrcpy(su_msg, fs_on_disk ? "Your account was saved to the disk." : "No disk: this lasts until you shut down.", sizeof su_msg);
+}
+static void setup_finish(void) {
+    setup_active = 0;
+    open_app(A_TERM);
+    tprintf("Welcome, %s.\n", sys_user);
+    startup_run();
+}
+static void setup_next(void) {
+    if (setup_page == 1 && !su_name[0]) { kstrcpy(su_msg, "Type a user name first.", sizeof su_msg); return; }
+    su_msg[0] = 0;
+    if (setup_page == 2) { setup_build(); setup_t0 = (int)ticks; }
+    if (setup_page == 3) { setup_finish(); return; }
+    setup_page++; setup_field = 0;
+}
+static void setup_key(int k) {
+    char *f = setup_field ? su_comp : su_name; int n = slen(f);
+    if (setup_page == 1) {
+        if (k == '\t') setup_field ^= 1;
+        else if (k == '\b') { if (n) f[n - 1] = 0; }
+        else if (k == '\n') { if (setup_field == 0) setup_field = 1; else setup_next(); }
+        else if (k >= 32 && k < 127 && n < 16) { f[n] = (char)k; f[n + 1] = 0; }
+        su_msg[0] = 0;
+    } else if (setup_page == 2) {
+        if (k == K_LEFT && setup_theme > 0) setup_theme--;
+        else if (k == K_RIGHT && setup_theme < N_THEMES - 1) setup_theme++;
+        else if (k == '\n') setup_next();
+        th_id = setup_theme; theme_apply(th_id);
+    } else if (k == '\n') setup_next();
+}
+#define SU_X 80
+#define SU_Y 60
+#define SU_W 480
+#define SU_H 360
+static void setup_draw(void) {
+    gradient_v(0, 0, W, H, RGB(20, 70, 190), RGB(8, 36, 120));
+    rect(0, 0, W, 40, RGB(8, 36, 120)); rect(0, H - 40, W, 40, RGB(8, 36, 120));
+    draw_str(12, 14, "LeactedOS Setup", RGB(255, 255, 255));
+    int x = SU_X, y = SU_Y;
+    rect(x, y, SU_W, SU_H, C_FACE); frame(x, y, SU_W, SU_H, C_DARK);
+    rect(x, y, SU_W, 22, RGB(30, 90, 210));
+    static const char *titles[4] = { "Welcome", "Who is using this computer?", "Choose a look", "Setting up your computer" };
+    draw_str(x + 8, y + 7, titles[setup_page], RGB(255, 255, 255));
+    drawf(x + SU_W - 60, y + 7, RGB(200, 220, 255), "%d of 4", setup_page + 1);
+    int cx = x + 24, cy = y + 40;
+    if (setup_page == 0) {
+        blit_argb(x + (SU_W - logo96_W) / 2, cy, logo96_W, logo96_H, logo96);
+        draw_str_c(x + SU_W / 2, cy + 108, "Welcome to LeactedOS", C_TEXT);
+        draw_str(cx, cy + 140, "This short Setup makes your user folder (Documents, Downloads,", C_TEXT);
+        draw_str(cx, cy + 154, "Desktop, Pictures), the SYSTEM folder and your settings.", C_TEXT);
+        draw_str(cx, cy + 182, fs_on_disk ? "Everything is saved on your LeactedFS disk." : "No LeactedFS disk found. Settings only last until shutdown.", fs_on_disk ? C_TEXT : RGB(170, 40, 0));
+        draw_str(cx, cy + 210, "Click Next to start.", C_DARK);
+    } else if (setup_page == 1) {
+        draw_str(cx, cy, "User name:", C_TEXT);
+        rect(cx, cy + 14, 220, 20, C_LIGHT); frame(cx, cy + 14, 220, 20, setup_field == 0 ? RGB(0, 70, 190) : C_DARK);
+        draw_str(cx + 4, cy + 20, su_name, C_TEXT);
+        if (setup_field == 0 && (ticks / 50) % 2) rect(cx + 4 + slen(su_name) * 8, cy + 19, 2, 11, C_TEXT);
+        draw_str(cx, cy + 50, "Computer name:", C_TEXT);
+        rect(cx, cy + 64, 220, 20, C_LIGHT); frame(cx, cy + 64, 220, 20, setup_field == 1 ? RGB(0, 70, 190) : C_DARK);
+        draw_str(cx + 4, cy + 70, su_comp, C_TEXT);
+        if (setup_field == 1 && (ticks / 50) % 2) rect(cx + 4 + slen(su_comp) * 8, cy + 69, 2, 11, C_TEXT);
+        draw_str(cx, cy + 100, "Names are stored in capital letters. Tab switches the box.", C_DARK);
+        draw_str(cx, cy + 118, "Your files will go in USERS\\<your name>.", C_DARK);
+    } else if (setup_page == 2) {
+        for (int i = 0; i < N_THEMES; i++) {
+            int tx = cx + i * 144, sel = i == setup_theme;
+            if (sel) rect(tx - 4, cy - 4, 136, 100, RGB(49, 106, 197));
+            theme_preview(tx + 20, cy + 4, i);
+            draw_str_c(tx + 52, cy + 48, themes[i].name, sel ? C_LIGHT : C_TEXT);
+            draw_str_c(tx + 52, cy + 64, themes[i].menu_title, sel ? RGB(220, 230, 250) : C_DARK);
+        }
+        draw_str(cx, cy + 120, "Click a look or use the left/right keys. You can change it later", C_DARK);
+        draw_str(cx, cy + 134, "in Settings.", C_DARK);
+    } else {
+        int el = (int)(ticks - (u32)setup_t0), pct = el * 100 / 120; if (pct > 100) pct = 100;
+        draw_str(cx, cy, pct < 100 ? "Creating your folders and settings..." : "All done.", C_TEXT);
+        rect(cx, cy + 24, 400, 16, C_LIGHT); frame(cx, cy + 24, 400, 16, C_DARK);
+        rect(cx + 2, cy + 26, 396 * pct / 100, 12, RGB(60, 160, 60));
+        if (pct >= 100) {
+            drawf(cx, cy + 60, C_TEXT, "User     : %s", sys_user);
+            drawf(cx, cy + 74, C_TEXT, "Computer : %s", sys_comp);
+            drawf(cx, cy + 88, C_TEXT, "Folder   : USERS\\%s  (Documents, Downloads, Desktop, Pictures)", sys_user);
+            drawf(cx, cy + 102, C_TEXT, "System   : SYSTEM  (open the File Manager to see it)");
+            draw_str(cx, cy + 126, su_msg, C_DARK);
+        }
+    }
+    if (!(setup_page == 3 && (int)(ticks - (u32)setup_t0) < 120)) button(x + SU_W - 90, y + SU_H - 34, 74, 24, setup_page == 3 ? "Finish" : "Next", 0);
+    if (setup_page == 1 || setup_page == 2) button(x + SU_W - 172, y + SU_H - 34, 74, 24, "Back", 0);
+    if (su_msg[0] && setup_page != 3) draw_str(x + 16, y + SU_H - 28, su_msg, RGB(170, 40, 0));
+}
+static void setup_click(int mx_, int my_) {
+    int x = SU_X, y = SU_Y, cx = x + 24, cy = y + 40;
+    int running = setup_page == 3 && (int)(ticks - (u32)setup_t0) < 120;
+    if (!running && inrect(mx_, my_, x + SU_W - 90, y + SU_H - 34, 74, 24)) { setup_next(); return; }
+    if ((setup_page == 1 || setup_page == 2) && inrect(mx_, my_, x + SU_W - 172, y + SU_H - 34, 74, 24)) { setup_page--; setup_field = 0; su_msg[0] = 0; return; }
+    if (setup_page == 1) {
+        if (inrect(mx_, my_, cx, cy + 14, 220, 20)) setup_field = 0;
+        if (inrect(mx_, my_, cx, cy + 64, 220, 20)) setup_field = 1;
+    }
+    if (setup_page == 2) for (int i = 0; i < N_THEMES; i++) if (inrect(mx_, my_, cx + i * 144 - 4, cy - 4, 136, 100)) { setup_theme = i; th_id = i; theme_apply(i); }
+}
+
 static void os_draw(void) {
     frame_count++;
     if (ticks - fps_t >= 100) { fps = (frame_count - fps_f) * 100 / (ticks - fps_t); fps_f = frame_count; fps_t = ticks; }
     clip_reset();
     if (cmd_mode) { term_draw(0, 0, W, H); return; }
+    if (setup_active) { setup_draw(); draw_cursor(); return; }
     xapp_tick();
     draw_desktop();
     for (int i = 0; i < nz; i++) if (!wins[zo[i]].min) draw_window(zo[i]);
@@ -5453,10 +5841,12 @@ static void os_events(void) {
     int k;
     while ((k = kq_pop())) {
         if (cmd_mode) { term_key(k); continue; }
+        if (setup_active) { setup_key(k); continue; }
         int a = top_app();
         if (a >= 0) app_key(a, k);
     }
     if (cmd_mode) { prev_btn = mbtn & 1; return; }
+    if (setup_active) { int l = mbtn & 1; if (l && !prev_btn) setup_click(mx, my); prev_btn = l; return; }
     int left = mbtn & 1;
     if (left && !prev_btn) on_press(mx, my);
     else if (left) on_move_held(mx, my);
@@ -5480,6 +5870,7 @@ static void os_init(u32 magic, const u32 *mbi) {
     if (boot_via_multiboot && mbi && (mbi[0] & 4) && mbi[4]) {              /* kernel command line from the boot menu: "cmd" = LeactedCmd */
         const char *cl = (const char *)(unsigned long)mbi[4];
         for (const char *p = cl; *p; p++) if ((p == cl || p[-1] == ' ') && !kmemcmp(p, "cmd", 3) && (p[3] == 0 || p[3] == ' ')) cmd_mode = 1;
+        for (const char *p = cl; *p; p++) if ((p == cl || p[-1] == ' ') && !kmemcmp(p, "safe", 4) && (p[4] == 0 || p[4] == ' ')) safe_mode = 1;
     }
     if (boot_via_multiboot && mbi && (mbi[0] & 0x200) && mbi[16]) { const char *bn = (const char *)(unsigned long)mbi[16]; boot_from_cd = !kmemcmp(bn, "LeactedOS CD", 13); boot_from_disk = boot_from_cd || !kmemcmp(bn, "LeactedOS", 10); }
     if (boot_via_multiboot && mbi && (mbi[0] & 1)) mem_kb = 1024 + mbi[2];
@@ -5497,14 +5888,18 @@ static void os_init(u32 magic, const u32 *mbi) {
     splash(55, "Disk");
     fs_check();
     fs_load();
+    sys_boot_files();
     settings_load();
+    int have_user = user_load();
     net_init();
     splash(80, "Files and settings");
     theme_apply(th_id);
     splash(100, "Desktop");
     sleep_ticks(cmd_mode ? 20 : 70);
-    if (cmd_mode) { set_cmd_mode(1); return; }
+    if (cmd_mode) { set_cmd_mode(1); startup_run(); return; }
+    if (!have_user && fs_on_disk && !safe_mode) { setup_start(); return; }     /* first start: Setup */
     open_app(A_TERM);
+    startup_run();
     if (fs_on_disk && fs_ver == 1) tputs("Your LeactedFS disk is the old small version.\nType fsupgrade for 64 files of 128 KB.\n");
 }
 

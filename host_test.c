@@ -466,7 +466,7 @@ int main(void) {
     cmd("super"); tclear(); cmd("cp D:/notes.md COPYNOTE.MD"); assert(term_has("Saved")); cmd("super"); assert(!is_root);
     tclear(); cmd("cp D:/Many/F03.TXT C:"); assert(!strcmp((char *)fsdata[fs_find("F03.TXT")], "file 3\n"));
     tclear(); cmd("cp D:/notes.md E:/x"); assert(term_has("can only be copied into LeactedFS"));
-    tclear(); cmd("cp D:/notes.md a\\b"); assert(term_has("no folders"));
+    tclear(); cmd("cp D:/notes.md a\\b"); assert(term_has("Folder not found"));
     tclear(); cmd("cp nosuch X"); assert(term_has("Not found: nosuch"));
     tclear(); cmd("cp D:/Documents X"); assert(term_has("That is a folder"));
     tclear(); cmd("cp COPYNOTE.MD COPYNOTE.MD"); assert(term_has("same file"));
@@ -476,10 +476,10 @@ int main(void) {
     tclear(); cmd("cp F:/huge.bin HUGE.BIN"); assert(term_has("Copied the first 128 KB of 900000 bytes") && fsdir[fs_find("HUGE.BIN")].size == 131072 && !memcmp(fsdata[fs_find("HUGE.BIN")], ex, 131072)); free(ex);
     memset(fsdir, 0, sizeof fsdir); memset(fsdata, 0, sizeof fsdata); fs_load();             /* all of it is really on the disk */
     assert(fs_find("COPYNOTE.MD") >= 0 && fsdir[fs_find("HUGE.BIN")].size == 131072);
-    tclear(); cmd("mv COPYNOTE.MD RENAMED.MD"); assert(term_has("Renamed.") && fs_find("RENAMED.MD") >= 0 && fs_find("COPYNOTE.MD") < 0);
+    tclear(); cmd("mv COPYNOTE.MD RENAMED.MD"); assert(term_has("Moved.") && fs_find("RENAMED.MD") >= 0 && fs_find("COPYNOTE.MD") < 0);
     memset(fsdir, 0, sizeof fsdir); memset(fsdata, 0, sizeof fsdata); fs_load(); assert(fs_find("RENAMED.MD") >= 0 && !strncmp((char *)fsdata[fs_find("RENAMED.MD")], "# lowercase", 11));
     tclear(); cmd("mv RENAMED.MD F03.TXT"); assert(term_has("already exists"));
-    tclear(); cmd("mv nosuch X"); assert(term_has("Not found in LeactedFS"));
+    tclear(); cmd("mv nosuch X"); assert(term_has("Not found"));
     tclear(); cmd("rename RENAMED.MD C:AGAIN.MD"); assert(fs_find("AGAIN.MD") >= 0);
     tclear(); cmd("touch EMPTYNEW.TXT"); assert(fs_find("EMPTYNEW.TXT") >= 0 && fsdir[fs_find("EMPTYNEW.TXT")].size == 0);
     { const char *del[] = { "AGAIN.MD", "F03.TXT", "BIGCOPY.BIN", "HUGE.BIN", "EMPTYNEW.TXT" }; for (int q = 0; q < 5; q++) fs_delete(fs_find(del[q])); }
@@ -721,7 +721,7 @@ int main(void) {
     tclear(); cmd("wget http://local.test/app.bin payload.bin"); assert(tjob == TJ_WGET);
     tclear(); { char *av[] = { "ping", "x" }; cmd_ping(av, 2); } assert(term_has("busy")); app_key(A_TERM, 3); assert(!tjob);
     tclear(); cmd("wget http://local.test/app.bin payload.bin"); assert(net_idle(3000) >= 0);
-    assert(term_has("Saved PAYLOAD.BIN (3000 bytes)")); { int i = fs_find("payload.bin"); assert(i >= 0 && fsdir[i].size == 3000); for (int k = 0; k < 3000; k++) assert(fsdata[i][k] == pat(k)); }
+    assert(term_has("Saved PAYLOAD.BIN (3000 bytes)")); { int i = fs_find_in(dl_folder(), "payload.bin"); assert(i >= 0 && fsdir[i].size == 3000); for (int k = 0; k < 3000; k++) assert(fsdata[i][k] == pat(k)); }
     tclear(); cmd("wget http://local.test/final"); net_idle(3000); assert(term_has("Saved FINAL (18 bytes)"));
     tclear(); cmd("wget http://local.test/"); net_idle(3000); assert(term_has("Saved INDEX.HTML") || term_has("Saved index.html"));
     tclear(); cmd("wget http://local.test/big"); net_idle(5000); assert(term_has("Saved BIG (100000 bytes)"));
@@ -769,7 +769,7 @@ int main(void) {
     /* plain text, a download, errors, searches, redirects */
     br_focus = 1; br_sel = 1; typestr_to(A_BROWSER, "http://local.test/plain"); app_key(A_BROWSER, '\n'); net_idle(3000);
     assert(br_has("line one") && br_has("    indented three") && !strcmp(wins[A_BROWSER].title, "Browser"));
-    br_go("http://local.test/app.bin", 1); net_idle(3000); assert(br_has("not a web page") && br_has("Saved APP.BIN (3000 bytes)") && fs_find("app.bin") >= 0);
+    br_go("http://local.test/app.bin", 1); net_idle(3000); assert(br_has("not a web page") && br_has("Saved APP.BIN (3000 bytes)") && fs_find_in(dl_folder(), "app.bin") >= 0);
     br_go("http://nosuch.test/", 1); net_idle(6000); assert(br_has("Cannot open this page") && br_has("Host not found"));
     frame_out("t48_browser_error.ppm");
     http_proxy_on = 0; br_go("https://local.test/", 1); net_idle(100); assert(br_has("HTTPS")); http_proxy_on = 1;
@@ -1035,6 +1035,56 @@ int main(void) {
     theme_apply(TH_KDE); frame_out("t29_kde_image.ppm");
     for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
     theme_apply(TH_XP);
+    /* folders, system files, startup commands, Setup */
+    {
+    assert(fs_install(0) && fs_on_disk);
+    int sd = sys_dir(); assert(sd);
+    assert(fs_find_in(sd, "KERNEL.SYS") >= 0 && fs_find_in(sd, "LOADER.SYS") >= 0 && fs_find_in(sd, "BOOT.CFG") >= 0 && fs_find_in(sd, "STARTUP.CMD") >= 0);
+    int ki = fs_find_in(sd, "KERNEL.SYS"); assert(fs_issys(ki) && (fsdir[ki].used & FSU_KERNEL) && fsdir[ki].size == FS_SLOT && !memcmp(fsdata[ki], sys_img, 4096));
+    tclear(); cmd("cd SYSTEM"); cmd("ls"); assert(term_has("KERNEL.SYS") && term_has("[system]") && term_has("BOOT.CFG")); cmd("cd ..");
+    /* folders in the terminal */
+    tclear(); cmd("mkdir DOCS"); assert(term_has("Folder created")); cmd("mkdir DOCS"); assert(term_has("Already exists"));
+    cmd("cd DOCS"); cmd("touch a.txt"); cmd("echo hi > b.txt"); tclear(); cmd("ls"); assert(term_has("A.TXT") && term_has("B.TXT")); cmd("cd ..");
+    assert(fs_find("A.TXT") < 0 && fs_find_in(fs_find("DOCS") + 1, "B.TXT") >= 0);
+    tclear(); cmd("mv DOCS/A.TXT DOCS/C.TXT"); assert(term_has("Moved.")); tclear(); cmd("mv DOCS DOCS/IN"); assert(term_has("into itself"));
+    cmd("mkdir DOCS/SUB"); cmd("mv DOCS/C.TXT DOCS/SUB"); assert(fs_find_in(fs_find_in(fs_find("DOCS") + 1, "SUB") + 1, "C.TXT") >= 0);
+    cmd("super"); tclear(); cmd("rm DOCS"); assert(term_has("folder with files")); tclear(); cmd("rm -r DOCS"); assert(term_has("Deleted") && fs_find("DOCS") < 0);
+    for (int i = 0; i < FS_MAX; i++) if (fsdir[i].used) assert(fs_par(i) == 0 || fsdir[fs_par(i) - 1].used);   /* no orphans */
+    /* system files are protected from a plain rm, but you can delete them */
+    tclear(); cmd("rm SYSTEM/STARTUP.CMD"); assert(term_has("SYSTEM file") && fs_find_in(sd, "STARTUP.CMD") >= 0);
+    tclear(); cmd("rm -y SYSTEM/STARTUP.CMD"); assert(term_has("Deleted") && fs_find_in(sd, "STARTUP.CMD") < 0);
+    memset(fsdir, 0, sizeof fsdir); fs_load(); assert(fs_find_in(sys_dir(), "BOOT.CFG") >= 0 && fs_find_in(sys_dir(), "STARTUP.CMD") < 0);   /* persists */
+    sys_boot_files(); assert(fs_find_in(sys_dir(), "STARTUP.CMD") < 0);                                                                       /* and is not recreated */
+    /* STARTUP.CMD runs at start, not in safe mode */
+    { const char *su = "# comment\necho boot-ok > STARTED.TXT\n"; sys_put(sys_dir(), "STARTUP.CMD", FSU_SYS, su, (u32)strlen(su)); }
+    tclear(); startup_run(); assert(fs_find("STARTED.TXT") >= 0);
+    cmd("rm STARTED.TXT"); safe_mode = 1; tclear(); startup_run(); assert(term_has("Safe mode") && fs_find("STARTED.TXT") < 0); safe_mode = 0;
+    /* an edited BOOT.CFG is real data on the disk for the loader */
+    { const char *bc = "# t\ntimeout=2\ndefault=2\n"; int bi = fs_find_in(sys_dir(), "BOOT.CFG"); fs_store(bi, bc, (u32)strlen(bc));
+      FILE *df = fopen("tests/out/cfg_disk.img", "wb"); if (df) { fwrite(fakedisk[0], 512, 4200, df); fclose(df); } }
+    /* deleting KERNEL.SYS really removes the kernel from the boot area */
+    cmd("rm -y SYSTEM/KERNEL.SYS"); { u8 z[512]; ata_read(0, 16, 1, z); for (int i = 0; i < 512; i++) assert(!z[i]); }
+    /* Downloads folder and Setup */
+    strcpy(sys_user, ""); { int d = dl_folder(); assert(d && fs_isdir(d - 1)); }
+    memset(fsdir, 0, sizeof fsdir); fs_defaults(); sys_make(0, 0);
+    setup_start(); assert(setup_active); setup_draw();
+    setup_key('\n'); assert(setup_page == 1);
+    su_name[0] = 0;
+    for (const char *p = "Ann"; *p; p++) setup_key(*p); assert(!strcmp(su_name, "Ann"));
+    setup_key('\t'); su_comp[0] = 0; for (const char *p = "Box"; *p; p++) setup_key(*p); assert(!strcmp(su_comp, "Box"));
+    setup_draw(); setup_next(); assert(setup_page == 2); setup_key(K_RIGHT); assert(th_id == TH_UNITY); setup_draw();
+    setup_next(); assert(setup_page == 3 && !strcmp(sys_user, "ANN"));
+    { int u = fs_find_dir(fs_find_dir(0, "USERS") + 1, "ANN"); assert(u >= 0);
+      for (const char *n = "DOCUMENTS\0DOWNLOADS\0DESKTOP\0PICTURES"; ; ) { (void)n; break; }
+      assert(fs_find_dir(u + 1, "DOCUMENTS") >= 0 && fs_find_dir(u + 1, "DOWNLOADS") >= 0 && fs_find_dir(u + 1, "DESKTOP") >= 0 && fs_find_dir(u + 1, "PICTURES") >= 0);
+      assert(fs_find_in(fs_find_dir(u + 1, "DOCUMENTS") + 1, "WELCOME.TXT") >= 0);
+      assert(dl_folder() == fs_find_dir(u + 1, "DOWNLOADS") + 1); }
+    setup_draw(); setup_t0 = (int)ticks - 500; setup_draw(); setup_next(); assert(!setup_active);
+    char ub[2] = { 0 }; (void)ub;
+    sys_user[0] = 0; assert(user_load() && !strcmp(sys_user, "ANN") && !strcmp(sys_comp, "BOX"));
+    theme_apply(TH_XP); th_id = TH_XP;
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    }
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }

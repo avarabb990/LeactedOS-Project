@@ -87,3 +87,10 @@ qemu-img create -f raw disk.img 64M
 qemu-system-i386 -cdrom leacteos-v13.iso -boot d -m 256 -nic user,model=rtl8139 -drive file=disk.img,format=raw,if=ide
 ```
 After the install, remove `-cdrom ... -boot d` to boot the disk. Build your own ISO from a kernel with `python3 tools/mkiso.py leacteos.bin leacteos.iso` (no external tools needed). The ISO also contains `LEACTEOS.BIN` (the multiboot kernel, for GRUB or `qemu -kernel`) and a README. The system itself is one kernel image, so there are no separate system files on the CD or the disk to delete: your files live in LeactedFS next to it.
+
+## v14: folders, system files and first-boot Setup
+
+* **Folders** on LeactedFS (File Manager "Folder" button, terminal `mkdir`, `cd`, `mv`, `rm -r`).
+* **System files** in `SYSTEM\`: `KERNEL.SYS` and `LOADER.SYS` are the real kernel and boot loader on the disk, `BOOT.CFG` is read by Leact-Loader (`timeout=N|off`, `default=1|2`), `STARTUP.CMD` runs at every start, plus `SETTINGS.CFG` and `USER.CFG`. You can edit or delete them (File Manager asks twice, terminal needs `rm -y`). Deleting KERNEL.SYS or LOADER.SYS really wipes it from the disk; boot from the install CD and reinstall to repair.
+* **Setup** runs on the first boot of an installed disk (user name, computer name, look) and creates `USERS\<NAME>\Documents, Downloads, Desktop, Pictures`. Run it again with `setup`. Downloads from the browser/wget now go to your Downloads folder.
+* Loader: press **S** for safe mode (skips STARTUP.CMD). Disks installed by older versions must be reinstalled once to get the new loader; their files get the SYSTEM folder automatically.
