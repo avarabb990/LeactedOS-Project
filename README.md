@@ -98,3 +98,7 @@ After the install, remove `-cdrom ... -boot d` to boot the disk. Build your own 
 ## v15: blue screen
 
 A CPU exception (or the `crash` command) shows a blue screen with a sad face, "Your Leacted PC ran into an error and needs to be repaired or reinstalled." and a stop code; any key restarts. The boot loader shows the same screen when `LOADER.SYS` or `KERNEL.SYS` is missing or damaged (`BOOT_LOADER_NOT_FOUND`, `KERNEL_IMAGE_CORRUPT`). Disks need a reinstall once to get the new loader.
+
+## v16: login screen
+
+Setup can set a password (stored only as a hash in `SYSTEM\USER.CFG`). When one is set, boot shows a login screen with a grey profile picture and your user name. Terminal: `lock` locks the desktop, `passwd NEW` changes the password, `passwd` alone removes it. LeactedCmd (command-line mode) has no login yet. Forgot the password? Delete `SYSTEM\USER.CFG` from another OS/disk, or reinstall.

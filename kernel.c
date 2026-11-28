@@ -1169,6 +1169,7 @@ static void sys_stage2(u8 *out) {                                  /* stage 2 wi
 /* ---- system files: SYSTEM\ holds KERNEL.SYS and LOADER.SYS (the real boot code on the disk), BOOT.CFG (read by
  * Leact-Loader), STARTUP.CMD (run at every start), SETTINGS.CFG and USER.CFG. They are normal files that you can edit or delete. */
 static char sys_user[FS_NAME], sys_comp[FS_NAME];
+static u32 sys_pass;                          /* FNV-1a hash of the login password, 0 = none */
 static int safe_mode;
 static int fs_find_dir(int parent, const char *name) { int i = fs_find_in(parent, name); return i >= 0 && fs_isdir(i) ? i : -1; }
 static int sys_dir(void) { int i = fs_find_dir(0, "SYSTEM"); return i >= 0 ? i + 1 : 0; }
@@ -2045,6 +2046,9 @@ static void cmd_echo_redirect(char *line) {
 }
 static void run_cmd(char *line);
 static void setup_start(void);
+static void login_start(int boot);
+static u32 pw_hash(const char *p);
+static void user_save(void);
 static void startup_run(void);
 enum { TJ_NONE, TJ_PING, TJ_LOOKUP, TJ_WGET, TJ_DHCP, TJ_LGET };
 static int tjob;
@@ -2414,6 +2418,7 @@ static void cmd_help(void) {
     tputs(" mv OLD NEW    move/rename  touch NAME   new file\n");
     tputs(" mkdir NAME    new folder   setup        run Setup\n");
     tputs(" crash         show the blue screen (restarts)\n");
+    tputs(" lock  passwd [NEW]   login screen / set or clear password\n");
     tputs(" echo T > F    write (>> appends)\n");
     tputs(" rm [-r] [-y] F   delete (-r folders, -y system files)\n");
     tputs(" edit F        open in Notepad\n");
@@ -2480,6 +2485,12 @@ static void run_cmd(char *line) {
         if (ac >= 2) note_open_file(av[1]); else open_app(A_NOTE);
     }
     else if (!kstrcmp(c, "crash")) { bsod_halt("MANUALLY_INITIATED_CRASH", 0xE2, 0); }
+    else if (!kstrcmp(c, "lock")) { if (cmd_mode) tputs("Lock needs the desktop.\n"); else if (!sys_pass) tputs("No password set. Use: passwd NEWPASSWORD\n"); else login_start(0); }
+    else if (!kstrcmp(c, "passwd")) {
+        if (!sys_user[0]) { tputs("No user yet. Run: setup\n"); return; }
+        sys_pass = ac >= 2 ? pw_hash(av[1]) : 0; user_save();
+        tputs(sys_pass ? "Password changed. Use 'lock' to try it.\n" : "Password removed.\n");
+    }
     else if (!kstrcmp(c, "setup")) { if (cmd_mode) tputs("Setup needs the desktop. Type: desktop\n"); else setup_start(); }
     else if (!kstrcmp(c, "mkdir") || !kstrcmp(c, "md")) { if (ac < 2) tputs("Usage: mkdir NAME\n"); else cmd_mkdir(av[1]); }
     else if (!kstrcmp(c, "rm") || !kstrcmp(c, "del")) {
@@ -5698,14 +5709,33 @@ static void startup_run(void) {
         p = nx;
     }
 }
+static u32 pw_hash(const char *p) { u32 h = 2166136261u; for (; *p; p++) { h ^= (u8)*p; h *= 16777619u; } return h ? h : 1; }
+/* a grey 'guest' style profile picture: round background, round head, shoulders, no face */
+static void avatar_draw(int cx, int cy, int r) {
+    fill_circle(cx, cy, r, RGB(205, 207, 212));
+    fill_circle(cx, cy - r * 20 / 100, r * 32 / 100, RGB(120, 123, 130));
+    int sy = cy + r * 82 / 100, rs = r * 62 / 100;
+    for (int dy = -r; dy <= r; dy++) {
+        int ds = cy + dy - sy; if (ds < -rs || ds > rs) continue;
+        int hb = isqrt(r * r - dy * dy), hs = isqrt(rs * rs - ds * ds), h = hb < hs ? hb : hs;
+        rect(cx - h, cy + dy, 2 * h + 1, 1, RGB(120, 123, 130));
+    }
+}
+static void user_save(void) {
+    char b[80]; int n = ksnprintf(b, sizeof b, "user=%s\ncomputer=%s\npass=%08x\n", sys_user, sys_comp, sys_pass);
+    int sd = sys_dir();
+    int i = fs_create_in(sd, "USER.CFG");
+    if (i >= 0) { fsdir[i].used |= sd ? FSU_SYS : 0; fs_store(i, b, (u32)n); }
+}
 static int user_load(void) {                 /* SYSTEM\USER.CFG: user=NAME, computer=NAME. 1 = found */
     int i = fs_find_in(sys_dir(), "USER.CFG");
     if (i < 0) return 0;
     char b[161]; u32 n = fsdir[i].size > 160 ? 160 : fsdir[i].size;
     memcpy(b, fsdata[i], n); b[n] = 0;
-    sys_user[0] = sys_comp[0] = 0;
+    sys_user[0] = sys_comp[0] = 0; sys_pass = 0;
     for (char *p = b; *p;) {
         char *dst = 0;
+        if (!memcmp(p, "pass=", 5)) { p += 5; u32 v = 0; for (; *p && *p != '\n' && *p != '\r'; p++) { int d = *p >= 'a' ? *p - 'a' + 10 : *p - '0'; v = v * 16 + (u32)(d & 15); } sys_pass = v; }
         if (!memcmp(p, "user=", 5)) { dst = sys_user; p += 5; }
         else if (!memcmp(p, "computer=", 9)) { dst = sys_comp; p += 9; }
         int k = 0;
@@ -5716,11 +5746,11 @@ static int user_load(void) {                 /* SYSTEM\USER.CFG: user=NAME, comp
     return 1;
 }
 static int setup_active, setup_page, setup_field, setup_t0;
-static char su_name[20], su_comp[20], su_msg[64];
+static char su_name[20], su_comp[20], su_pw[20], su_pw2[20], su_msg[64];
 static int setup_theme;
 static void setup_start(void) {
     setup_active = 1; setup_page = 0; setup_field = 0; setup_t0 = 0; su_msg[0] = 0;
-    kstrcpy(su_name, "User", sizeof su_name); kstrcpy(su_comp, "LEACTED-PC", sizeof su_comp);
+    kstrcpy(su_name, "User", sizeof su_name); kstrcpy(su_comp, "LEACTED-PC", sizeof su_comp); su_pw[0] = su_pw2[0] = 0;
     setup_theme = th_id;
 }
 static int fs_mkpath(int par, const char *name) {                  /* find or make a folder, id = slot + 1 or 0 */
@@ -5746,10 +5776,8 @@ static void setup_build(void) {                                   /* what the Se
     }
     sys_make(0, 0);
     th_id = setup_theme; theme_apply(th_id);
-    char b[64]; int n = ksnprintf(b, sizeof b, "user=%s\ncomputer=%s\n", un, cn);
-    int sd = sys_dir();
-    int i = fs_create_in(sd, "USER.CFG");
-    if (i >= 0) { fsdir[i].used |= sd ? FSU_SYS : 0; fs_store(i, b, (u32)n); }
+    sys_pass = su_pw[0] ? pw_hash(su_pw) : 0;
+    user_save();
     settings_save();
     if (fs_on_disk) fs_flush_dir();
     kstrcpy(su_msg, fs_on_disk ? "Your account was saved to the disk." : "No disk: this lasts until you shut down.", sizeof su_msg);
@@ -5762,17 +5790,18 @@ static void setup_finish(void) {
 }
 static void setup_next(void) {
     if (setup_page == 1 && !su_name[0]) { kstrcpy(su_msg, "Type a user name first.", sizeof su_msg); return; }
+    if (setup_page == 1 && kstrcmp(su_pw, su_pw2)) { kstrcpy(su_msg, "The passwords do not match.", sizeof su_msg); return; }
     su_msg[0] = 0;
     if (setup_page == 2) { setup_build(); setup_t0 = (int)ticks; }
     if (setup_page == 3) { setup_finish(); return; }
     setup_page++; setup_field = 0;
 }
 static void setup_key(int k) {
-    char *f = setup_field ? su_comp : su_name; int n = slen(f);
+    char *f = setup_field == 0 ? su_name : setup_field == 1 ? su_comp : setup_field == 2 ? su_pw : su_pw2; int n = slen(f);
     if (setup_page == 1) {
-        if (k == '\t') setup_field ^= 1;
+        if (k == '\t') setup_field = (setup_field + 1) & 3;
         else if (k == '\b') { if (n) f[n - 1] = 0; }
-        else if (k == '\n') { if (setup_field == 0) setup_field = 1; else setup_next(); }
+        else if (k == '\n') { if (setup_field < 3) setup_field++; else setup_next(); }
         else if (k >= 32 && k < 127 && n < 16) { f[n] = (char)k; f[n + 1] = 0; }
         su_msg[0] = 0;
     } else if (setup_page == 2) {
@@ -5813,8 +5842,18 @@ static void setup_draw(void) {
         rect(cx, cy + 64, 220, 20, C_LIGHT); frame(cx, cy + 64, 220, 20, setup_field == 1 ? RGB(0, 70, 190) : C_DARK);
         draw_str(cx + 4, cy + 70, su_comp, C_TEXT);
         if (setup_field == 1 && (ticks / 50) % 2) rect(cx + 4 + slen(su_comp) * 8, cy + 69, 2, 11, C_TEXT);
-        draw_str(cx, cy + 100, "Names are stored in capital letters. Tab switches the box.", C_DARK);
-        draw_str(cx, cy + 118, "Your files will go in USERS\\<your name>.", C_DARK);
+        draw_str(cx, cy + 100, "Password (optional):", C_TEXT);
+        rect(cx, cy + 114, 220, 20, C_LIGHT); frame(cx, cy + 114, 220, 20, setup_field == 2 ? RGB(0, 70, 190) : C_DARK);
+        for (int q = 0; q < slen(su_pw); q++) draw_str(cx + 4 + q * 8, cy + 120, "*", C_TEXT);
+        if (setup_field == 2 && (ticks / 50) % 2) rect(cx + 4 + slen(su_pw) * 8, cy + 119, 2, 11, C_TEXT);
+        draw_str(cx, cy + 150, "Type it again:", C_TEXT);
+        rect(cx, cy + 164, 220, 20, C_LIGHT); frame(cx, cy + 164, 220, 20, setup_field == 3 ? RGB(0, 70, 190) : C_DARK);
+        for (int q = 0; q < slen(su_pw2); q++) draw_str(cx + 4 + q * 8, cy + 170, "*", C_TEXT);
+        if (setup_field == 3 && (ticks / 50) % 2) rect(cx + 4 + slen(su_pw2) * 8, cy + 169, 2, 11, C_TEXT);
+        avatar_draw(cx + 340, cy + 50, 48);
+        draw_str_c(cx + 340, cy + 106, su_name, C_TEXT);
+        draw_str(cx, cy + 196, "Leave the password empty for no login screen. Tab switches the box.", C_DARK);
+        draw_str(cx, cy + 210, "Names are stored in capital letters. Files go in USERS\\<your name>.", C_DARK);
     } else if (setup_page == 2) {
         for (int i = 0; i < N_THEMES; i++) {
             int tx = cx + i * 144, sel = i == setup_theme;
@@ -5850,8 +5889,40 @@ static void setup_click(int mx_, int my_) {
     if (setup_page == 1) {
         if (inrect(mx_, my_, cx, cy + 14, 220, 20)) setup_field = 0;
         if (inrect(mx_, my_, cx, cy + 64, 220, 20)) setup_field = 1;
+        if (inrect(mx_, my_, cx, cy + 114, 220, 20)) setup_field = 2;
+        if (inrect(mx_, my_, cx, cy + 164, 220, 20)) setup_field = 3;
     }
     if (setup_page == 2) for (int i = 0; i < N_THEMES; i++) if (inrect(mx_, my_, cx + i * 144 - 4, cy - 4, 136, 100)) { setup_theme = i; th_id = i; theme_apply(i); }
+}
+
+static int lg_active, lg_boot;
+static char lg_pw[20], lg_msg[40];
+static void login_start(int boot) { lg_active = 1; lg_boot = boot; lg_pw[0] = 0; lg_msg[0] = 0; }
+static void login_try(void) {
+    if (pw_hash(lg_pw) != sys_pass) { kstrcpy(lg_msg, "The password is incorrect.", sizeof lg_msg); lg_pw[0] = 0; return; }
+    lg_active = 0; lg_pw[0] = 0;
+    if (lg_boot) { open_app(A_TERM); tprintf("Welcome back, %s.\n", sys_user); startup_run(); }
+}
+static void login_draw(void) {
+    gradient_v(0, 0, W, H, RGB(20, 70, 190), RGB(8, 36, 120));
+    rect(0, 0, W, 40, RGB(8, 36, 120)); rect(0, H - 40, W, 40, RGB(8, 36, 120));
+    avatar_draw(W / 2, 150, 60);
+    draw_str_c(W / 2, 224, sys_user, RGB(255, 255, 255));
+    rect(W / 2 - 110, 250, 190, 22, C_LIGHT); frame(W / 2 - 110, 250, 190, 22, RGB(0, 40, 140));
+    int n = slen(lg_pw);
+    for (int q = 0; q < n; q++) draw_str(W / 2 - 104 + q * 8, 257, "*", C_TEXT);
+    if ((ticks / 50) % 2) rect(W / 2 - 104 + n * 8, 255, 2, 11, C_TEXT);
+    button(W / 2 + 84, 250, 26, 22, ">", 0);
+    draw_str_c(W / 2, 288, lg_msg[0] ? lg_msg : "Type your password and press Enter", lg_msg[0] ? RGB(255, 190, 190) : RGB(200, 220, 255));
+    draw_str(12, 14, "LeactedOS", RGB(255, 255, 255));
+    if (sys_comp[0]) draw_str(W - 12 - slen(sys_comp) * 8, 14, sys_comp, RGB(200, 220, 255));
+}
+static void login_key(int k) {
+    int n = slen(lg_pw);
+    if (k == '\n') login_try();
+    else if (k == '\b') { if (n) lg_pw[n - 1] = 0; }
+    else if (k >= 32 && k < 127 && n < 16) { lg_pw[n] = (char)k; lg_pw[n + 1] = 0; }
+    if (k != '\n') lg_msg[0] = 0;
 }
 
 static void os_draw(void) {
@@ -5860,6 +5931,7 @@ static void os_draw(void) {
     clip_reset();
     if (cmd_mode) { term_draw(0, 0, W, H); return; }
     if (setup_active) { setup_draw(); draw_cursor(); return; }
+    if (lg_active) { login_draw(); draw_cursor(); return; }
     xapp_tick();
     draw_desktop();
     for (int i = 0; i < nz; i++) if (!wins[zo[i]].min) draw_window(zo[i]);
@@ -5878,10 +5950,12 @@ static void os_events(void) {
     while ((k = kq_pop())) {
         if (cmd_mode) { term_key(k); continue; }
         if (setup_active) { setup_key(k); continue; }
+        if (lg_active) { login_key(k); continue; }
         int a = top_app();
         if (a >= 0) app_key(a, k);
     }
     if (cmd_mode) { prev_btn = mbtn & 1; return; }
+    if (lg_active) { int l = mbtn & 1; if (l && !prev_btn && inrect(mx, my, W / 2 + 84, 250, 26, 22)) login_try(); prev_btn = l; return; }
     if (setup_active) { int l = mbtn & 1; if (l && !prev_btn) setup_click(mx, my); prev_btn = l; return; }
     int left = mbtn & 1;
     if (left && !prev_btn) on_press(mx, my);
@@ -5933,6 +6007,7 @@ static void os_init(u32 magic, const u32 *mbi) {
     splash(100, "Desktop");
     sleep_ticks(cmd_mode ? 20 : 70);
     if (cmd_mode) { set_cmd_mode(1); startup_run(); return; }
+    if (have_user && sys_pass) { login_start(1); return; }                          /* password set: login screen first */
     if (!have_user && fs_on_disk && !safe_mode) { setup_start(); return; }     /* first start: Setup */
     open_app(A_TERM);
     startup_run();

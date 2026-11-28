@@ -1087,6 +1087,25 @@ int main(void) {
     }
     /* blue screen */
     tclear(); cmd("crash"); assert(back[5] == RGB(0, 90, 190) && back[100 * W + 62] == RGB(255, 255, 255)); ppm("t54_bsod.ppm");
+    /* password, login screen */
+    {
+    setup_start(); setup_next(); assert(setup_page == 1);
+    setup_field = 2; for (const char *p = "secret"; *p; p++) setup_key(*p); setup_key('\t'); for (const char *p = "secrex"; *p; p++) setup_key(*p);
+    setup_draw(); setup_next(); assert(setup_page == 1 && !strcmp(su_msg, "The passwords do not match."));
+    su_pw2[0] = 0; for (const char *p = "secret"; *p; p++) setup_key(*p); setup_next(); assert(setup_page == 2);
+    setup_next(); assert(sys_pass == pw_hash("secret") && sys_pass);
+    setup_t0 = (int)ticks - 500; setup_next(); assert(!setup_active);
+    sys_pass = 0; sys_user[0] = 0; assert(user_load() && sys_pass == pw_hash("secret"));
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    login_start(1); assert(lg_active); login_draw(); ppm("t55_login.ppm");
+    for (const char *p = "wrong"; *p; p++) login_key(*p); login_key('\n'); assert(lg_active && strstr(lg_msg, "incorrect") && !lg_pw[0]);
+    for (const char *p = "secret"; *p; p++) login_key(*p); login_key('\n'); assert(!lg_active && wins[A_TERM].open);
+    tclear(); cmd("lock"); assert(lg_active && !lg_boot); for (const char *p = "secret"; *p; p++) login_key(*p); login_key('\n'); assert(!lg_active);
+    tclear(); cmd("passwd"); assert(term_has("Password removed") && !sys_pass); tclear(); cmd("lock"); assert(!lg_active && term_has("No password"));
+    cmd("passwd abc"); assert(sys_pass == pw_hash("abc")); sys_pass = 0; user_load(); assert(sys_pass == pw_hash("abc"));
+    sys_pass = 0; user_save();
+    for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
+    }
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }
