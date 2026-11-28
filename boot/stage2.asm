@@ -45,6 +45,7 @@ start:
     call getmem
     call memcheck
     call load
+    call kcheck
     call bssclr
     call mkmbi
     jmp enter
@@ -68,12 +69,15 @@ setpos:
     pop cx
     pop ax
     ret
-str_at:                       ; SI = text, DH/DL = row/col, BL = attribute (ES = 0xB800)
+str_at:                       ; SI = text, DH/DL = row/col, BL = attribute (ES = 0xB800); '#' draws a solid block
     call setpos
 .l: lodsb
     test al, al
     jz .d
-    mov ah, bl
+    cmp al, '#'
+    jne .n
+    mov al, 0xDB
+.n: mov ah, bl
     stosw
     jmp .l
 .d: ret
@@ -315,10 +319,60 @@ puts:
     call putc
     jmp puts
 .d: ret
-fatal:
-    call puts
+fatal:                        ; SI = stop code. Blue screen, then halt.
+    push si
+    mov ax, 3
+    int 0x10
+    mov ah, 1
+    mov cx, 0x2000
+    int 0x10
+    mov ax, 0xB800
+    mov es, ax
+    xor di, di
+    mov cx, 2000
+    mov ax, 0x1F20
+    rep stosw
+    mov bl, 0x1F
+    mov dh, 3
+    mov dl, 8
+    mov si, f_r1
+    call str_at
+    mov dh, 4
+    mov si, f_r2
+    call str_at
+    mov dh, 5
+    mov si, f_r3
+    call str_at
+    mov dh, 6
+    mov si, f_r3
+    call str_at
+    mov dh, 7
+    mov si, f_r3
+    call str_at
+    mov dh, 8
+    mov si, f_r2
+    call str_at
+    mov dh, 9
+    mov si, f_r1
+    call str_at
+    mov dh, 12
+    mov dl, 3
+    mov si, m_bs1
+    call str_at
+    mov dh, 14
+    mov si, m_bs2
+    call str_at
+    pop si
+    mov dh, 14
+    mov dl, 14
+    call str_at
+    mov dh, 16
+    mov dl, 3
+    mov si, m_bs3
+    call str_at
+    mov dh, 18
     mov si, m_halt
-    call puts
+    call str_at
 .h: cli
     hlt
     jmp .h
@@ -487,6 +541,17 @@ load:
     jmp .loop
 .done:
     ret
+
+kcheck:                       ; the image at 1 MB must start with the multiboot header, else the kernel is gone or damaged
+    call unreal
+    xor ax, ax
+    mov ds, ax
+    a32 mov eax, [0x100000]
+    cmp eax, 0x1BADB002
+    je .ok
+    mov si, m_bad
+    jmp fatal
+.ok: ret
 
 bssclr:
     call unreal
@@ -763,11 +828,18 @@ m_start0 db "Starting LeactedOS desktop...", 13, 10, "Loading ", 0
 m_start1 db "Starting LeactedCmd...", 13, 10, "Loading ", 0
 m_cl0    db "desktop", 0
 m_cl1    db "cmd", 0
-m_nokern db "No kernel on this disk. Run the Installer from a running LeactedOS.", 0
-m_a20    db "Cannot enable the A20 line.", 0
-m_read   db "Disk read error.", 0
-m_mem    db "Not enough memory.", 0
-m_halt   db 13, 10, "System halted.", 0
+m_nokern db "KERNEL_IMAGE_NOT_FOUND", 0
+m_bad    db "KERNEL_IMAGE_CORRUPT", 0
+m_a20    db "A20_GATE_FAILURE", 0
+m_read   db "DISK_READ_ERROR", 0
+m_mem    db "INSUFFICIENT_MEMORY", 0
+m_halt   db "System halted.", 0
+f_r1     db "##          ####", 0
+f_r2     db "##        ##", 0
+f_r3     db "          ##", 0
+m_bs1    db "Your Leacted PC ran into an error and needs to be repaired or reinstalled.", 0
+m_bs2    db "Stop code:", 0
+m_bs3    db "Boot the LeactedOS install CD and reinstall to repair this PC.", 0
 m_name   db "LeactedOS", 0
 m_namecd db "LeactedOS CD", 0
 times 4096 - ($ - $$) db 0

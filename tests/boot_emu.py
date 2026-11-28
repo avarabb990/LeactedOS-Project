@@ -445,6 +445,14 @@ if __name__ == "__main__":
     c, m = check(path, 0, [(3, 0, ord('x')), (5, *DOWN), (7, *ENTER)], "cmd")
     c, m = check(path, 0, [(3, 0, ord('s'))], "desktop safe")
     print("boot menu: ok (timeout, arrows, enter, number keys, S = safe mode)")
+    def vtext(c, row): return bytes(c.mem[0xB8000 + row * 160:0xB8000 + row * 160 + 160:2]).decode('cp437')
+    d = bytearray(open(path, 'rb').read()); d[8 * 512:16 * 512] = bytes(4096)           # LOADER.SYS deleted: stage 1 shows the blue screen
+    c, res = boot(bytes(d), 0, []); assert res.startswith("halted"), res
+    assert c.mem[0xB8000 + 1] == 0x1F and "Your Leacted PC ran into an error and needs to be" in vtext(c, 6) + vtext(c, 5) + vtext(c, 4) and "reinstalled" in "".join(vtext(c, r) for r in range(3, 12)) and "BOOT_LOADER_NOT_FOUND" in "".join(vtext(c, r) for r in range(3, 14))
+    d = bytearray(open(path, 'rb').read()); d[16 * 512:16 * 512 + 4096] = bytes(4096)   # KERNEL.SYS deleted: the loader shows the blue screen
+    c, res = boot(bytes(d), 0, [(3, *ENTER)]); assert res.startswith("halted"), res
+    assert c.mem[0xB8000 + 1] == 0x1F and "needs to be repaired or reinstalled." in vtext(c, 12) and "KERNEL_IMAGE_CORRUPT" in vtext(c, 14) and ":(" not in vtext(c, 3)
+    print("blue screen: ok (loader missing, kernel missing)")
     cfgp = os.path.join(os.path.dirname(path), "cfg_disk.img")
     if os.path.exists(cfgp):                                                     # SYSTEM\BOOT.CFG: timeout=2 default=2 (written by host_test)
         c, m = check(cfgp, 0, None, "cmd"); assert "in  2 seconds" in screen_text(m, 15) or "in 2 seconds" in screen_text(m, 15) or "automatically" in screen_text(m, 15)

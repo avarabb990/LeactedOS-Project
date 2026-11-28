@@ -151,6 +151,9 @@ void timer_irq(void) {
     outb(0x20, 0x20);
 }
 
+#ifndef HOST
+extern void (*const exc_table[32])(void);
+#endif
 static void idt_set(int n, void (*fn)(void)) {
     u16 cs = 0x08;
 #ifndef HOST
@@ -173,6 +176,7 @@ static void irq_init(void) {
     /* PIT channel 0, 100 Hz */
     outb(0x43, 0x36);
     outb(0x40, 11932 & 0xFF); outb(0x40, 11932 >> 8);
+    for (int n = 0; n < 32; n++) idt_set(n, exc_table[n]);
     idt_set(0x20, irq0_stub);
     struct idt_ptr p = { sizeof(idt) - 1, (u32)(uintptr_t)idt };
     __asm__ volatile("lidt %0" ::"m"(p));
@@ -1140,7 +1144,7 @@ extern void _start(void);
 #endif
 static void sys_capture(void) {
 #ifdef HOST
-    sys_n = 654321; for (u32 i = 0; i < sys_n; i++) sys_img[i] = (u8)(i * 31 + (i >> 8));
+    sys_n = 654321; for (u32 i = 0; i < sys_n; i++) sys_img[i] = (u8)(i * 31 + (i >> 8)); memcpy(sys_img, "\x02\xB0\xAD\x1B", 4);
     sys_entry = 0x100010; sys_bssend = 0x1146880; sys_ok = 1;
 #else
     u32 n = (u32)(__image_end - __image_start);
@@ -1269,6 +1273,36 @@ static void reboot_now(void) {
     __asm__ volatile("lidt %0; int3" ::"m"(z));
     for (;;) __asm__ volatile("hlt");
 #endif
+}
+
+/* Blue screen: a sad face and the stop code. Used for CPU exceptions and by the 'crash' command. */
+static void bsod_show(const char *stop, u32 code, u32 eip) {
+    u32 bg = RGB(0, 90, 190), fg = RGB(255, 255, 255);
+    clip_reset();
+    rect(0, 0, W, H, bg);
+    rect(60, 50, 16, 16, fg); rect(60, 98, 16, 16, fg);                 /* ':' */
+    for (int y = -42; y <= 42; y += 4) rect(104 + (y * y) / 70, 80 + y, 10, 10, fg);   /* '(' */
+    draw_str(60, 170, "Your Leacted PC ran into an error and needs to be", fg);
+    draw_str(60, 184, "repaired or reinstalled.", fg);
+    drawf(60, 224, fg, "Stop code: %s", stop);
+    drawf(60, 240, fg, "Error 0x%08x at address 0x%08x", code, eip);
+    draw_str(60, 280, "To repair this PC, boot the LeactedOS install CD", fg);
+    draw_str(60, 294, "and reinstall.", fg);
+    draw_str(60, 330, "Press any key to restart.", fg);
+    flip();
+}
+static const char *const exc_names[20] = { "DIVIDE_ERROR", "DEBUG_EXCEPTION", "NMI", "BREAKPOINT", "OVERFLOW", "BOUND_RANGE_EXCEEDED", "INVALID_OPCODE", "DEVICE_NOT_AVAILABLE",
+    "DOUBLE_FAULT", "COPROCESSOR_OVERRUN", "INVALID_TSS", "SEGMENT_NOT_PRESENT", "STACK_FAULT", "GENERAL_PROTECTION_FAULT", "PAGE_FAULT", "RESERVED", "FPU_ERROR", "ALIGNMENT_CHECK", "MACHINE_CHECK", "SIMD_FPU_ERROR" };
+static void bsod_halt(const char *stop, u32 code, u32 eip) {      /* show it, wait for a key, restart (the PC build only) */
+    bsod_show(stop, code, eip);
+#ifndef HOST
+    while (kq_pop()) {}
+    for (;;) { input_poll(); if (kq_pop()) reboot_now(); }
+#endif
+}
+void kernel_exception(u32 *fr) {                    /* fr: vector, error code, EIP (pushed by boot.S and the CPU) */
+    u32 n = fr[0];
+    bsod_halt(n < 20 ? exc_names[n] : "UNKNOWN_EXCEPTION", fr[1], fr[2]);
 }
 static void power_off(void) {
 #ifndef HOST
@@ -2379,6 +2413,7 @@ static void cmd_help(void) {
     tputs(" cp SRC NAME   copy into LeactedFS (from any drive)\n");
     tputs(" mv OLD NEW    move/rename  touch NAME   new file\n");
     tputs(" mkdir NAME    new folder   setup        run Setup\n");
+    tputs(" crash         show the blue screen (restarts)\n");
     tputs(" echo T > F    write (>> appends)\n");
     tputs(" rm [-r] [-y] F   delete (-r folders, -y system files)\n");
     tputs(" edit F        open in Notepad\n");
@@ -2444,6 +2479,7 @@ static void run_cmd(char *line) {
     else if (!kstrcmp(c, "edit") || !kstrcmp(c, "notepad")) {
         if (ac >= 2) note_open_file(av[1]); else open_app(A_NOTE);
     }
+    else if (!kstrcmp(c, "crash")) { bsod_halt("MANUALLY_INITIATED_CRASH", 0xE2, 0); }
     else if (!kstrcmp(c, "setup")) { if (cmd_mode) tputs("Setup needs the desktop. Type: desktop\n"); else setup_start(); }
     else if (!kstrcmp(c, "mkdir") || !kstrcmp(c, "md")) { if (ac < 2) tputs("Usage: mkdir NAME\n"); else cmd_mkdir(av[1]); }
     else if (!kstrcmp(c, "rm") || !kstrcmp(c, "del")) {

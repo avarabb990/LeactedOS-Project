@@ -37,11 +37,40 @@ irq0_stub:
     popa
     iret
 
+.global exc_table
+.macro EXC n
+exc_\n:
+.if (\n==8)|(\n==10)|(\n==11)|(\n==12)|(\n==13)|(\n==14)|(\n==17)|(\n==21)
+.else
+    pushl $0
+.endif
+    pushl $\n
+    jmp exc_common
+.endm
+.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+EXC \n
+.endr
+exc_common:
+    cli
+    cld
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    push %esp
+    call kernel_exception
+1:  hlt
+    jmp 1b
+
 .global idt_ignore
 idt_ignore:
     iret
 
 .section .rodata
+.align 4
+exc_table:
+.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    .long exc_\n
+.endr
 .align 8
 gdt:
     .quad 0

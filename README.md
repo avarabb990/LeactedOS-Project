@@ -94,3 +94,7 @@ After the install, remove `-cdrom ... -boot d` to boot the disk. Build your own 
 * **System files** in `SYSTEM\`: `KERNEL.SYS` and `LOADER.SYS` are the real kernel and boot loader on the disk, `BOOT.CFG` is read by Leact-Loader (`timeout=N|off`, `default=1|2`), `STARTUP.CMD` runs at every start, plus `SETTINGS.CFG` and `USER.CFG`. You can edit or delete them (File Manager asks twice, terminal needs `rm -y`). Deleting KERNEL.SYS or LOADER.SYS really wipes it from the disk; boot from the install CD and reinstall to repair.
 * **Setup** runs on the first boot of an installed disk (user name, computer name, look) and creates `USERS\<NAME>\Documents, Downloads, Desktop, Pictures`. Run it again with `setup`. Downloads from the browser/wget now go to your Downloads folder.
 * Loader: press **S** for safe mode (skips STARTUP.CMD). Disks installed by older versions must be reinstalled once to get the new loader; their files get the SYSTEM folder automatically.
+
+## v15: blue screen
+
+A CPU exception (or the `crash` command) shows a blue screen with a sad face, "Your Leacted PC ran into an error and needs to be repaired or reinstalled." and a stop code; any key restarts. The boot loader shows the same screen when `LOADER.SYS` or `KERNEL.SYS` is missing or damaged (`BOOT_LOADER_NOT_FOUND`, `KERNEL_IMAGE_CORRUPT`). Disks need a reinstall once to get the new loader.

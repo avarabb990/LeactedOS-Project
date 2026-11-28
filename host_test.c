@@ -1085,6 +1085,8 @@ int main(void) {
     theme_apply(TH_XP); th_id = TH_XP;
     for (int k = 0; k < N_APPS; k++) if (wins[k].open) close_app(k);
     }
+    /* blue screen */
+    tclear(); cmd("crash"); assert(back[5] == RGB(0, 90, 190) && back[100 * W + 62] == RGB(255, 255, 255)); ppm("t54_bsod.ppm");
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }
